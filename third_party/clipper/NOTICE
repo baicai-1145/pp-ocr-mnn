@@ -1,0 +1,19 @@
+# clipper (vendored)
+
+Vendored from the PaddleOCR reference distribution (not MNN):
+- `clipper.hpp`, `clipper.cpp` from
+  `/root/PaddleOCR/deploy/ios_demo/PaddleOCRDemo/ThirdParty/Clipper1/`
+  (also available as
+  `/root/PaddleOCR/deploy/cpp_infer/...` which uses the same upstream source
+  `angusj/clipper` v6.4.2).
+
+This is a Boost-1.0-licensed header + implementation of Angus Johnson's
+Clipper polygon clipping/offsetting library. We only use `ClipperOffset` for
+the polygon expansion (Paddle's `pyclipper` semantics: `JT_ROUND,
+ET_CLOSEDPOLYGON`).
+
+Including the cpp file is the standard way to use Clipper; we link it as a
+normal translation unit in our tests/CLI.
+
+See the upstream copyright header at the top of `clipper.hpp` / `clipper.cpp`
+for the full Boost-1.0 attribution.
