@@ -1,0 +1,13 @@
+{
+  "name": "PP-OCRv6_tiny_rec",
+  "type": "rec",
+  "file": "PP-OCRv6_tiny_rec.mnn",
+  "sha256": "",
+  "bytes": 4434868,
+  "url": "PP-OCRv6_tiny_rec.mnn",
+  "rec": {
+    "shape": [3, 48, 320],
+    "use_space": true,
+    "dict": []
+  }
+}

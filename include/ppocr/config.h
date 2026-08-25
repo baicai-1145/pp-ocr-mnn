@@ -1,0 +1,78 @@
+// pp-ocr-mnn — model config (owner m1)
+//
+// Plain-old structs that mirror the JSON shapes documented in CONTRACT.md
+// (configs/<ModelName>.json + configs/registry.json). `load_model_config`
+// parses one model config file; fields that don't apply to a given type
+// (e.g. rec dict for a det model) are left at their defaults.
+#ifndef PPOCR_CONFIG_H_
+#define PPOCR_CONFIG_H_
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace ppocr {
+
+// det resize policy. Matches PaddleOCR's DetResizeForTest variants:
+//   LimitMin   = type 0  (limit_side_len "min", 32-aligned, used by v6 / seal)
+//   ResizeLong = type 2  (limit_side_len = resize_long, stride-aligned, v4/v5)
+struct DetResizeConfig {
+  enum class Mode { LimitMin, ResizeLong };
+  Mode mode = Mode::LimitMin;
+  int limit_side_len = 736;   // "min" side cap for LimitMin; the long-side cap for ResizeLong
+  int resize_long    = 960;   // long-side cap used by ResizeLong (v4/v5)
+  int stride         = 32;    // 32 for v6/seal, 128 for v4/v5
+  int max_side_limit = 4000;  // hard ceiling (clamps over-long edges)
+};
+
+// DB postprocess parameters. Defaults match v4/v5 mobile/server.
+// v6 reduces box_thresh; seal det uses 0.2/0.6/0.5.
+struct DetConfig {
+  float thresh       = 0.3f;  // binarization threshold on probability map
+  float box_thresh   = 0.6f;  // min box score to keep
+  float unclip_ratio = 1.5f;  // polygon expansion factor (matches PaddleOCR)
+  int   max_candidates = 1000;
+  DetResizeConfig resize;
+};
+
+// CTC recognition input geometry + character dictionary. The dict is loaded
+// from the model config; use_space controls whether a literal space is
+// appended to the alphabet (official PaddleOCR rec models do this).
+struct RecConfig {
+  int c = 3, h = 48, w = 320;
+  std::vector<std::string> dict;
+  bool use_space = true;
+};
+
+// Text-line orientation classifier (PP-LCNet_x1_0_textline_ori).
+// ImageNet normalization; labels are 0_degree / 180_degree strings from the
+// model's inference.yml. (Not used in the M1 acceptance gate but shipped.)
+struct ClsConfig {
+  int c = 3, h = 80, w = 160;
+  std::vector<float> mean{0.485f, 0.456f, 0.406f};
+  std::vector<float> std {0.229f, 0.224f, 0.225f};
+  std::vector<std::string> labels;
+};
+
+// One row in the registry: an .mnn model on disk + its parsed config + provenance.
+struct ModelConfig {
+  std::string name;        // registry key, e.g. "PP-OCRv6_tiny_det"
+  std::string type;        // "det" | "rec" | "cls"
+  std::string file;        // relative filename inside model_dir
+  std::string sha256;      // expected hex digest of `file`
+  std::string url;         // download URL relative to mirror base
+  uint64_t    bytes = 0;   // expected file size (0 = unknown)
+  DetConfig   det;
+  RecConfig   rec;
+  ClsConfig   cls;
+};
+
+// Parse `json_path` into a ModelConfig. Throws std::runtime_error on
+// malformed JSON or missing required fields. Always validates that
+// `type` is one of det/rec/cls; det/rec/cls sub-objects are validated
+// against the declared type (extra sub-objects are ignored).
+ModelConfig load_model_config(const std::string& json_path);
+
+} // namespace ppocr
+#endif // PPOCR_CONFIG_H_
