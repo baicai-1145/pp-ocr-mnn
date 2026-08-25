@@ -308,6 +308,7 @@ class JsonParser {
         std::string v = parse_string();
         if (v == "limit_min") rc.mode = DetResizeConfig::Mode::LimitMin;
         else if (v == "resize_long") rc.mode = DetResizeConfig::Mode::ResizeLong;
+        else if (v == "no_resize") rc.mode = DetResizeConfig::Mode::NoResize;
         else throw err_at("unknown resize.mode '" + v + "'");
       } else if (key == "limit_side_len") {
         size_t s = p_;

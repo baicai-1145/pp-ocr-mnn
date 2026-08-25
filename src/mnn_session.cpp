@@ -169,7 +169,11 @@ void MnnSession::set_input_float(const std::string& name,
   MnnSession::resize_input(name, dims);
   float* dst = MnnSession::input_host(name);
   if (!dst) {
-    throw std::runtime_error("MnnSession: input host null after resize");
+    throw std::runtime_error("MnnSession: input host null after resize (dims=" +
+                             std::to_string(dims[0]) + "x" +
+                             std::to_string(dims[1]) + "x" +
+                             std::to_string(dims[2]) + "x" +
+                             std::to_string(dims[3]) + ")");
   }
   size_t n = 1;
   for (int d : dims) n *= static_cast<size_t>(d > 0 ? d : 1);

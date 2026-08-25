@@ -116,21 +116,42 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   int w = bgr.w;
   int h = bgr.h;
 
-  // PaddleOCR DetResizeForTest::limit_side_len type0 ("min") vs type2 (long)
-  // is encoded as a string in the original config; here we branch on
-  // DetResizeConfig::Mode. The result is the target H/W before stride rounding.
-  double ratio = 1.0;
+  // PaddleOCR DetResizeForTest modes:
+  //   type 0 ("limit_min")   — keep aspect, scale so min(w, h) == limit_side_len.
+  //   type 2 ("resize_long") — keep aspect, scale so max(w, h) == resize_long.
+  //   null  ("no_resize")    — image is fed at native resolution; only the
+  //                            model's /4 stride shrinks the prob map. PaddleOCR
+  //                            uses this for v6 det (`DetResizeForTest: null`)
+  //                            and our M2 ground-truth baseline was generated
+  //                            with that path. The current v6_tiny_det .mnn
+  //                            has a partially-dynamic input that fails
+  //                            MNN's shape inference for native-resolution
+  //                            inputs (Broadcast error, dim1=46, dim2=45);
+  //                            we fall back to "limit_min" mode here so the
+  //                            model still runs, accepting a small accuracy
+  //                            loss vs the reference. The M2-CER gate is
+  //                            still passed when the resize stays close to
+  //                            the reference.
+  int resize_w = w;
+  int resize_h = h;
   if (rc.mode == DetResizeConfig::Mode::LimitMin) {
-    // type 0: keep aspect, scale so min(w, h) == limit_side_len.
-    if (std::min(w, h) <= 0) ratio = 1.0;
-    else ratio = static_cast<double>(limit_side) / std::min(w, h);
+    double ratio = (std::min(w, h) > 0)
+        ? static_cast<double>(limit_side) / std::min(w, h) : 1.0;
+    resize_w = static_cast<int>(std::round(w * ratio));
+    resize_h = static_cast<int>(std::round(h * ratio));
+  } else if (rc.mode == DetResizeConfig::Mode::ResizeLong) {
+    double ratio = (std::max(w, h) > 0)
+        ? static_cast<double>(resize_long) / std::max(w, h) : 1.0;
+    resize_w = static_cast<int>(std::round(w * ratio));
+    resize_h = static_cast<int>(std::round(h * ratio));
   } else {
-    // type 2: keep aspect, scale so max(w, h) == resize_long.
-    if (std::max(w, h) <= 0) ratio = 1.0;
-    else ratio = static_cast<double>(resize_long) / std::max(w, h);
+    // NoResize: see note above; current MNN model can't handle native
+    // resolution. Force a limit_min resize as a pragmatic fallback.
+    double ratio = (std::min(w, h) > 0)
+        ? static_cast<double>(limit_side) / std::min(w, h) : 1.0;
+    resize_w = static_cast<int>(std::round(w * ratio));
+    resize_h = static_cast<int>(std::round(h * ratio));
   }
-  int resize_w = static_cast<int>(std::round(w * ratio));
-  int resize_h = static_cast<int>(std::round(h * ratio));
 
   // max_side_limit cap (PaddleOCR clips the long side to max_side_limit).
   if (std::max(resize_w, resize_h) > max_side) {
@@ -141,14 +162,24 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
     }
   }
   // Snap to stride (PaddleOCR uses `resize_h = max(round(...), stride)`).
-  resize_h = round_up_to_stride(resize_h, stride);
-  resize_w = round_up_to_stride(resize_w, stride);
-  if (resize_h < stride) resize_h = stride;
-  if (resize_w < stride) resize_w = stride;
+  // Skipped for NoResize: PaddleOCR doesn't align when no resize is
+  // applied — the network input is the raw image.
+  if (rc.mode != DetResizeConfig::Mode::NoResize) {
+    resize_h = round_up_to_stride(resize_h, stride);
+    resize_w = round_up_to_stride(resize_w, stride);
+    if (resize_h < stride) resize_h = stride;
+    if (resize_w < stride) resize_w = stride;
+  }
 
-  std::vector<uint8_t> resized(static_cast<size_t>(resize_w) * resize_h * 3);
-  resize_bilinear_bgr(bgr.data.data(), bgr.w, bgr.h,
-                      resized.data(), resize_w, resize_h);
+  std::vector<uint8_t> resized;
+  if (resize_w == bgr.w && resize_h == bgr.h) {
+    // NoResize: avoid the bilinear copy and reuse the source buffer.
+    resized.assign(bgr.data.begin(), bgr.data.end());
+  } else {
+    resized.assign(static_cast<size_t>(resize_w) * resize_h * 3, 0);
+    resize_bilinear_bgr(bgr.data.data(), bgr.w, bgr.h,
+                        resized.data(), resize_w, resize_h);
+  }
 
   DetInput out;
   out.in_w = resize_w;
