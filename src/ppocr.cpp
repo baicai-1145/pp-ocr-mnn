@@ -433,6 +433,12 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     for (size_t i = 0; i < n; ++i) {
       const float* row = so.data + i * T * C;
       RecOut out = ctc_decode(row, T, C, e.rec_cfg.rec);
+      // Note: ctc_decode returns the mean probability of the
+      // emitted characters. We do NOT threshold text by rec score
+      // here — the upstream `box_thresh` and `db_post` kMinSize
+      // are the right place to drop spurious detections. A small
+      // rec score is a useful signal for downstream consumers
+      // (e.g. CER audits) and we keep the field intact.
       texts[start + i] = {out.text, out.score};
     }
   }

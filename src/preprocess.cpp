@@ -145,8 +145,14 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
     resize_w = static_cast<int>(std::round(w * ratio));
     resize_h = static_cast<int>(std::round(h * ratio));
   } else {
-    // NoResize: see note above; current MNN model can't handle native
-    // resolution. Force a limit_min resize as a pragmatic fallback.
+    // NoResize: PaddleOCR's `DetResizeForTest: null` would feed the
+    // image at native resolution. The v6_tiny_det .mnn we ship is
+    // only partially-dynamic — MNN's shape inference fails for
+    // native inputs ("Broad cast error, dim1=46, dim2=45"). We
+    // therefore fall back to the same `limit_min` resize the
+    // `LimitMin` mode uses, so the model still runs. Decision-maker
+    // can re-export the v6 det .mnn with fully-dynamic shapes to
+    // enable a true null pipeline.
     double ratio = (std::min(w, h) > 0)
         ? static_cast<double>(limit_side) / std::min(w, h) : 1.0;
     resize_w = static_cast<int>(std::round(w * ratio));
