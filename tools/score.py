@@ -3,16 +3,25 @@
 
 Per docs/CONTRACT.md:
   * For every (det__rec) cell: per image, CER = levenshtein(pred_join, base_join)
-    / len(base_join) where join = "\n".join(rec_texts); cell score = mean over
+    / len(base_join) where join = "\\n".join(rec_texts); cell score = mean over
     images; PASS if cell_score ≤ 0.05.
   * --strip mode scores `strip__<rec>` cells against
     /root/ocr_test_imgs/strip_gt.json (per-image gt).
   * seal cells (PP-OCRv4_mobile_seal_det/, PP-OCRv4_server_seal_det/) are out
     of scope (M4) — reported as N/A.
-  * Output: results/report.md matrix + exit code (0 = all PASS, 1 = any FAIL).
 
-Levenshtein is a self-implemented O(m*n) DP (no numpy dep). Acceptable for
-matrix-scale inputs; cell text is short.
+Output (default `results/report.md`):
+  * **Main matrix** (7×7): rows = det, cols = rec, cell = lang-averaged CER
+    + PASS/FAIL. This is the canonical 49-cell 7×7 view the decision-maker
+    needs at a glance.
+  * **Lang-rec block**: per-cell CER for the 10 lang-specific rec models
+    (each row = det__<lang>_PP-OCRv5_mobile_rec).
+  * **Doc-rec block**: PP-OCRv4_server_rec_doc cells.
+  * **Strip block**: 2 strip cells (ta, te).
+  * **Seal block**: M4 stub, N/A.
+  * Exit code: 0 if all PASS, 1 if any FAIL (NaN never trips the gate).
+
+Levenshtein is a self-implemented O(m*n) DP (no numpy dep).
 """
 from __future__ import annotations
 
@@ -28,6 +37,26 @@ from typing import Dict, List, Optional, Tuple
 REF_ROOT = Path("/root/ppocr_reference")
 STRIP_GT = Path("/root/ocr_test_imgs/strip_gt.json")
 
+# Canonical dets / recs for the 7×7 main matrix (per AGENTS.md).
+MAIN_DETS: List[str] = [
+    "PP-OCRv4_mobile_det", "PP-OCRv4_server_det",
+    "PP-OCRv5_mobile_det", "PP-OCRv5_server_det",
+    "PP-OCRv6_tiny_det", "PP-OCRv6_small_det", "PP-OCRv6_medium_det",
+]
+MAIN_RECS: List[str] = [
+    "PP-OCRv4_mobile_rec", "PP-OCRv4_server_rec",
+    "PP-OCRv5_mobile_rec", "PP-OCRv5_server_rec",
+    "PP-OCRv6_tiny_rec", "PP-OCRv6_small_rec", "PP-OCRv6_medium_rec",
+]
+DOC_REC = "PP-OCRv4_server_rec_doc"
+LANG_RECS: List[str] = [
+    "en_PP-OCRv4_mobile_rec", "en_PP-OCRv5_mobile_rec",
+    "arabic_PP-OCRv5_mobile_rec", "cyrillic_PP-OCRv5_mobile_rec",
+    "devanagari_PP-OCRv5_mobile_rec", "el_PP-OCRv5_mobile_rec",
+    "eslav_PP-OCRv5_mobile_rec", "korean_PP-OCRv5_mobile_rec",
+    "latin_PP-OCRv5_mobile_rec", "th_PP-OCRv5_mobile_rec",
+]
+
 
 # ---------------------------------------------------------------------------
 # Levenshtein (no numpy)
@@ -41,7 +70,6 @@ def levenshtein(a: str, b: str) -> int:
         return len(b)
     if not b:
         return len(a)
-    # ensure b is shorter
     if len(a) < len(b):
         a, b = b, a
     n, m = len(b), len(a)
@@ -68,7 +96,7 @@ def cer(pred: str, base: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Loading
+# Loaders
 # ---------------------------------------------------------------------------
 
 def load_pred(pred_path: Path) -> List[dict]:
@@ -87,20 +115,49 @@ def load_strip_gt(gt_path: Path) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Strip schema validation
+# ---------------------------------------------------------------------------
+
+REQUIRED_STRIP_KEYS = ("image_path", "rec_texts", "rec_scores", "gt_text")
+REQUIRED_FULL_KEYS = ("image_path", "rec_texts", "rec_scores", "det_polys")
+
+
+def validate_strip_entry(entry: dict) -> Optional[str]:
+    """Return an error string if the strip entry is malformed, else None.
+
+    The strip baseline schema (per /root/ppocr_reference/strip__ta_PP-OCRv5_mobile_rec/ta/ocr_results.json)
+    is:
+        {image_path: str, rec_texts: [str, ...], rec_scores: [float, ...],
+         gt_text: str}
+    """
+    for k in REQUIRED_STRIP_KEYS:
+        if k not in entry:
+            return f"missing key: {k}"
+    if not isinstance(entry["rec_texts"], list):
+        return "rec_texts not a list"
+    if not isinstance(entry["rec_scores"], list):
+        return "rec_scores not a list"
+    if len(entry["rec_texts"]) != len(entry["rec_scores"]):
+        return ("rec_texts/rec_scores length mismatch: "
+                f"{len(entry['rec_texts'])} vs {len(entry['rec_scores'])}")
+    if not isinstance(entry["gt_text"], str):
+        return "gt_text not a string"
+    return None
+
+
+def validate_full_entry(entry: dict) -> Optional[str]:
+    for k in REQUIRED_FULL_KEYS:
+        if k not in entry:
+            return f"missing key: {k}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Per-cell scoring
 # ---------------------------------------------------------------------------
 
 def _join_texts(d: dict) -> str:
     return "\n".join(d.get("rec_texts", []) or [])
-
-
-def _join_texts_strip(d: dict) -> str:
-    """For strip cells, baseline uses `gt_text` (single line). For symmetry
-    we accept both list and scalar."""
-    gt = d.get("gt_text", "")
-    if isinstance(gt, list):
-        return "\n".join(gt)
-    return gt
 
 
 def score_image(pred_rec_texts: List[str], base: str) -> float:
@@ -114,7 +171,6 @@ def score_full_cell(combo_dir: Path, lang: str, results_dir: Path) -> Tuple[floa
     if not pred_path.exists():
         return float("nan"), 0
     pred = load_pred(pred_path)
-    # build map by image_path
     pred_by_path: Dict[str, List[str]] = {}
     for p in pred:
         pred_by_path[p["image_path"]] = p.get("rec_texts", [])
@@ -129,24 +185,54 @@ def score_full_cell(combo_dir: Path, lang: str, results_dir: Path) -> Tuple[floa
     return sum(scores) / len(scores), len(scores)
 
 
-def score_strip_cell(combo_dir: Path, results_dir: Path,
-                     strip_gt: Dict[str, str]) -> Tuple[float, int]:
-    pred_path = results_dir / combo_dir.name / "pred.json"
-    if not pred_path.exists():
+def score_full_cell_lang_avg(combo_dir: Path, results_dir: Path) -> Tuple[float, int]:
+    """Mean over languages (so each (det,rec) cell has one number)."""
+    scores: List[float] = []
+    n_imgs = 0
+    for lang_dir in sorted(combo_dir.iterdir()):
+        if not lang_dir.is_dir():
+            continue
+        c, n = score_full_cell(combo_dir, lang_dir.name, results_dir)
+        if c == c:
+            scores.append(c)
+            n_imgs += n
+    if not scores:
         return float("nan"), 0
+    return sum(scores) / len(scores), n_imgs
+
+
+def score_strip_cell(combo_dir: Path, lang: str, results_dir: Path,
+                     strip_gt: Dict[str, str]) -> Tuple[float, int, List[str]]:
+    """Per-lang score for a strip cell. Returns (cer, n, warnings)."""
+    pred_path = results_dir / combo_dir.name / lang / "pred.json"
+    if not pred_path.exists():
+        return float("nan"), 0, [f"missing pred: {pred_path}"]
     pred = load_pred(pred_path)
+    # Validate pred schema (must include image_path + rec_texts).
+    warnings: List[str] = []
+    for i, p in enumerate(pred):
+        if "image_path" not in p or "rec_texts" not in p:
+            warnings.append(f"pred[{i}] missing keys")
+    base_path = combo_dir / lang / "ocr_results.json"
+    base = load_baseline(base_path) if base_path.exists() else []
+    base_by_path: Dict[str, dict] = {b["image_path"]: b for b in base}
     scores: List[float] = []
     for p in pred:
         ipath = p["image_path"]
+        b = base_by_path.get(ipath)
+        if b is not None:
+            err = validate_strip_entry(b)
+            if err is not None:
+                warnings.append(f"baseline[{Path(ipath).name}]: {err}")
         gt = strip_gt.get(ipath, "")
         scores.append(score_image(p.get("rec_texts", []), gt))
     if not scores:
-        return float("nan"), 0
-    return sum(scores) / len(scores), len(scores)
+        return float("nan"), 0, warnings
+    return sum(scores) / len(scores), len(scores), warnings
 
 
 # ---------------------------------------------------------------------------
-# Report
+# Report rendering
 # ---------------------------------------------------------------------------
 
 def _fmt(x: float) -> str:
@@ -161,40 +247,128 @@ def _status(x: float, thr: float = 0.05) -> str:
     return "PASS" if x <= thr else "FAIL"
 
 
-def write_report(report_path: Path, rows: List[dict], *,
-                 title: str, threshold: float) -> None:
+def _matrix_7x7(det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
+                threshold: float) -> str:
+    """Render a 7x7 main matrix: rows=det, cols=rec; cell=CER (status)."""
     lines: List[str] = []
-    lines.append(f"# {title}")
+    lines.append("| det \\\\ rec | " + " | ".join(MAIN_RECS) + " |")
+    lines.append("|" + "|".join(["---"] * (len(MAIN_RECS) + 1)) + "|")
+    for det in MAIN_DETS:
+        row = [det]
+        for rec in MAIN_RECS:
+            cer, _n = det_to_rec_cer.get((det, rec), (float("nan"), 0))
+            row.append(f"{_fmt(cer)} {_status(cer, threshold)}")
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _summary(rows: List[dict], threshold: float) -> Tuple[int, int, int]:
+    pass_n = fail_n = nan_n = 0
+    for r in rows:
+        c = r.get("cer", float("nan"))
+        if c != c:
+            nan_n += 1
+        elif c <= threshold:
+            pass_n += 1
+        else:
+            fail_n += 1
+    return pass_n, fail_n, nan_n
+
+
+def render_report(*, det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
+                  lang_rec_rows: List[dict], doc_rows: List[dict],
+                  strip_rows: List[dict], seal_rows: List[dict],
+                  threshold: float, warnings: List[str]) -> Tuple[str, bool]:
+    """Build the markdown report. Returns (md, has_fail)."""
+    lines: List[str] = []
+    lines.append("# PP-OCR CER report")
     lines.append("")
     lines.append(f"Threshold: CER ≤ {threshold}")
     lines.append("")
-    # Decide columns
-    cols = ["combo", "lang", "images", "cer", "status"]
-    lines.append("| " + " | ".join(cols) + " |")
-    lines.append("|" + "|".join(["---"] * len(cols)) + "|")
-    pass_n = fail_n = nan_n = 0
-    for r in rows:
-        c = r["cer"]
-        if c != c:
-            nan_n += 1
-        else:
-            if c <= threshold:
-                pass_n += 1
-            else:
-                fail_n += 1
-        lines.append("| {combo} | {lang} | {n} | {cer} | {st} |".format(
-            combo=r["combo"], lang=r.get("lang", "-"), n=r.get("n", 0),
-            cer=_fmt(c), st=_status(c, threshold),
-        ))
-    lines.append("")
-    lines.append(f"**Summary:** PASS={pass_n}  FAIL={fail_n}  N/A={nan_n}")
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+
+    # ---- Main 7x7 matrix -------------------------------------------------
+    if det_to_rec_cer:
+        lines.append("## Main matrix (7×7) — lang-averaged CER")
+        lines.append("")
+        lines.append("Rows = `det`, cols = `rec`. Cell = mean CER across the 16 "
+                     "languages. Status: PASS / FAIL.")
+        lines.append("")
+        lines.append(_matrix_7x7(det_to_rec_cer, threshold))
+        # Flatten for summary
+        flat: List[dict] = []
+        for (det, rec), (cer_, n) in det_to_rec_cer.items():
+            flat.append({"combo": f"{det}__{rec}", "cer": cer_, "n": n})
+        pass_n, fail_n, nan_n = _summary(flat, threshold)
+        lines.append(f"**Main matrix (49 cells):** PASS={pass_n}  FAIL={fail_n}  N/A={nan_n}")
+        lines.append("")
+    else:
+        flat = []
+
+    # ---- Lang-rec block --------------------------------------------------
+    if lang_rec_rows:
+        lines.append("## Lang-rec block (per-cell CER)")
+        lines.append("")
+        lines.append("| combo | langs scored | mean CER | status |")
+        lines.append("|---|---|---|---|")
+        for r in lang_rec_rows:
+            lines.append(f"| {r['combo']} | {r['n_langs']} | {_fmt(r['cer'])} | "
+                         f"{_status(r['cer'], threshold)} |")
+        flat += lang_rec_rows
+        lines.append("")
+
+    # ---- Doc block -------------------------------------------------------
+    if doc_rows:
+        lines.append("## Doc-rec block (PP-OCRv4_server_rec_doc)")
+        lines.append("")
+        lines.append("| combo | langs scored | mean CER | status |")
+        lines.append("|---|---|---|---|")
+        for r in doc_rows:
+            lines.append(f"| {r['combo']} | {r['n_langs']} | {_fmt(r['cer'])} | "
+                         f"{_status(r['cer'], threshold)} |")
+        flat += doc_rows
+        lines.append("")
+
+    # ---- Strip block -----------------------------------------------------
+    if strip_rows:
+        lines.append("## Strip rec-only (ta/te)")
+        lines.append("")
+        lines.append("| combo | lang | imgs | CER | status |")
+        lines.append("|---|---|---|---|---|")
+        for r in strip_rows:
+            lines.append(f"| {r['combo']} | {r['lang']} | {r['n']} | "
+                         f"{_fmt(r['cer'])} | {_status(r['cer'], threshold)} |")
+        flat += strip_rows
+        lines.append("")
+
+    # ---- Seal block ------------------------------------------------------
+    if seal_rows:
+        lines.append("## Seal det (M4 scope — N/A)")
+        lines.append("")
+        lines.append("| combo | lang | status |")
+        lines.append("|---|---|---|")
+        for r in seal_rows:
+            lines.append(f"| {r['combo']} | {r.get('lang', '-')} | N/A |")
+        flat += seal_rows
+        lines.append("")
+
+    # ---- Warnings --------------------------------------------------------
+    if warnings:
+        lines.append("## Schema warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    pass_n, fail_n, nan_n = _summary(flat, threshold)
+    has_fail = fail_n > 0
+    lines.append("---")
+    lines.append(f"**Total:** PASS={pass_n}  FAIL={fail_n}  N/A={nan_n}  "
+                 f"(cells={len(flat)})")
+    return "\n".join(lines) + "\n", has_fail
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Discovery
 # ---------------------------------------------------------------------------
 
 def _iter_full_combos() -> List[Path]:
@@ -205,7 +379,6 @@ def _iter_full_combos() -> List[Path]:
         n = c.name
         if "__" not in n or n.startswith("strip__"):
             continue
-        # skip seal dirs (they have no __)
         out.append(c)
     return out
 
@@ -230,63 +403,146 @@ def _iter_seal() -> List[Path]:
     return out
 
 
-def main_full(results_dir: Path, *, threshold: float, report_path: Path) -> int:
+# ---------------------------------------------------------------------------
+# Top-level score functions (return rows + warnings)
+# ---------------------------------------------------------------------------
+
+def collect_main_matrix(results_dir: Path) -> Tuple[Dict[Tuple[str, str], Tuple[float, int]],
+                                                    List[str]]:
+    """Build the 7×7 (det, rec) → (cer, n_imgs) map using lang-averaged CER."""
+    det_to_rec: Dict[Tuple[str, str], Tuple[float, int]] = {}
+    warnings: List[str] = []
+    for combo_dir in _iter_full_combos():
+        n = combo_dir.name
+        if "__" not in n:
+            continue
+        det, rec = n.split("__", 1)
+        if det not in MAIN_DETS or rec not in MAIN_RECS:
+            continue
+        c, n_imgs = score_full_cell_lang_avg(combo_dir, results_dir)
+        det_to_rec[(det, rec)] = (c, n_imgs)
+    return det_to_rec, warnings
+
+
+def collect_lang_rec_block(results_dir: Path) -> List[dict]:
     rows: List[dict] = []
     for combo_dir in _iter_full_combos():
+        n = combo_dir.name
+        if "__" not in n:
+            continue
+        det, rec = n.split("__", 1)
+        if rec not in LANG_RECS:
+            continue
+        c, n_imgs = score_full_cell_lang_avg(combo_dir, results_dir)
+        rows.append({"combo": n, "cer": c, "n_langs": n_imgs // 10 if n_imgs else 0})
+    return rows
+
+
+def collect_doc_block(results_dir: Path) -> List[dict]:
+    rows: List[dict] = []
+    for combo_dir in _iter_full_combos():
+        n = combo_dir.name
+        if "__" not in n:
+            continue
+        det, rec = n.split("__", 1)
+        if rec != DOC_REC:
+            continue
+        c, n_imgs = score_full_cell_lang_avg(combo_dir, results_dir)
+        rows.append({"combo": n, "cer": c, "n_langs": n_imgs // 10 if n_imgs else 0})
+    return rows
+
+
+def collect_strip_block(results_dir: Path) -> Tuple[List[dict], List[str]]:
+    if not STRIP_GT.exists():
+        return [], [f"strip GT not found at {STRIP_GT}"]
+    strip_gt = load_strip_gt(STRIP_GT)
+    rows: List[dict] = []
+    warnings: List[str] = []
+    for combo_dir in _iter_strip_combos():
         for lang_dir in sorted(combo_dir.iterdir()):
             if not lang_dir.is_dir():
                 continue
             lang = lang_dir.name
-            c, n = score_full_cell(combo_dir, lang, results_dir)
+            c, n, ws = score_strip_cell(combo_dir, lang, results_dir, strip_gt)
             rows.append({"combo": combo_dir.name, "lang": lang, "cer": c, "n": n})
-    write_report(report_path, rows, title="PP-OCR Full OCR matrix — CER", threshold=threshold)
-    has_fail = any((r["cer"] == r["cer"] and r["cer"] > threshold) for r in rows)
+            warnings.extend(ws)
+    return rows, warnings
+
+
+def collect_seal_block() -> List[dict]:
+    rows: List[dict] = []
+    for s in _iter_seal():
+        rows.append({"combo": s.name, "lang": "seal", "cer": float("nan"), "n": 0})
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Main entry points (CLI handlers)
+# ---------------------------------------------------------------------------
+
+def main_full(results_dir: Path, *, threshold: float, report_path: Path) -> int:
+    """Score the 7×7 main matrix + lang-rec + doc blocks.
+
+    The user-facing default is the 7×7 (visible in the report header) plus
+    a lang-rec/doc block; the 'all' flag adds strip and seal. This matches
+    the contract: '7×7 main matrix + lang-rec/doc single column'.
+    """
+    det_to_rec, _ = collect_main_matrix(results_dir)
+    lang_rec = collect_lang_rec_block(results_dir)
+    doc = collect_doc_block(results_dir)
+    md, has_fail = render_report(
+        det_to_rec_cer=det_to_rec, lang_rec_rows=lang_rec, doc_rows=doc,
+        strip_rows=[], seal_rows=[], threshold=threshold, warnings=[],
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(md)
     return 1 if has_fail else 0
 
 
 def main_strip(results_dir: Path, *, threshold: float, report_path: Path) -> int:
-    if not STRIP_GT.exists():
-        print(f"ERROR: strip GT not found at {STRIP_GT}", file=sys.stderr)
-        return 2
-    strip_gt = load_strip_gt(STRIP_GT)
-    rows: List[dict] = []
-    for combo_dir in _iter_strip_combos():
-        # strip cells have a flat ocr_results.json per language subdir
-        # (we read pred.json from results/<combo>/<lang>/pred.json, so iterate langs)
-        any_lang = False
-        for lang_dir in sorted(combo_dir.iterdir()):
-            if not lang_dir.is_dir():
-                continue
-            lang = lang_dir.name
-            # The strip baseline is per-language; but the GT we use is strip_gt
-            # which is keyed by image path. So per-language cer works.
-            pred_path = results_dir / combo_dir.name / lang / "pred.json"
-            if not pred_path.exists():
-                continue
-            pred = load_pred(pred_path)
-            scores: List[float] = []
-            for p in pred:
-                gt = strip_gt.get(p["image_path"], "")
-                scores.append(score_image(p.get("rec_texts", []), gt))
-            c = sum(scores) / len(scores) if scores else float("nan")
-            rows.append({"combo": combo_dir.name, "lang": lang, "cer": c, "n": len(scores)})
-            any_lang = True
-        if not any_lang:
-            rows.append({"combo": combo_dir.name, "lang": "-", "cer": float("nan"), "n": 0})
-    write_report(report_path, rows, title="PP-OCR Strip rec-only — CER",
-                 threshold=threshold)
-    has_fail = any((r["cer"] == r["cer"] and r["cer"] > threshold) for r in rows)
+    """Strip-only mode: just the strip block, no main matrix.
+
+    (Use --all to combine everything.)"""
+    rows, warnings = collect_strip_block(results_dir)
+    md, has_fail = render_report(
+        det_to_rec_cer={}, lang_rec_rows=[], doc_rows=[],
+        strip_rows=rows, seal_rows=[], threshold=threshold, warnings=warnings,
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(md)
     return 1 if has_fail else 0
 
 
 def main_seal(*, report_path: Path) -> int:
-    """M4 scope: report seal dirs as N/A, no scoring."""
-    rows: List[dict] = []
-    for s in _iter_seal():
-        rows.append({"combo": s.name, "lang": "seal", "cer": float("nan"), "n": 0})
-    write_report(report_path, rows, title="PP-OCR Seal det — N/A (M4 scope)",
-                 threshold=0.05)
+    """Seal-only mode: just the M4 stub."""
+    rows = collect_seal_block()
+    md, _ = render_report(
+        det_to_rec_cer={}, lang_rec_rows=[], doc_rows=[],
+        strip_rows=[], seal_rows=rows, threshold=0.05, warnings=[],
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(md)
     return 0
+
+
+def main_all(results_dir: Path, *, threshold: float, report_path: Path) -> int:
+    det_to_rec, _ = collect_main_matrix(results_dir)
+    lang_rec = collect_lang_rec_block(results_dir)
+    doc = collect_doc_block(results_dir)
+    strip, warnings = collect_strip_block(results_dir)
+    seal = collect_seal_block()
+    md, has_fail = render_report(
+        det_to_rec_cer=det_to_rec, lang_rec_rows=lang_rec, doc_rows=doc,
+        strip_rows=strip, seal_rows=seal, threshold=threshold,
+        warnings=warnings,
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(md)
+    return 1 if has_fail else 0
 
 
 # ---------------------------------------------------------------------------
@@ -295,57 +551,28 @@ def main_seal(*, report_path: Path) -> int:
 
 def _cli(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(prog="score")
-    ap.add_argument("--results-dir", default=str(Path(__file__).resolve().parent.parent / "results"))
+    ap.add_argument("--results-dir",
+                    default=str(Path(__file__).resolve().parent.parent / "results"))
     ap.add_argument("--report", default=None,
-                    help="path to write report.md (default: results/report.md)")
+                    help="path to write report.md (default: <results-dir>/report.md)")
+    ap.add_argument("--report-md", dest="report_md", default=None,
+                    help="alias of --report")
     ap.add_argument("--threshold", type=float, default=0.05)
-    ap.add_argument("--strip", action="store_true", help="score strip cells instead of full")
+    ap.add_argument("--strip", action="store_true", help="score strip cells")
     ap.add_argument("--seal", action="store_true", help="emit seal N/A stub")
-    ap.add_argument("--all", action="store_true", help="write full + strip + seal sections")
+    ap.add_argument("--all", action="store_true",
+                    help="write full + lang-rec + doc + strip + seal sections")
     args = ap.parse_args(argv)
 
     results_dir = Path(args.results_dir)
     if not results_dir.exists():
         print(f"ERROR: results dir not found: {results_dir}", file=sys.stderr)
         return 2
-    default_report = results_dir / "report.md"
-    report_path = Path(args.report) if args.report else default_report
+    report_path = Path(args.report_md or args.report or
+                       (results_dir / "report.md"))
 
     if args.all:
-        # combined
-        rows: List[dict] = []
-        for combo_dir in _iter_full_combos():
-            for lang_dir in sorted(combo_dir.iterdir()):
-                if not lang_dir.is_dir():
-                    continue
-                c, n = score_full_cell(combo_dir, lang_dir.name, results_dir)
-                rows.append({"combo": combo_dir.name, "lang": lang_dir.name,
-                             "cer": c, "n": n})
-        strip_gt = load_strip_gt(STRIP_GT) if STRIP_GT.exists() else {}
-        for combo_dir in _iter_strip_combos():
-            for lang_dir in sorted(combo_dir.iterdir()):
-                if not lang_dir.is_dir():
-                    continue
-                pred_path = results_dir / combo_dir.name / lang_dir.name / "pred.json"
-                if not pred_path.exists():
-                    rows.append({"combo": combo_dir.name, "lang": lang_dir.name,
-                                 "cer": float("nan"), "n": 0})
-                    continue
-                pred = load_pred(pred_path)
-                scores: List[float] = []
-                for p in pred:
-                    gt = strip_gt.get(p["image_path"], "")
-                    scores.append(score_image(p.get("rec_texts", []), gt))
-                c = sum(scores) / len(scores) if scores else float("nan")
-                rows.append({"combo": combo_dir.name, "lang": lang_dir.name,
-                             "cer": c, "n": len(scores)})
-        for s in _iter_seal():
-            rows.append({"combo": s.name, "lang": "seal", "cer": float("nan"), "n": 0})
-        write_report(report_path, rows, title="PP-OCR full matrix (full+strip+seal)",
-                     threshold=args.threshold)
-        has_fail = any((r["cer"] == r["cer"] and r["cer"] > args.threshold) for r in rows)
-        return 1 if has_fail else 0
-
+        return main_all(results_dir, threshold=args.threshold, report_path=report_path)
     if args.strip:
         return main_strip(results_dir, threshold=args.threshold, report_path=report_path)
     if args.seal:

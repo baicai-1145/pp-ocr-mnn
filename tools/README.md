@@ -17,6 +17,7 @@ tools/
 
   README.md           this file
   CER_VS_OFFICIAL.md  analysis: our CER vs PaddleOCR RecMetric
+  REC_ONLY.md         rec-only contract gap (CLI patch request to m1)
 
 tests/
   test_tools.py       unit + integration tests (30 tests, stdlib only)
@@ -110,6 +111,7 @@ python3 tools/cer_audit.py --out results/cer_audit.md
 | `--cells REGEX` | all | restrict combo names by regex |
 | `--only-combo NAME` | none | restrict to a single combo (repeatable) |
 | `--langs a,b,c` | all | restrict languages |
+| `--rec-only` | off | rec-only mode; **CLI does not yet support this** — see `tools/REC_ONLY.md`. Implies `--include-strip`. |
 | `--dry-run` | off | print plan only, do not run CLI |
 
 ### `score.py` flags (most-used)
@@ -118,11 +120,16 @@ python3 tools/cer_audit.py --out results/cer_audit.md
 |---|---|---|
 | `--results-dir DIR` | `./results` | dir containing `<combo>/<lang>/pred.json` |
 | `--report PATH` | `<results-dir>/report.md` | output matrix |
+| `--report-md PATH` | `<results-dir>/report.md` | alias of `--report` |
 | `--threshold F` | `0.05` | per-cell mean CER cutoff |
 | `--strip` | off | score `strip__*` cells vs `strip_gt.json` |
 | `--seal` | off | emit M4 N/A stub |
-| `--all` | off | full + strip + seal in one report |
+| `--all` | off | full + lang-rec + doc + strip + seal in one report |
 | exit code | — | `0` = all PASS, `1` = any FAIL |
+
+The default `score.py` (no flag) writes a 7×7 main matrix (rows=det,
+cols=rec, cell=lang-averaged CER + status) plus a lang-rec block and
+a doc-rec block. Use `--all` to also include strip and seal.
 
 ## Catalog (30 models)
 
