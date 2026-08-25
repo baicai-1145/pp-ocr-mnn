@@ -634,6 +634,142 @@ class TestConfigSchema(unittest.TestCase):
         self.assertEqual(d["cls"]["labels"], ["0_degree", "180_degree"])
 
 
+class TestVerifyMnnShapes(unittest.TestCase):
+    """Unit tests for tools/verify_mnn_shapes.py (TOOLS-4)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tools import verify_mnn_shapes as v
+        cls.v = v
+
+    def test_is_v6(self):
+        self.assertTrue(self.v.is_v6("PP-OCRv6_tiny_det"))
+        self.assertTrue(self.v.is_v6("PP-OCRv6_small_det"))
+        self.assertTrue(self.v.is_v6("PP-OCRv6_medium_det"))
+        self.assertFalse(self.v.is_v6("PP-OCRv4_mobile_det"))
+        self.assertFalse(self.v.is_v6("PP-OCRv5_server_det"))
+        self.assertFalse(self.v.is_v6("PP-OCRv4_mobile_seal_det"))
+
+    def test_v6_shape_battery_contains_failing_shape(self):
+        # 720x1280 is the canonical failing case (non-32-multiple H)
+        self.assertIn("1x3x720x1280", self.v.V6_SHAPES)
+        # ... and several 32-multiples that should pass
+        self.assertIn("1x3x736x1312", self.v.V6_SHAPES)
+        self.assertIn("1x3x960x960", self.v.V6_SHAPES)
+        self.assertIn("1x3x640x480", self.v.V6_SHAPES)
+        self.assertIn("1x3x1024x1024", self.v.V6_SHAPES)
+
+    def test_v4v5_battery_extends_v6(self):
+        # v4/v5 gets a few extra square shapes
+        for s in self.v.V6_SHAPES:
+            self.assertIn(s, self.v.V4V5_SHAPES)
+        self.assertIn("1x3x1280x1280", self.v.V4V5_SHAPES)
+        self.assertIn("1x3x1152x1280", self.v.V4V5_SHAPES)
+
+    def test_parse_probe_output_ok(self):
+        out = (
+            "model: /tmp/test.mnn\n"
+            "  backend: cpu\n"
+            "  input: x, default shape: [1,3,-1,-1]\n"
+            "  num_shapes: 1\n"
+            "\n"
+            "[ OK ] shape=1x3x736x1312 -> output [1x1x736x1312]\n"
+            "\n"
+            "Summary: 1/1 shapes passed, 0 failed\n"
+        )
+        parsed = self.v.parse_probe_output(out)
+        self.assertEqual(len(parsed), 1)
+        shape, status, rest, hint = parsed[0]
+        self.assertEqual(shape, "1x3x736x1312")
+        self.assertEqual(status, "OK")
+        self.assertEqual(rest, "output [1x1x736x1312]")
+        self.assertEqual(hint, "")
+
+    def test_parse_probe_output_fail(self):
+        out = (
+            "model: /tmp/test.mnn\n"
+            "  backend: cpu\n"
+            "\n"
+            "OpenCL init error, fallback ...\n"
+            "Error to use creator of 3, delete it\n"
+            "Broad cast error, dim1 = 46, dim2 = 45\n"
+            "Compute Shape Error for Add.179\n"
+            "Can't run session because not resized\n"
+            "[FAIL] shape=1x3x720x1280 runSession rc=3\n"
+        )
+        parsed = self.v.parse_probe_output(out)
+        self.assertEqual(len(parsed), 1)
+        shape, status, rest, hint = parsed[0]
+        self.assertEqual(shape, "1x3x720x1280")
+        self.assertEqual(status, "FAIL")
+        self.assertEqual(rest, "runSession rc=3")
+        # Hint should be filtered: OpenCL/creator lines dropped,
+        # the actual error kept.
+        self.assertNotIn("OpenCL", hint)
+        self.assertNotIn("Error to use creator", hint)
+        self.assertIn("Broad cast", hint)
+        self.assertIn("Compute Shape", hint)
+        self.assertIn("Can't run", hint)
+
+    def test_parse_probe_output_mixed(self):
+        out = (
+            "[ OK ] shape=1x3x736x1312 -> output [1x1x736x1312]\n"
+            "Broad cast error, dim1 = 46, dim2 = 45\n"
+            "[FAIL] shape=1x3x720x1280 runSession rc=3\n"
+            "Summary: 1/2 shapes passed, 1 failed\n"
+        )
+        parsed = self.v.parse_probe_output(out)
+        self.assertEqual(len(parsed), 2)
+        # First should be OK (no hint)
+        self.assertEqual(parsed[0][1], "OK")
+        self.assertEqual(parsed[0][3], "")
+        # Second should be FAIL with the broad cast hint
+        self.assertEqual(parsed[1][1], "FAIL")
+        self.assertIn("Broad cast", parsed[1][3])
+
+    def test_render_table(self):
+        res = {
+            "PP-OCRv6_tiny_det": {
+                "1x3x720x1280": {"ok": False, "stderr_hint": "Broad cast", "output_or_error": ""},
+                "1x3x736x1312": {"ok": True, "stderr_hint": "", "output_or_error": "output [...]"},
+            }
+        }
+        md = self.v.render_table(res, self.v.V6_SHAPES)
+        self.assertIn("| model |", md)
+        self.assertIn("PP-OCRv6_tiny_det", md)
+        self.assertIn("FAIL: Broad cast", md)
+        self.assertIn("OK", md)
+        # Columns that weren't tested should NOT appear
+        self.assertNotIn("960x960", md)
+
+    def test_render_per_model(self):
+        res = {
+            "X": {
+                "1x3x720x1280": {"ok": False, "stderr_hint": "Broad cast", "output_or_error": ""},
+                "1x3x736x1312": {"ok": True, "stderr_hint": "", "output_or_error": "output [...]"},
+            }
+        }
+        md = self.v.render_per_model(res, self.v.V6_SHAPES)
+        self.assertIn("### X", md)
+        # Counts should be over the 2 actually-tested shapes, not 12
+        self.assertIn("pass: 1/2", md)
+        self.assertIn("fail: 1/2", md)
+
+    def test_build_probe_if_missing(self):
+        # build_probe is idempotent; just ensure it returns a Path
+        from pathlib import Path
+        p = self.v.build_probe()
+        self.assertIsInstance(p, Path)
+        self.assertTrue(p.exists(), f"probe not built at {p}")
+
+    def test_main_zero_args_exits_2(self):
+        # No models -> exit 2
+        with __import__("contextlib").redirect_stdout(__import__("io").StringIO()), \
+             __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            rc = self.v.main([])
+        self.assertEqual(rc, 2)
+
+
 def main():
     unittest.main(verbosity=2)
 
