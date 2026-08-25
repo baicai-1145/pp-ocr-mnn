@@ -1,0 +1,21 @@
+{
+  "name": "PP-OCRv4_server_det",
+  "type": "det",
+  "file": "PP-OCRv4_server_det.mnn",
+  "sha256": "c670afc3610cccf7d8883325b2544a8233d8b8457bcae67aa081db17ba20d599",
+  "bytes": 95042388,
+  "url": "PP-OCRv4_server_det.mnn",
+  "det": {
+    "thresh": 0.3,
+    "box_thresh": 0.6,
+    "unclip_ratio": 1.5,
+    "max_candidates": 1000,
+    "resize": {
+      "mode": "resize_long",
+      "limit_side_len": 736,
+      "resize_long": 960,
+      "stride": 128,
+      "max_side_limit": 4000
+    }
+  }
+}

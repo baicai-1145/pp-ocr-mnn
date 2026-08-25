@@ -1,0 +1,21 @@
+{
+  "name": "PP-OCRv6_tiny_det",
+  "type": "det",
+  "file": "PP-OCRv6_tiny_det.mnn",
+  "sha256": "8d22c1e80a4f2895c670ea29eaaa1ebbfbb8631434cd26cdb68e6223dd36620d",
+  "bytes": 1746376,
+  "url": "PP-OCRv6_tiny_det.mnn",
+  "det": {
+    "thresh": 0.2,
+    "box_thresh": 0.4,
+    "unclip_ratio": 1.4,
+    "max_candidates": 3000,
+    "resize": {
+      "mode": "limit_min",
+      "limit_side_len": 736,
+      "resize_long": 960,
+      "stride": 32,
+      "max_side_limit": 4000
+    }
+  }
+}

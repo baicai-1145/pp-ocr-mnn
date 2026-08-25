@@ -1,0 +1,29 @@
+{
+  "name": "PP-LCNet_x1_0_textline_ori",
+  "type": "cls",
+  "file": "PP-LCNet_x1_0_textline_ori.mnn",
+  "sha256": "8b63eed38352bd505e4790a4fcb4d213889c83d4b78bcc055a8ec74cbfe1f687",
+  "bytes": 6694800,
+  "url": "PP-LCNet_x1_0_textline_ori.mnn",
+  "cls": {
+    "shape": [
+      3,
+      80,
+      160
+    ],
+    "labels": [
+      "0_degree",
+      "180_degree"
+    ],
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  }
+}
