@@ -1,0 +1,23 @@
+# build
+build/
+cmake-build-*/
+out/
+# weights & converted models
+models/*.mnn
+models/*.onnx
+models/_onnx/
+# downloaded assets
+_downloads/
+# local test outputs
+tests/data/
+results/
+*.log
+# python
+__pycache__/
+*.pyc
+.venv/
+# ide/os
+.idea/
+.vscode/
+*.swp
+.DS_Store
