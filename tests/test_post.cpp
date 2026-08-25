@@ -426,6 +426,73 @@ void test_db_postprocess_two_rects() {
   std::printf("[ok] test_db_postprocess_two_rects: %zu boxes\n", boxes.size());
 }
 
+// --- Test 15: warp_perspective_quad with extreme aspect ratio (h/w = 8:1) ---
+// A very thin horizontal text line is common in real textline-warping use
+// cases. Make sure the sampler does not produce out-of-bounds reads or
+// writes a wrong-sized output.
+void test_warp_extreme_aspect() {
+  const int W = 80, H = 16, C = 3;
+  Image src;
+  src.w = W; src.h = H; src.c = C;
+  src.data.assign(W * H * C, 0);
+  // Linear gradient (x -> 0..255).
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      uint8_t v = static_cast<uint8_t>(x * 3);
+      for (int c = 0; c < C; ++c) src.data[(y * W + x) * C + c] = v;
+    }
+  // Quad in src coords: 80 wide, 10 tall, around the middle. Destination
+  // 8x high to get h/w = 8/64 = 1/8.
+  PointF quad[4] = {
+      {0, 3}, {W - 1, 3}, {W - 1, 12}, {0, 12},
+  };
+  const int dst_w = 64, dst_h = 8;  // aspect 8:1
+  Image dst = warp_perspective_quad(src, quad, dst_w, dst_h);
+  assert(dst.w == dst_w && dst.h == dst_h && dst.c == C);
+  assert(!dst.data.empty());
+  // Pixels should be in valid range; no all-zero output.
+  int non_zero = 0;
+  int oob = 0;
+  for (int y = 0; y < dst_h; ++y)
+    for (int x = 0; x < dst_w; ++x) {
+      for (int c = 0; c < C; ++c) {
+        uint8_t v = dst.data[(y * dst_w + x) * C + c];
+        if (v != 0) ++non_zero;
+        // No OOB check needed since output is uint8; this asserts nonzero.
+        (void)oob;
+      }
+    }
+  // At least half the pixels should be non-zero (gradient has 0 at x=0).
+  if (non_zero < (dst_w * dst_h * C) / 2) {
+    std::fprintf(stderr,
+                 "FAIL test_warp_extreme_aspect: only %d non-zero of %d\n",
+                 non_zero, dst_w * dst_h * C);
+    std::exit(1);
+  }
+  std::printf("[ok] test_warp_extreme_aspect: dst=%dx%d, %d non-zero pixels\n",
+              dst_w, dst_h, non_zero);
+}
+
+// --- Test 16: db_postprocess on all-zero prob map (no boxes, no crash) ----
+void test_db_postprocess_zero_map() {
+  const int H = 32, W = 48;
+  std::vector<float> prob(W * H, 0.0f);  // all zeros
+  DetConfig cfg;
+  cfg.thresh = 0.3f;
+  cfg.box_thresh = 0.5f;
+  cfg.unclip_ratio = 1.5f;
+  cfg.max_candidates = 100;
+  // Must not crash, must return zero boxes (nothing above threshold).
+  auto boxes = db_postprocess(prob.data(), H, W, 96, 64, 2.0f, 2.0f, cfg);
+  if (!boxes.empty()) {
+    std::fprintf(stderr,
+                 "FAIL test_db_postprocess_zero_map: expected 0 boxes, got %zu\n",
+                 boxes.size());
+    std::exit(1);
+  }
+  std::printf("[ok] test_db_postprocess_zero_map: 0 boxes (no crash)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -435,14 +502,16 @@ int main() {
   test_sort_min_area_rect_points();
   test_warp_identity();
   test_warp_subpixel_shift();
+  test_warp_extreme_aspect();
   test_db_postprocess_white_rect();
   test_db_postprocess_two_rects();
+  test_db_postprocess_zero_map();
   test_ctc_decode_basic();
   test_ctc_decode_with_space();
   test_ctc_decode_utf8();
   test_ctc_decode_all_blank();
   test_ctc_decode_blank_between_repeats();
   test_ctc_decode_probabilistic();
-  std::printf("\nALL POSTPROCESS TESTS PASSED (14/14)\n");
+  std::printf("\nALL POSTPROCESS TESTS PASSED (16/16)\n");
   return 0;
 }

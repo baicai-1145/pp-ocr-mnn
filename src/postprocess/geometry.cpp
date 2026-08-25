@@ -119,16 +119,25 @@ bool min_area_rect_convex(const std::vector<PointF>& h, PointF out[4],
 }
 
 // --- bicubic (OpenCV INTER_CUBIC, a = -0.75) ---------------------------------
-inline float cubic_weight(float t) {
-  const float a = -0.75f;
-  float at = std::fabs(t);
-  if (at < 1.0f) {
-    return ((a + 2.0f) * at - (a + 3.0f)) * at * at + 1.0f;
-  }
-  if (at < 2.0f) {
-    return ((a * at - 5.0f * a) * at + 8.0f * a) * at - 4.0f * a;
-  }
-  return 0.0f;
+// Port of OpenCV's interpolateCubic: 3 explicit weights + 1 residual. The 4
+// samples are at offsets -1, 0, 1, 2 from x0 (where x0 = floor(sample)). The
+// residual guarantees partition-of-unity exactly (sum to 1.0) and matches
+// OpenCV's rounding pattern bit-for-bit in most cases.
+inline void cubic_weights(float fx, float w[4]) {
+  const float A = -0.75f;
+  // OpenCV's parameterization: x in [0, 1) is the fractional offset.
+  // c[0] = kernel at |t| = x+1   (sample at x0-1)
+  // c[1] = kernel at |t| = x     (sample at x0)
+  // c[2] = kernel at |t| = 1-x   (sample at x0+1)
+  // c[3] = 1 - c[0] - c[1] - c[2] (sample at x0+2)
+  w[0] = ((A * (fx + 1.0f) - 5.0f * A) * (fx + 1.0f) + 8.0f * A) *
+             (fx + 1.0f) -
+         4.0f * A;
+  w[1] = ((A + 2.0f) * fx - (A + 3.0f)) * fx * fx + 1.0f;
+  w[2] = ((A + 2.0f) * (1.0f - fx) - (A + 3.0f)) * (1.0f - fx) *
+             (1.0f - fx) +
+         1.0f;
+  w[3] = 1.0f - w[0] - w[1] - w[2];
 }
 
 inline uint8_t sample_bicubic_replicate_plane(const uint8_t* plane, int w, int h,
@@ -150,10 +159,8 @@ inline uint8_t sample_bicubic_replicate_plane(const uint8_t* plane, int w, int h
     ys[i] = yy;
   }
   float wx[4], wy[4];
-  for (int i = 0; i < 4; ++i) {
-    wx[i] = cubic_weight(fx - (i - 1));
-    wy[i] = cubic_weight(fy - (i - 1));
-  }
+  cubic_weights(fx, wx);
+  cubic_weights(fy, wy);
   float sum = 0.0f;
   for (int j = 0; j < 4; ++j) {
     float row_w = 0.0f;
