@@ -228,6 +228,40 @@ void test_config_json_parse_rec() {
 
 } // namespace
 
+// PaddleOCR NumPy round() compatibility: half-to-even (banker's
+// rounding). The 32 px discrepancy in M2-PIPE (1280x720 -> 1280x704
+// in baseline, 1280x736 in our M1 path) was caused by the previous
+// ceil-based alignment. These cases pin the new contract.
+void test_stride_align() {
+  using ppocr::round_up_to_stride;
+  // Reference: numpy.round() in Python uses banker's rounding
+  // (FE_TONEAREST, half-to-even) on IEEE-754 doubles. std::nearbyint
+  // does the same on the host C++ side. We pin every half-value
+  // boundary that arises during a normal 32-align det resize so
+  // future drift is caught at test time.
+  // Reference: numpy.round() in Python uses banker's rounding
+  // (FE_TONEAREST, half-to-even) on IEEE-754 doubles. std::nearbyint
+  // does the same on the host C++ side. We pin every half-value
+  // boundary that arises during a normal 32-align det resize so
+  // future drift is caught at test time.
+  CHECK(round_up_to_stride(720, 32) == 704);  // 22.5 -> 22 -> 704
+  CHECK(round_up_to_stride(736, 32) == 736);  // 23   -> 23 -> 736
+  CHECK(round_up_to_stride(944, 32) == 960);  // 29.5 -> 30 -> 960
+  CHECK(round_up_to_stride(976, 32) == 960);  // 30.5 -> 30 -> 960
+  CHECK(round_up_to_stride(992, 32) == 992);  // 31   -> 31 -> 992
+  CHECK(round_up_to_stride(0,   32) == 32);   // 0    -> 0  -> clamp to 32
+  CHECK(round_up_to_stride(16,  32) == 32);   // 0.5  -> 0  -> clamp to 32
+  CHECK(round_up_to_stride(48,  32) == 64);   // 1.5  -> 2  -> 64  (half-to-even)
+  CHECK(round_up_to_stride(64,  32) == 64);   // 2    -> 2  -> 64
+  CHECK(round_up_to_stride(704, 32) == 704);  // 22   -> 22 -> 704
+  CHECK(round_up_to_stride(736, 32) == 736);  // 23   -> 23 -> 736
+  // 128-align sanity (used by seal det):
+  CHECK(round_up_to_stride(720, 128) == 768);  // 5.625 -> 6 -> 768
+  CHECK(round_up_to_stride(768, 128) == 768);  // 6 -> 6 -> 768
+  CHECK(round_up_to_stride(960, 128) == 1024); // 7.5 -> 8 -> 1024 (half-to-even)
+  CHECK(round_up_to_stride(896, 128) == 896);  // 7 -> 7 -> 896
+}
+
 int main() {
   test_det_type0();
   test_det_type2();
@@ -236,6 +270,7 @@ int main() {
   test_rec_normalization();
   test_config_json_parse();
   test_config_json_parse_rec();
+  test_stride_align();
   std::fprintf(stderr, "all preprocess tests passed\n");
   return 0;
 }

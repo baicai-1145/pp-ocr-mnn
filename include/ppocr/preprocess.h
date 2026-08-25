@@ -48,5 +48,14 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w, 
 // cls: resize to cfg.h * cfg.w, ImageNet norm, CHW float32. No padding.
 std::vector<float> prep_cls(const Image& bgr, const ClsConfig& cfg);
 
+// Snap an integer to the nearest multiple of `m` using banker's
+// rounding (half-to-even). Matches Python `round()` / numpy.round.
+// PaddleOCR's DetResizeForTest is implemented on top of NumPy's
+// half-to-even rule (e.g. `int(round(720/32) * 32) == 704`). The
+// previous ceil-based alignment was off by 32 px on 720-px inputs
+// and was the root cause of the M2-PIPE CER regression. Exposed
+// here so the test suite can pin the half-value boundaries.
+int round_up_to_stride(int v, int m);
+
 } // namespace ppocr
 #endif // PPOCR_PREPROCESS_H_
