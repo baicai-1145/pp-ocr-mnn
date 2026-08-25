@@ -78,6 +78,8 @@ int round_up_to_stride(int v, int m) {
 
 // Convert HxWx3 BGR uint8 to CHW float32 with the given per-channel
 // scale, mean, std. scale is applied first: y = (x*scale - mean) / std.
+// The mean/std arrays are aligned with the BGR channel order PaddleOCR
+// uses (mean[0] for B, mean[2] for R); no axis swap is performed here.
 void hwc_bgr_to_chw_float(const uint8_t* src, int w, int h,
                           float* dst,
                           float scale,
@@ -88,8 +90,8 @@ void hwc_bgr_to_chw_float(const uint8_t* src, int w, int h,
     const uint8_t* row = src + static_cast<size_t>(y) * w * 3;
     for (int x = 0; x < w; ++x) {
       const uint8_t* px = row + x * 3;
-      // BGR order, matching PaddleOCR's NormalizeImage (channel_num=3,
-      // order='' means default [0,1,2] which equals BGR for BGR input).
+      // px[0] = B, px[1] = G, px[2] = R. mean_bgr/std_bgr are in the
+      // same BGR order, so channel i gets mean_bgr[i].
       const float b = (static_cast<float>(px[0]) * scale - mean_bgr[0]) / std_bgr[0];
       const float g = (static_cast<float>(px[1]) * scale - mean_bgr[1]) / std_bgr[1];
       const float r = (static_cast<float>(px[2]) * scale - mean_bgr[2]) / std_bgr[2];
@@ -155,18 +157,17 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   out.ratio_h = static_cast<float>(static_cast<double>(resize_h) / bgr.h);
   out.chw.assign(3 * static_cast<size_t>(resize_w) * resize_h, 0.f);
 
-  // ImageNet mean/std in BGR order. PaddleOCR's NormalizeImage order='' for
-  // BGR input keeps the default [0,1,2] which equals BGR. scale 1/255.
-  const float mean_bgr[3] = {0.406f * 255.f / 255.f,  // will be normalized
-                             0.456f * 255.f / 255.f,
-                             0.485f * 255.f / 255.f};
-  const float std_bgr[3]  = {0.225f, 0.224f, 0.229f};
-  // (x/255 - mean) / std
-  const float real_mean[3] = {0.406f, 0.456f, 0.485f};
-  (void)mean_bgr;
+  // PaddleOCR DetPreProcess: DecodeImage(BGR) -> DetResizeForTest ->
+  // NormalizeImage(order='chw', scale=1/255, mean=[0.485,0.456,0.406],
+  // std=[0.229,0.224,0.225]) -> ToCHWImage. The mean/std arrays are
+  // broadcast along the channel axis in the order PaddleOCR stores
+  // them, which is BGR=0,1,2. Our input is BGR, our output is CHW with
+  // channel 0 = B, 1 = G, 2 = R. No reordering is required: just
+  // apply cfg.det.thresh-mean / std per channel position.
+  const float mean[3] = {0.485f, 0.456f, 0.406f};
+  const float std [3] = {0.229f, 0.224f, 0.225f};
   hwc_bgr_to_chw_float(resized.data(), resize_w, resize_h,
-                       out.chw.data(), 1.f / 255.f,
-                       real_mean, std_bgr);
+                       out.chw.data(), 1.f / 255.f, mean, std);
   return out;
 }
 
@@ -229,20 +230,27 @@ std::vector<float> prep_cls(const Image& bgr, const ClsConfig& cfg) {
 
   std::vector<float> chw(3 * static_cast<size_t>(cfg.w) * cfg.h, 0.f);
   const float scale = 1.f / 255.f;
-  // cfg.mean / cfg.std are length-3; PaddleOCR stores them in RGB order
-  // in the inference.yml. We feed BGR pixels, so we re-map to BGR.
-  float mean_bgr[3] = {
-      cfg.mean.size() > 0 ? cfg.mean[2] : 0.485f,
-      cfg.mean.size() > 1 ? cfg.mean[1] : 0.456f,
-      cfg.mean.size() > 2 ? cfg.mean[0] : 0.406f,
+  // PaddleClas cls pipeline: DecodeImage(BGR) -> Resize -> NormalizeImage
+  // (order='chw', mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]) ->
+  // ToCHWImage. The mean/std arrays map onto BGR channel positions in
+  // the order they are stored; we feed BGR and emit CHW(BGR), so we
+  // apply cfg.mean[i] / cfg.std[i] directly to channel i. No
+  // reordering (this was the M1 bug — the inference.yml values are
+  // already BGR-aligned, not RGB).
+  const float default_mean[3] = {0.485f, 0.456f, 0.406f};
+  const float default_std [3] = {0.229f, 0.224f, 0.225f};
+  float mean[3] = {
+      cfg.mean.size() > 0 ? cfg.mean[0] : default_mean[0],
+      cfg.mean.size() > 1 ? cfg.mean[1] : default_mean[1],
+      cfg.mean.size() > 2 ? cfg.mean[2] : default_mean[2],
   };
-  float std_bgr[3] = {
-      cfg.std.size() > 0 ? cfg.std[2] : 0.229f,
-      cfg.std.size() > 1 ? cfg.std[1] : 0.224f,
-      cfg.std.size() > 2 ? cfg.std[0] : 0.225f,
+  float stdv[3] = {
+      cfg.std.size() > 0 ? cfg.std[0] : default_std[0],
+      cfg.std.size() > 1 ? cfg.std[1] : default_std[1],
+      cfg.std.size() > 2 ? cfg.std[2] : default_std[2],
   };
   hwc_bgr_to_chw_float(resized.data(), cfg.w, cfg.h, chw.data(),
-                       scale, mean_bgr, std_bgr);
+                       scale, mean, stdv);
   return chw;
 }
 

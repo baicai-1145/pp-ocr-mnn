@@ -90,6 +90,30 @@ void test_det_type2() {
   CHECK(in.chw.size() == static_cast<size_t>(3) * in.in_w * in.in_h);
 }
 
+void test_det_channel_order() {
+  // PaddleOCR DetPreProcess keeps BGR channel order — mean[0] is
+  // subtracted from B (0.485), mean[2] from R (0.406). Verifies the
+  // M1 fix: do not flip mean/std across the channel axis.
+  // Pure blue pixel (B=255, G=0, R=0):
+  //   B: (1.0 - 0.485) / 0.229 = 2.249
+  //   G: (0.0 - 0.456) / 0.224 = -2.0357
+  //   R: (0.0 - 0.406) / 0.225 = -1.804
+  ppocr::Image blue = make_solid(8, 8, /*R*/0, /*G*/0, /*B*/255);
+  ppocr::DetResizeConfig rc;
+  rc.mode = ppocr::DetResizeConfig::Mode::LimitMin;
+  rc.limit_side_len = 736; rc.stride = 32;
+  ppocr::DetInput in = ppocr::prep_det(blue, rc);
+  const int plane = in.in_w * in.in_h;
+  const float b = in.chw[0 * plane + 0];
+  const float g = in.chw[1 * plane + 0];
+  const float r = in.chw[2 * plane + 0];
+  std::fprintf(stderr, "[det channel] BGR(255,0,0) -> b=%.4f g=%.4f r=%.4f\n",
+               b, g, r);
+  CHECK(std::fabs(b - (1.0f - 0.485f) / 0.229f) < 1e-3f);
+  CHECK(std::fabs(g - (0.0f - 0.456f) / 0.224f) < 1e-3f);
+  CHECK(std::fabs(r - (0.0f - 0.406f) / 0.225f) < 1e-3f);
+}
+
 void test_rec_keep_ratio_and_pad() {
   // 200x80 → ratio 48/80 = 0.6 → w' = round(120) = 120; padded to 320.
   ppocr::Image img = make_solid(200, 80, 255, 255, 255);
@@ -207,6 +231,7 @@ void test_config_json_parse_rec() {
 int main() {
   test_det_type0();
   test_det_type2();
+  test_det_channel_order();
   test_rec_keep_ratio_and_pad();
   test_rec_normalization();
   test_config_json_parse();
