@@ -6,6 +6,7 @@ out/
 models/*.mnn
 models/*.onnx
 models/_onnx/
+models
 # downloaded assets
 _downloads/
 # local test outputs
