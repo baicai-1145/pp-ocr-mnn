@@ -143,54 +143,6 @@ bool find_first_boundary(const std::vector<int>& mask, int W, int H, int target,
   return false;
 }
 
-// --- Douglas-Peucker polyline simplification --------------------------------
-void dp_simplify(std::vector<PointF>& pts, float eps) {
-  if (pts.size() < 3 || eps <= 0.0f) return;
-  std::vector<uint8_t> keep(pts.size(), 0);
-  keep.front() = 1;
-  keep.back() = 1;
-  // Iterative stack to avoid recursion depth issues on long contours.
-  std::vector<std::pair<int, int>> stack;
-  stack.emplace_back(0, static_cast<int>(pts.size()) - 1);
-  while (!stack.empty()) {
-    auto [a, b] = stack.back();
-    stack.pop_back();
-    if (b - a < 2) continue;
-    const PointF& p1 = pts[a];
-    const PointF& p2 = pts[b];
-    float dx = p2.x - p1.x;
-    float dy = p2.y - p1.y;
-    float norm = std::sqrt(dx * dx + dy * dy);
-    float max_d = 0.0f;
-    int max_i = -1;
-    for (int i = a + 1; i < b; ++i) {
-      const PointF& p = pts[i];
-      float d;
-      if (norm < 1e-6f) {
-        d = std::sqrt((p.x - p1.x) * (p.x - p1.x) +
-                      (p.y - p1.y) * (p.y - p1.y));
-      } else {
-        d = std::fabs(dy * p.x - dx * p.y + p2.x * p1.y - p2.y * p1.x) / norm;
-      }
-      if (d > max_d) {
-        max_d = d;
-        max_i = i;
-      }
-    }
-    if (max_i >= 0 && max_d > eps) {
-      keep[max_i] = 1;
-      stack.emplace_back(a, max_i);
-      stack.emplace_back(max_i, b);
-    }
-  }
-  std::vector<PointF> out;
-  out.reserve(pts.size());
-  for (size_t i = 0; i < pts.size(); ++i) {
-    if (keep[i]) out.push_back(pts[i]);
-  }
-  pts.swap(out);
-}
-
 // --- polygon area (signed, Green's formula) ---------------------------------
 float polygon_area(const std::vector<PointF>& p) {
   if (p.size() < 3) return 0.0f;
@@ -372,11 +324,11 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     std::vector<PointF> boundary = trace_boundary(comp, W, H, lbl, sx, sy);
     if (boundary.size() < 4) continue;
 
-    // Simplify with DP using epsilon = 0.002 * perimeter (Paddle uses
-    // approxPolyDP with this formula).
-    float perim = polygon_perimeter(boundary);
-    dp_simplify(boundary, 0.002f * perim);
-    if (boundary.size() < 4) continue;
+    // Note: Paddle's boxes_from_bitmap (box_type="quad", the default used by
+    // PaddleOCR 3.x paddlex pipeline) does NOT apply approxPolyDP. It feeds
+    // the raw contour from cv::findContours directly into GetMiniBoxes. We
+    // do the same: skip dp_simplify here. (ppocr's polygons_from_bitmap
+    // path uses approxPolyDP, but that's the poly box_type we don't emit.)
 
     // Compute mini-box (minAreaRect -> sort_min_area_rect_points). Paddle's
     // get_mini_boxes also returns the short side length for sside filter.
