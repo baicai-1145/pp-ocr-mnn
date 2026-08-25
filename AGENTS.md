@@ -34,12 +34,14 @@ it ships as a first-class module, default off, validated separately on rotated i
    Do not re-download, retrain, or finetune. The catalog is the contract.
 3. **Every model variant must be supported.** 811-cell matrix is hard, not a wishlist.
    If a model converts or runs badly, fix OUR code (preprocess / postprocess / conversion).
-4. **Preprocess/postprocess must match each model's `inference.yml`.** Key facts (verified):
-   - det DB params: v4/v5 (mobile & server) = thresh 0.3 / box 0.6 / unclip 1.5, resize_long 960;
-     v6 (tiny/small/medium) = thresh 0.2 / box 0.4–0.45 / unclip 1.4, `DetResizeForTest: null`
-     → type0 with limit_side_len 736 "min", 32-align; seal = 0.2 / 0.6 / 0.5, resize_long 736.
+4. **Preprocess/postprocess must match the baseline-generating runtime (PaddleX), NOT the per-model inference.yml.**
+   Empirically verified (docs/DET_GEOMETRY.md): PaddleX pipeline defaults override yml for ALL dets:
+   resize = limit_min 64 / stride 32 (python round-half-to-EVEN, e.g. 720→704) / max_side_limit 4000;
+   DB params thresh 0.3 / box 0.6 / unclip 1.5 (v6 yml's 0.2/0.4/1.4 is NOT used at runtime).
    - rec: ALL variants CTCLabelDecode, shape [3,48,320], norm `(x/255-0.5)/0.5`, BGR input,
      blank=0, space char appended last, dict differs per model (95–18708 entries).
+   - Mean/std are applied positionally to BGR (B-mean=0.485, R-mean=0.406) — the yml values
+     are already BGR-aligned; never "un-flip" them.
    - cls PP-LCNet_x1_0_textline_ori: [3,80,160], ImageNet norm, labels 0°/180°, topk=1.
 5. **No OpenCV.** `stb_image.h` for I/O, MNN `ImageProcess` for resize. DB postprocess
    (contours, minAreaRect, clipper offset, perspective warp) is hand-written C++.
