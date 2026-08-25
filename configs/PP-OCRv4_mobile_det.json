@@ -1,0 +1,21 @@
+{
+  "name": "PP-OCRv4_mobile_det",
+  "type": "det",
+  "file": "PP-OCRv4_mobile_det.mnn",
+  "sha256": "34ac0610fb3fe1c053d24c5f1ad009a61cdebfd617d3fdb7a71cfdcc5064a5ed",
+  "bytes": 4746820,
+  "url": "PP-OCRv4_mobile_det.mnn",
+  "det": {
+    "thresh": 0.3,
+    "box_thresh": 0.6,
+    "unclip_ratio": 1.5,
+    "max_candidates": 1000,
+    "resize": {
+      "mode": "resize_long",
+      "limit_side_len": 736,
+      "resize_long": 960,
+      "stride": 128,
+      "max_side_limit": 4000
+    }
+  }
+}

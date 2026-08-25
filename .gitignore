@@ -6,6 +6,7 @@ out/
 models/*.mnn
 models/*.onnx
 models/_onnx/
+models
 # downloaded assets
 _downloads/
 # local test outputs
@@ -21,4 +22,3 @@ __pycache__/
 .vscode/
 *.swp
 .DS_Store
-models/

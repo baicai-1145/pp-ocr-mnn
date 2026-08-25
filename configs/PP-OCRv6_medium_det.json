@@ -1,13 +1,13 @@
 {
-  "name": "PP-OCRv6_tiny_det",
+  "name": "PP-OCRv6_medium_det",
   "type": "det",
-  "file": "PP-OCRv6_tiny_det.mnn",
-  "sha256": "8d22c1e80a4f2895c670ea29eaaa1ebbfbb8631434cd26cdb68e6223dd36620d",
-  "bytes": 1746376,
-  "url": "PP-OCRv6_tiny_det.mnn",
+  "file": "PP-OCRv6_medium_det.mnn",
+  "sha256": "0247ee12177f28b3fc5dfbe89549bcc4b99e09b474fdb7b367826d30976e3082",
+  "bytes": 36178568,
+  "url": "PP-OCRv6_medium_det.mnn",
   "det": {
     "thresh": 0.2,
-    "box_thresh": 0.4,
+    "box_thresh": 0.45,
     "unclip_ratio": 1.4,
     "max_candidates": 3000,
     "resize": {

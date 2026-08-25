@@ -1,0 +1,242 @@
+{
+  "PP-LCNet_x1_0_textline_ori": {
+    "name": "PP-LCNet_x1_0_textline_ori",
+    "type": "cls",
+    "file": "PP-LCNet_x1_0_textline_ori.mnn",
+    "sha256": "8b63eed38352bd505e4790a4fcb4d213889c83d4b78bcc055a8ec74cbfe1f687",
+    "bytes": 6694800,
+    "url": "PP-LCNet_x1_0_textline_ori.mnn"
+  },
+  "PP-OCRv4_mobile_det": {
+    "name": "PP-OCRv4_mobile_det",
+    "type": "det",
+    "file": "PP-OCRv4_mobile_det.mnn",
+    "sha256": "34ac0610fb3fe1c053d24c5f1ad009a61cdebfd617d3fdb7a71cfdcc5064a5ed",
+    "bytes": 4746820,
+    "url": "PP-OCRv4_mobile_det.mnn"
+  },
+  "PP-OCRv4_mobile_rec": {
+    "name": "PP-OCRv4_mobile_rec",
+    "type": "rec",
+    "file": "PP-OCRv4_mobile_rec.mnn",
+    "sha256": "01b63a1d96bfd96134c26d0e7b9090127430a8b304a7f9da731c5f7f60d8d0b9",
+    "bytes": 10828392,
+    "url": "PP-OCRv4_mobile_rec.mnn"
+  },
+  "PP-OCRv4_mobile_seal_det": {
+    "name": "PP-OCRv4_mobile_seal_det",
+    "type": "det",
+    "file": "PP-OCRv4_mobile_seal_det.mnn",
+    "sha256": "8c59dbaf854b2b2fcc0af9173914fab28c593e046c512cd21a6c15c17984994a",
+    "bytes": 4744784,
+    "url": "PP-OCRv4_mobile_seal_det.mnn"
+  },
+  "PP-OCRv4_server_det": {
+    "name": "PP-OCRv4_server_det",
+    "type": "det",
+    "file": "PP-OCRv4_server_det.mnn",
+    "sha256": "c670afc3610cccf7d8883325b2544a8233d8b8457bcae67aa081db17ba20d599",
+    "bytes": 95042388,
+    "url": "PP-OCRv4_server_det.mnn"
+  },
+  "PP-OCRv4_server_rec": {
+    "name": "PP-OCRv4_server_rec",
+    "type": "rec",
+    "file": "PP-OCRv4_server_rec.mnn",
+    "sha256": "58af77e30e47d3bc049e6d7fd09054421903035bf6aa90770ba227ea95f6afeb",
+    "bytes": 48398928,
+    "url": "PP-OCRv4_server_rec.mnn"
+  },
+  "PP-OCRv4_server_rec_doc": {
+    "name": "PP-OCRv4_server_rec_doc",
+    "type": "rec",
+    "file": "PP-OCRv4_server_rec_doc.mnn",
+    "sha256": "8da028954666510e73a31eb528370eb5e3e66015b847a450cc65fea158393cb3",
+    "bytes": 52380152,
+    "url": "PP-OCRv4_server_rec_doc.mnn"
+  },
+  "PP-OCRv4_server_seal_det": {
+    "name": "PP-OCRv4_server_seal_det",
+    "type": "det",
+    "file": "PP-OCRv4_server_seal_det.mnn",
+    "sha256": "f2693d94ee291b8fb6f01f15d89ff5c0fc39aa10c121f917c64ae10b4c58cdef",
+    "bytes": 111123812,
+    "url": "PP-OCRv4_server_seal_det.mnn"
+  },
+  "PP-OCRv5_mobile_det": {
+    "name": "PP-OCRv5_mobile_det",
+    "type": "det",
+    "file": "PP-OCRv5_mobile_det.mnn",
+    "sha256": "d679515c619f8b242f540db06aa02d5746ad3d1f100857488c59962fd344ec52",
+    "bytes": 4746820,
+    "url": "PP-OCRv5_mobile_det.mnn"
+  },
+  "PP-OCRv5_mobile_rec": {
+    "name": "PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "PP-OCRv5_mobile_rec.mnn",
+    "sha256": "10026aa0e521a383d555daffce07bf9be7718bb43499b69c86896a89138d3996",
+    "bytes": 16520232,
+    "url": "PP-OCRv5_mobile_rec.mnn"
+  },
+  "PP-OCRv5_server_det": {
+    "name": "PP-OCRv5_server_det",
+    "type": "det",
+    "file": "PP-OCRv5_server_det.mnn",
+    "sha256": "99c6f6dd1aacd90e14170113b094c5bfcc37dd28cb83df3e88cc0f2a687fcd0a",
+    "bytes": 63910712,
+    "url": "PP-OCRv5_server_det.mnn"
+  },
+  "PP-OCRv5_server_rec": {
+    "name": "PP-OCRv5_server_rec",
+    "type": "rec",
+    "file": "PP-OCRv5_server_rec.mnn",
+    "sha256": "5332796762b172b5743e649284575915e44d97ac74e8a93b4e6148e4252bff0a",
+    "bytes": 83028528,
+    "url": "PP-OCRv5_server_rec.mnn"
+  },
+  "PP-OCRv6_medium_det": {
+    "name": "PP-OCRv6_medium_det",
+    "type": "det",
+    "file": "PP-OCRv6_medium_det.mnn",
+    "sha256": "0247ee12177f28b3fc5dfbe89549bcc4b99e09b474fdb7b367826d30976e3082",
+    "bytes": 36178568,
+    "url": "PP-OCRv6_medium_det.mnn"
+  },
+  "PP-OCRv6_medium_rec": {
+    "name": "PP-OCRv6_medium_rec",
+    "type": "rec",
+    "file": "PP-OCRv6_medium_rec.mnn",
+    "sha256": "cb8db8d77143914a3a974ae9859591e14a9d50a44be11c1a941aca4d1e902721",
+    "bytes": 76501204,
+    "url": "PP-OCRv6_medium_rec.mnn"
+  },
+  "PP-OCRv6_small_det": {
+    "name": "PP-OCRv6_small_det",
+    "type": "det",
+    "file": "PP-OCRv6_small_det.mnn",
+    "sha256": "9181e47cd4bfff3ea6de016e83ab573cc452b6b1befcf2b72b08a55715710966",
+    "bytes": 9191152,
+    "url": "PP-OCRv6_small_det.mnn"
+  },
+  "PP-OCRv6_small_rec": {
+    "name": "PP-OCRv6_small_rec",
+    "type": "rec",
+    "file": "PP-OCRv6_small_rec.mnn",
+    "sha256": "5f41fdc2818d3a7e20ce4c32eb494de1387c336c718dbc722b5345b4b9f89086",
+    "bytes": 21111780,
+    "url": "PP-OCRv6_small_rec.mnn"
+  },
+  "PP-OCRv6_tiny_det": {
+    "name": "PP-OCRv6_tiny_det",
+    "type": "det",
+    "file": "PP-OCRv6_tiny_det.mnn",
+    "sha256": "8d22c1e80a4f2895c670ea29eaaa1ebbfbb8631434cd26cdb68e6223dd36620d",
+    "bytes": 1746376,
+    "url": "PP-OCRv6_tiny_det.mnn"
+  },
+  "PP-OCRv6_tiny_rec": {
+    "name": "PP-OCRv6_tiny_rec",
+    "type": "rec",
+    "file": "PP-OCRv6_tiny_rec.mnn",
+    "sha256": "c289eee1085ed7241b34b17e69a1c3f6852e2ab99fea30333566c43d769bfcb0",
+    "bytes": 4434868,
+    "url": "PP-OCRv6_tiny_rec.mnn"
+  },
+  "arabic_PP-OCRv5_mobile_rec": {
+    "name": "arabic_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "arabic_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "7199914f470d37d14dd159d6807c1138d41fd8fd2747378b08acd9b15718c69d",
+    "bytes": 7984408,
+    "url": "arabic_PP-OCRv5_mobile_rec.mnn"
+  },
+  "cyrillic_PP-OCRv5_mobile_rec": {
+    "name": "cyrillic_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "cyrillic_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "ecdc45f0e9be2e94c248f7e0e246fe2e2b5a51894c3e2a2e12cefa5094fd6f30",
+    "bytes": 8034260,
+    "url": "cyrillic_PP-OCRv5_mobile_rec.mnn"
+  },
+  "devanagari_PP-OCRv5_mobile_rec": {
+    "name": "devanagari_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "devanagari_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "b235cc15fc1864acaf69ea4934011e144fb3ae0c95be711253ea38d3b06013db",
+    "bytes": 7897772,
+    "url": "devanagari_PP-OCRv5_mobile_rec.mnn"
+  },
+  "el_PP-OCRv5_mobile_rec": {
+    "name": "el_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "el_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "e1749c1cf0a90a7ff5ecd12cf5e508b82c7e4cb6e12fca784f14396d8c575526",
+    "bytes": 7794196,
+    "url": "el_PP-OCRv5_mobile_rec.mnn"
+  },
+  "en_PP-OCRv4_mobile_rec": {
+    "name": "en_PP-OCRv4_mobile_rec",
+    "type": "rec",
+    "file": "en_PP-OCRv4_mobile_rec.mnn",
+    "sha256": "278a56e07547c0b76107176c54f755cc1166c5b3a3871783d1cc44f6878710fd",
+    "bytes": 7668840,
+    "url": "en_PP-OCRv4_mobile_rec.mnn"
+  },
+  "en_PP-OCRv5_mobile_rec": {
+    "name": "en_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "en_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "a432f5ef6551b963ac477066f4ed8dff47e6d6f801fb666c7168f5152f4c6962",
+    "bytes": 7833884,
+    "url": "en_PP-OCRv5_mobile_rec.mnn"
+  },
+  "eslav_PP-OCRv5_mobile_rec": {
+    "name": "eslav_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "eslav_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "f3aa394c09319ae49a433c6f61ab616d540e0bf57c315e6bccf30367b5836322",
+    "bytes": 7873088,
+    "url": "eslav_PP-OCRv5_mobile_rec.mnn"
+  },
+  "korean_PP-OCRv5_mobile_rec": {
+    "name": "korean_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "korean_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "c0eb302d38679ea7eedccfbb3eda64dbeb44822d89df6037ae0de79b9e2d5939",
+    "bytes": 13404240,
+    "url": "korean_PP-OCRv5_mobile_rec.mnn"
+  },
+  "latin_PP-OCRv5_mobile_rec": {
+    "name": "latin_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "latin_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "ffb5a016cc53b8bf336a44c2a52e2183c725d084604b75624d7d2a8b66e6d9d6",
+    "bytes": 8027484,
+    "url": "latin_PP-OCRv5_mobile_rec.mnn"
+  },
+  "ta_PP-OCRv5_mobile_rec": {
+    "name": "ta_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "ta_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "b08e10faeaeac9c60318705d8cccba3d1360992999896359fb4c4cec3ad64eff",
+    "bytes": 7871152,
+    "url": "ta_PP-OCRv5_mobile_rec.mnn"
+  },
+  "te_PP-OCRv5_mobile_rec": {
+    "name": "te_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "te_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "9c4ecad2e2e2db91ffb4f64672b124e8313c5c3d4467cd7d387ced7e991b813e",
+    "bytes": 7884220,
+    "url": "te_PP-OCRv5_mobile_rec.mnn"
+  },
+  "th_PP-OCRv5_mobile_rec": {
+    "name": "th_PP-OCRv5_mobile_rec",
+    "type": "rec",
+    "file": "th_PP-OCRv5_mobile_rec.mnn",
+    "sha256": "04fc4ac95a157efc7d30110ea6cbf8d20ac0144b0d891ece4293053edfb4bbf6",
+    "bytes": 7876476,
+    "url": "th_PP-OCRv5_mobile_rec.mnn"
+  }
+}
