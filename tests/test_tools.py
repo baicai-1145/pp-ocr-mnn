@@ -38,6 +38,7 @@ from convert_models import (  # noqa: E402
 )
 from score import levenshtein, cer, score_image  # noqa: E402
 from run_reference import discover_combos  # noqa: E402
+import cer_audit  # noqa: E402
 
 
 PPOCR_MODELS = Path("/root/ppocr_models")
@@ -297,6 +298,50 @@ class TestScoreCliE2E(unittest.TestCase):
             self.assertEqual(rc, 1)
             txt = (td / "report.md").read_text()
             self.assertIn("FAIL", txt)
+
+
+class TestCerAudit(unittest.TestCase):
+    """Smoke tests for cer_audit.py."""
+
+    def test_load_human_gt_txt(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            img = td / "01.jpg"
+            img.write_bytes(b"\xff\xd8fake")
+            (td / "01.jpg.txt").write_text(
+                "File:Street signs at Queen Victoria Street.jpg\n"
+                "https://commons.wikimedia.org/wiki/File:...\n",
+                encoding="utf-8",
+            )
+            gt = cer_audit._load_human_gt_txt(img)
+            self.assertEqual(gt, "File:Street signs at Queen Victoria Street.jpg")
+
+    def test_audit_cell_self_cer_is_zero(self):
+        # audit_cell on a cell whose baseline matches the 'GT' should give
+        # near-zero CER, but our default sample uses Wikimedia metadata.
+        # The proper sanity is the self-check in cer_audit itself: call
+        # audit_cell + _self_cer_check and assert mean ≈ 0.
+        # We can use any existing cell that has a baseline file.
+        a = cer_audit.audit_cell(
+            "PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec", "zh")
+        if "error" in a:
+            self.skipTest("baseline not present")
+        sc = cer_audit._self_cer_check([a])
+        self.assertEqual(len(sc), 1)
+        label, mean, n = sc[0]
+        self.assertEqual(label, "PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec/zh")
+        self.assertEqual(n, a["n_images"])
+        self.assertLess(mean, 1e-6)  # self-vs-self must be 0
+
+    def test_render_markdown_contains_caveat(self):
+        a = cer_audit.audit_cell(
+            "PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec", "en")
+        if "error" in a:
+            self.skipTest("baseline not present")
+        md = cer_audit.render_markdown([a], self_check=cer_audit._self_cer_check([a]))
+        self.assertIn("# CER baseline audit", md)
+        self.assertIn("Wikimedia Commons", md)
+        self.assertIn("Per-cell summary", md)
 
 
 class TestDiscoverCombos(unittest.TestCase):
