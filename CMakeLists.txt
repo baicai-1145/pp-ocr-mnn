@@ -82,10 +82,14 @@ add_library(ppocr_core STATIC
   src/preprocess.cpp
   src/mnn_session.cpp
   src/ppocr.cpp
-  src/stub_post.cpp
+  src/postprocess/db_post.cpp
+  src/postprocess/geometry.cpp
+  src/postprocess/ctc_decode.cpp
+  third_party/clipper/clipper.cpp
 )
 target_include_directories(ppocr_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/clipper
 )
 # stb and MNN are third-party; treat their headers as SYSTEM so our
 # strict -Wall/-Wextra pass stays focused on ppocr code.
