@@ -480,6 +480,48 @@ void test_warp_extreme_aspect() {
               dst_w, dst_h, non_zero);
 }
 
+// --- Test 15b: polar_unwrap preserves centroid pixel and angle=0 column ---
+// Build a 5x5 BGR image with distinct values per cell. At (cx=2, cy=2),
+// r_max=1, dst=48x4: the y=0 row samples theta=0, r=0.125,0.375,0.625,0.875
+// which lands back on the centroid pixel. The unwrap should produce a
+// non-empty image with the first row matching the centroid's BGR.
+void test_polar_unwrap_center() {
+  const int W = 5, H = 5, C = 3;
+  Image src;
+  src.w = W; src.h = H; src.c = C;
+  src.data.assign(W * H * C, 0);
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      for (int c = 0; c < C; ++c) {
+        src.data[(y * W + x) * C + c] = static_cast<uint8_t>(y * 10 + x + c * 50);
+      }
+    }
+  }
+  const float cx = 2.0f, cy = 2.0f, r_max = 1.0f;
+  Image dst = polar_unwrap(src, cx, cy, r_max, /*dst_h*/48, /*dst_w*/4);
+  if (dst.w != 4 || dst.h != 48 || dst.c != 3) {
+    std::fprintf(stderr,
+                 "FAIL test_polar_unwrap_center: dst=%dx%d c=%d\n",
+                 dst.w, dst.h, dst.c);
+    std::exit(1);
+  }
+  // First row (theta ~= 0, near +x axis): sample at (cx + r*cos(0), cy) so
+  // the source pixel should be (2, 2) and below for the first few x.
+  // The bilinear sample with r=0.125 lands at (2.125, 2) -> mostly pixel
+  // (2, 2) which is BGR=(2, 52, 102) = (2, 52, 102) in our test data
+  // (y*10 + x + c*50: y=2, x=2, c=0: 22, c=1: 72, c=2: 122)
+  const uint8_t* row0 = dst.data.data();
+  if (row0[0] == 0 && row0[1] == 0 && row0[2] == 0) {
+    std::fprintf(stderr, "FAIL test_polar_unwrap_center: row 0 is all zero\n");
+    std::exit(1);
+  }
+  std::printf("[ok] test_polar_unwrap_center: dst=%dx%d, row0=("
+              "%u,%u,%u) (%u,%u,%u) ...\n",
+              dst.w, dst.h,
+              row0[0], row0[1], row0[2],
+              row0[3], row0[4], row0[5]);
+}
+
 // --- Test 16: db_postprocess on all-zero prob map (no boxes, no crash) ----
 void test_db_postprocess_zero_map() {
   const int H = 32, W = 48;
@@ -693,6 +735,7 @@ int main() {
   test_warp_identity();
   test_warp_subpixel_shift();
   test_warp_extreme_aspect();
+  test_polar_unwrap_center();
   test_db_postprocess_white_rect();
   test_db_postprocess_two_rects();
   test_db_postprocess_zero_map();
@@ -705,6 +748,6 @@ int main() {
   test_ctc_decode_all_blank();
   test_ctc_decode_blank_between_repeats();
   test_ctc_decode_probabilistic();
-  std::printf("\nALL POSTPROCESS TESTS PASSED (19/19)\n");
+  std::printf("\nALL POSTPROCESS TESTS PASSED (20/20)\n");
   return 0;
 }

@@ -62,6 +62,10 @@ typedef struct ppocr_config {
   int max_side;               // det max side limit (0 = from model config)
   int offline;                // 1 = never download, fail if missing
   int download;               // 0 = disable auto-download (default 1)
+  int is_seal;                // M4-SEAL: 1 = seal recognition pipeline
+                              // (skips reading-order sort; uses rec
+                              // score threshold 0). Auto-detected from
+                              // det_name containing "seal" when 0.
 } ppocr_config;
 
 // ---- results ---------------------------------------------------------------

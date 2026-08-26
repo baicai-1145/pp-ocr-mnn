@@ -391,4 +391,107 @@ Image warp_perspective_quad(const Image& src, const PointF quad_in[4],
   return dst;
 }
 
+Image polar_unwrap(const Image& src, float cx, float cy, float r_max,
+                   int dst_h, int dst_w) {
+  Image dst;
+  if (src.c <= 0 || src.w <= 0 || src.h <= 0 || dst_h <= 0 || dst_w <= 0) {
+    return dst;
+  }
+  if (r_max <= 0.0f) r_max = 1.0f;
+  const float two_pi = 6.283185307f;
+  dst.w = dst_w;
+  dst.h = dst_h;
+  dst.c = src.c;
+  dst.data.assign(static_cast<size_t>(dst_w) * dst_h * src.c, 0);
+  const int W = src.w, H = src.h, C = src.c;
+  for (int y = 0; y < dst_h; ++y) {
+    // (y + 0.5) / dst_h * 2*pi -> theta in [0, 2pi), CCW from +x axis.
+    const float theta = (static_cast<float>(y) + 0.5f) / dst_h * two_pi;
+    const float cos_t = std::cos(theta);
+    const float sin_t = std::sin(theta);
+    uint8_t* drow = dst.data.data() + static_cast<size_t>(y) * dst_w * C;
+    for (int x = 0; x < dst_w; ++x) {
+      const float r = (static_cast<float>(x) + 0.5f) / dst_w * r_max;
+      const float sx = cx + r * cos_t;
+      const float sy = cy + r * sin_t;
+      if (sx < 0.0f || sy < 0.0f || sx > W - 1.0f || sy > H - 1.0f) {
+        continue;
+      }
+      const int ix = static_cast<int>(sx);
+      const int iy = static_cast<int>(sy);
+      const int ix1 = (ix + 1 < W) ? ix + 1 : ix;
+      const int iy1 = (iy + 1 < H) ? iy + 1 : iy;
+      const float dx = sx - static_cast<float>(ix);
+      const float dy = sy - static_cast<float>(iy);
+      const uint8_t* p00 = src.data.data() + (static_cast<size_t>(iy)  * W + ix)  * C;
+      const uint8_t* p01 = src.data.data() + (static_cast<size_t>(iy)  * W + ix1) * C;
+      const uint8_t* p10 = src.data.data() + (static_cast<size_t>(iy1) * W + ix)  * C;
+      const uint8_t* p11 = src.data.data() + (static_cast<size_t>(iy1) * W + ix1) * C;
+      const float w00 = (1.0f - dx) * (1.0f - dy);
+      const float w01 = dx * (1.0f - dy);
+      const float w10 = (1.0f - dx) * dy;
+      const float w11 = dx * dy;
+      uint8_t* dp = drow + static_cast<size_t>(x) * C;
+      for (int ch = 0; ch < C; ++ch) {
+        const float v = w00 * p00[ch] + w01 * p01[ch] + w10 * p10[ch] + w11 * p11[ch];
+        dp[ch] = static_cast<uint8_t>(std::lround(v));
+      }
+    }
+  }
+  return dst;
+}
+
+
+Image polar_unwrap_band(const Image& src, float cx, float cy,
+                        float r_inner, float r_outer,
+                        int dst_h, int dst_w) {
+  Image dst;
+  if (src.c <= 0 || src.w <= 0 || src.h <= 0 || dst_h <= 0 || dst_w <= 0) {
+    return dst;
+  }
+  if (r_inner < 0.0f) r_inner = 0.0f;
+  if (r_outer <= r_inner) r_outer = r_inner + 1.0f;
+  const float two_pi = 6.283185307f;
+  const float r_span = r_outer - r_inner;
+  dst.w = dst_w;
+  dst.h = dst_h;
+  dst.c = src.c;
+  dst.data.assign(static_cast<size_t>(dst_w) * dst_h * src.c, 255);
+  const int W = src.w, H = src.h, C = src.c;
+  for (int y = 0; y < dst_h; ++y) {
+    const float theta = (static_cast<float>(y) + 0.5f) / dst_h * two_pi;
+    const float cos_t = std::cos(theta);
+    const float sin_t = std::sin(theta);
+    uint8_t* drow = dst.data.data() + static_cast<size_t>(y) * dst_w * C;
+    for (int x = 0; x < dst_w; ++x) {
+      const float r = r_inner + (static_cast<float>(x) + 0.5f) / dst_w * r_span;
+      const float sx = cx + r * cos_t;
+      const float sy = cy + r * sin_t;
+      if (sx < 0.0f || sy < 0.0f || sx > W - 1.0f || sy > H - 1.0f) {
+        continue;
+      }
+      const int ix = static_cast<int>(sx);
+      const int iy = static_cast<int>(sy);
+      const int ix1 = (ix + 1 < W) ? ix + 1 : ix;
+      const int iy1 = (iy + 1 < H) ? iy + 1 : iy;
+      const float dx = sx - static_cast<float>(ix);
+      const float dy = sy - static_cast<float>(iy);
+      const uint8_t* p00 = src.data.data() + (static_cast<size_t>(iy)  * W + ix)  * C;
+      const uint8_t* p01 = src.data.data() + (static_cast<size_t>(iy)  * W + ix1) * C;
+      const uint8_t* p10 = src.data.data() + (static_cast<size_t>(iy1) * W + ix)  * C;
+      const uint8_t* p11 = src.data.data() + (static_cast<size_t>(iy1) * W + ix1) * C;
+      const float w00 = (1.0f - dx) * (1.0f - dy);
+      const float w01 = dx * (1.0f - dy);
+      const float w10 = (1.0f - dx) * dy;
+      const float w11 = dx * dy;
+      uint8_t* dp = drow + static_cast<size_t>(x) * C;
+      for (int c = 0; c < C; ++c) {
+        const float v = w00 * p00[c] + w01 * p01[c] + w10 * p10[c] + w11 * p11[c];
+        dp[c] = static_cast<uint8_t>(v + 0.5f);
+      }
+    }
+  }
+  return dst;
+}
+
 }  // namespace ppocr
