@@ -30,6 +30,13 @@
 # "report the trade-off" path the M1 task description allows.
 
 cmake_minimum_required(VERSION 3.16)
+# CMP0057 = NEW lets if() accept the IN_LIST operator, which is what
+# the NDK r27 toolchain's flags.cmake uses. Setting it before
+# project() means the toolchain file (loaded by CMAKE_TOOLCHAIN_FILE
+# during the first project() call) sees the correct policy.
+if(POLICY CMP0057)
+  cmake_policy(SET CMP0057 NEW)
+endif()
 project(ppocr_mnn
         VERSION 0.1.0
         LANGUAGES CXX C)
@@ -38,6 +45,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Toggle targets that are not part of the public ABI. Default ON
+# so existing ws/m1 / ws/m2 dev workflows keep working; OFF when
+# cross-compiling (M5-PREP) so we don't waste time building
+# desktop-only tests on a phone toolchain.
+option(PPOCR_BUILD_TESTS "Build pp-ocr-mnn unit tests" ON)
+option(PPOCR_BUILD_TOOLS "Build pp-ocr-mnn CLI tools" ON)
+option(PPOCR_BUILD_CLS  "Build pp-ocr-mnn cls test driver" ON)
 
 find_package(Threads REQUIRED)
 
@@ -56,12 +71,24 @@ set(PPOCR_STB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"
 
 # Try the prebuilt static library first. If a future CI environment
 # does not ship it, we fall back to a CPU-only add_subdirectory build.
+# The PATHS list supports both the host build (build/) and any
+# cross-build directory the user has staged (build_android_*/,
+# build_ios_*/, build_windows_*/). The first one that contains a
+# libMNN.a wins.
 set(_mnn_lib_candidates
     "${PPOCR_MNN_ROOT}/build/libMNN.a"
-    "${PPOCR_MNN_ROOT}/build/source/libMNN.a")
+    "${PPOCR_MNN_ROOT}/build/source/libMNN.a"
+    "${PPOCR_MNN_ROOT}/build_android_arm64_v8a/libMNN.a"
+    "${PPOCR_MNN_ROOT}/build_android_x86_64/libMNN.a"
+    "${PPOCR_MNN_ROOT}/build_ios/libMNN.a"
+    "${PPOCR_MNN_ROOT}/build_windows/libMNN.a")
 find_library(MNN_LIBRARY
              NAMES MNN
              PATHS "${PPOCR_MNN_ROOT}/build"
+                   "${PPOCR_MNN_ROOT}/build_android_arm64_v8a"
+                   "${PPOCR_MNN_ROOT}/build_android_x86_64"
+                   "${PPOCR_MNN_ROOT}/build_ios"
+                   "${PPOCR_MNN_ROOT}/build_windows"
              NO_DEFAULT_PATH)
 
 set(_ppocr_using_prebuilt_mnn FALSE)
@@ -219,6 +246,7 @@ target_link_libraries(ppocr_cli PRIVATE ppocr_core)
 
 # ---- tests --------------------------------------------------------------
 enable_testing()
+if(PPOCR_BUILD_TESTS)
 add_executable(test_preprocess tests/test_preprocess.cpp)
 target_link_libraries(test_preprocess PRIVATE ppocr_core)
 add_test(NAME test_preprocess COMMAND test_preprocess)
@@ -226,12 +254,14 @@ add_test(NAME test_preprocess COMMAND test_preprocess)
 # the working dir to the build dir so it doesn't pollute the source tree.
 set_tests_properties(test_preprocess PROPERTIES
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
 
 # Auto-downloader test driver (TOOLS-5 / M3). It links against
 # ppocr_core via --whole-archive so the `ensure_model`, `load_registry`,
 # and `find_entry` symbols are pulled in (they are only called from
 # src/ppocr.cpp, which doesn't link this test binary). See
 # tests/test_downloader.cpp for the scenarios.
+if(PPOCR_BUILD_TESTS)
 add_executable(test_downloader tests/test_downloader.cpp)
 # Static libs don't pull unreferenced objects into a downstream
 # executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
@@ -246,12 +276,66 @@ target_link_libraries(test_downloader PRIVATE
 if(PPOCR_HAS_CURL)
   target_link_libraries(test_downloader PRIVATE CURL::CURL)
 endif()
+endif()
 
 # M3 cls integration test. Loads the cls model and verifies that
 # ppocr_run() with cls enabled reports cls_ms > 0 when there are
 # det boxes, and cls_ms == 0 when cls_name is null.
+if(PPOCR_BUILD_CLS)
 add_executable(test_cls tests/test_cls.cpp)
 target_link_libraries(test_cls PRIVATE ppocr_core)
 add_test(NAME test_cls COMMAND test_cls)
 set_tests_properties(test_cls PROPERTIES
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
+
+# ---- JNI (Android) ---------------------------------------------------------
+# Off by default. Enabled with -DPPOCR_BUILD_JNI=ON, typically by the
+# Android toolchain file (platform/android/android-arm64-v8a.toolchain.cmake).
+# The JNI .so is the only M5-PREP build that needs the whole
+# libppocr_core + libMNN.a bundled into a single shared object.
+# Other Android users are expected to build via the host CMake and
+# just include the JNI source via `add_subdirectory(platform/android)`.
+option(PPOCR_BUILD_JNI "Build the Android JNI wrapper (libppocr-jni.so)" OFF)
+if(PPOCR_BUILD_JNI)
+  if(NOT ANDROID OR NOT DEFINED ANDROID_ABI)
+    message(FATAL_ERROR "PPOCR_BUILD_JNI=ON requires the Android NDK toolchain "
+                        "(set CMAKE_TOOLCHAIN_FILE to one of the platform/android/*.cmake).")
+  endif()
+  add_library(ppocr-jni SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/ppocr_jni.cc"
+  )
+  # ppocr_jni.cc uses Android-specific log and bitmap APIs via
+  # <jni.h> + <android/log.h>. The NDK ships these in
+  # $NDK/sources/android/support/include and the sysroot that the
+  # toolchain adds. We link against `log` for __android_log_print.
+  target_link_libraries(ppocr-jni PRIVATE
+    ppocr_core
+    log
+  )
+  target_compile_definitions(ppocr-jni PRIVATE PPOCR_BUILD_JNI=1)
+  # The JNI shim doesn't need the existing host test data files;
+  # the Java side is responsible for asset management.
+endif()
+
+# ---- install rules (M5-PREP) -----------------------------------------------
+# `cmake --install .` is the standard way to package pp-ocr-mnn
+# for downstream users. We install the public headers, the static
+# library, and the CLI binary. The MNN library is intentionally
+# NOT installed; downstream users who want a self-contained
+# distribution should re-link against their own libMNN.a.
+#
+# Header layout under the install prefix:
+#   <prefix>/include/ppocr/ppocr.h
+#   <prefix>/include/ppocr/downloader.h
+#   <prefix>/include/ppocr/config.h
+#   ... (all the public headers in include/ppocr/ and
+#        include/ppocr/postprocess/)
+include(GNUInstallDirs)
+install(TARGETS ppocr_cli
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS ppocr_core
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/ppocr
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h")
