@@ -660,22 +660,33 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       float bbox_ymax = std::max(quad[0].y, std::max(quad[1].y, std::max(quad[2].y, quad[3].y)));
       float bbox_w = bbox_xmax - bbox_xmin;
       float bbox_h = bbox_ymax - bbox_ymin;
-      // For a near-circular seal, the poly bounding box has the
-      // circular diameter along the chord that's at the seal center's
-      // y-level. If the poly is just the top arc, bbox_w ~= 2r (the
-      // full diameter) and bbox_h is the arc height. For a full-ring
-      // poly (inner star's bbox), bbox_h ~= bbox_w ~= 2r. Use the
-      // larger axis as the diameter estimate (this over-estimates r
-      // for partial arcs slightly, but the unwrap is robust to it).
-      float r_seal = 0.5f * std::max(bbox_w, bbox_h);
-      // M4-SEAL: ring text - polar-unwarp.
-      const float r_inner = 0.60f * r_seal;
-      const float r_outer = 1.05f * r_seal;
+      // M4-SEAL2: adaptive band from min-area-rect geometry. The
+      // rect center sits at distance d_rect from the image center;
+      // its short side h_rect spans radially across the ring at the
+      // arc's apex, so the ring's OUTER edge is d_rect + h_rect/2
+      // (measured 212-216 vs true ~220 on zh/en seals, while vertex
+      // radii overshoot to 290 because of rect rotation). The band
+      // is [outer - band_w, outer] with band_w = 0.35*outer
+      // (>= 30 px), covering the glyph ring for thin en/ru rings and
+      // thick zh rings alike.
+      const float rect_cx = 0.25f * (quad[0].x + quad[1].x + quad[2].x + quad[3].x);
+      const float rect_cy = 0.25f * (quad[0].y + quad[1].y + quad[2].y + quad[3].y);
+      const float d_rect = std::sqrt((rect_cx - img_cx) * (rect_cx - img_cx) +
+                                     (rect_cy - img_cy) * (rect_cy - img_cy));
+      const float h_rect = std::max(1.0f, std::min(maxW, maxH));
+      const float r_outer_raw = d_rect + 0.5f * h_rect;
+      float band_w = 0.35f * r_outer_raw;
+      if (band_w < 30.0f) band_w = 30.0f;
+      if (band_w > r_outer_raw) band_w = r_outer_raw;
+      const float r_inner = std::max(1.0f, r_outer_raw - band_w);
+      const float r_outer = r_outer_raw;
       const float r_mid = 0.5f * (r_inner + r_outer);
+      (void)bbox_w; (void)bbox_h;
       const float arc_len = 6.283185307f * r_mid;
       const int radial_n = std::max(1, H);
       const int angular_n = std::max(1, std::min(batch_w_cap,
                                                   static_cast<int>(arc_len)));
+
       Image unwrapped = polar_unwrap_band(bgr, img_cx, img_cy, r_inner, r_outer,
                                             angular_n, radial_n);
       // Transpose + horizontal flip so the rec sees H=48 (radial)

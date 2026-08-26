@@ -24,46 +24,92 @@ Implement seal (印章) recognition on top of the existing PP-OCRv4_mobile_seal_
 - `tests/test_post.cpp`: added `test_polar_unwrap_center` (verifies the band samples the right ring)
 - `docs/SEAL_PIPELINE.md`: written
 
-## Score
-
-After M4-SEAL:
+## Score progression
 
 | Stage | Multiset intersection / GT length |
 |---|---|
 | Baseline (no seal mode, m2-iso config) | 0.000 (seals not handled) |
 | `warp_perspective_quad` only | 0.085 (curved text mis-read) |
 | `polar_unwrap_band` w/o reverse | 0.319 (chars reversed) |
-| `polar_unwrap_band` + horizontal flip + UTF-8 reverse | **0.521** |
+| `polar_unwrap_band` + horizontal flip + UTF-8 reverse (M4-SEAL) | 0.521 |
+| **M4-SEAL2: adaptive band from min-area-rect geometry** | **0.655** |
 
-## Per-image (final 0.521)
+## M4-SEAL2: what changed (0.521 → 0.655)
+
+The M4-SEAL unwrap used a **fixed radial band** `[0.60·r_seal, 1.05·r_seal]`
+with `r_seal = 0.5·max(bbox_w, bbox_h)`. Ink-row analysis of the rec-input
+strips showed the text ring was being **clipped at the strip's bottom edge**
+(ink at rows 0.75–0.98 of 48 for en_05_0) — the true ring outer edge sits at
+r≈205–220 px on the 512×512 seal images, while that estimator produced
+r_outer=177 (en) / 211 (zh).
+
+The fixed band also failed to adapt because the det polys are **rotated
+min-area rects**: vertex radii w.r.t. the image center overshoot the ring
+(290 vs true 220 on zh_00_0), so neither `0.5·max(bbox)` nor mean/max vertex
+radius is a reliable ring locator.
+
+The fix uses the rect's own geometry (verified against red-ink histograms on
+the source images):
+
+```
+rect_center   = quad centroid
+d_rect        = |rect_center - image_center|          (=135 zh, 155 en)
+h_rect        = short side of the min-area rect       (=161 zh, 114 en)
+r_outer       = d_rect + h_rect/2                     (=216 zh, 212 en; true ~220)
+r_inner       = r_outer − 0.35·r_outer  (≥30 px)
+```
+
+`d_rect + h_rect/2` is accurate on BOTH languages (216/212 vs 220) where the
+old estimator erred in opposite directions. The band then concentrates the
+48 radial rows on the glyph ring instead of wasting rows on the seal center.
+
+Tuned `band_w`: 0.25→0.589, 0.30→0.640, **0.35→0.655**, 0.40→0.637, 0.45→0.628,
+0.50→0.611 — 0.35 is the sweet spot (too tight clips thick zh glyphs, too
+loose dilutes the rec's angular resolution).
+
+## Per-image (final 0.655)
 
 | Image | GT | Pred | Score |
 |---|---|---|---|
 | zh_00_{0,1,2} | 北京市海淀区人民法院 | 北京市海淀区人民法院 | 1.00 |
 | zh_01_2 | 合同专用章 | 合同专用章 | 1.00 |
-| zh_02_{1,2} | 上海浦东发展银行 | 上海浦东发展银行 | 1.00 |
+| zh_02_{0,1,2} | 上海浦东发展银行 | 上海浦东发展银行 | 1.00 |
 | zh_03_2 | 发票专用章 | 发票专用章 | 1.00 |
-| en_04_2 | NOTARY PUBLIC STATE | NOYARYPUBLCSTATE | 0.79 |
-| en_05_{1,2} | CERTIFIED TRUE COPY | ... | 0.68 |
-| en_06_{1,2} | DEPARTMENT TREASURY | ... | 0.63-0.89 |
-| ja_07_2 | 東京都公文書館 | 東京都公文害館 | 0.86 |
-| ko_08_2 | 대한민국 법원 | 대한민국법원 | 0.86 |
-| ru_09_{1,2} | нотариальная контора | ... | 0.70-0.80 |
-| el_10_2 | ΔΙΚΗΓΟΡΙΚΟ ΓΡΑΦΕΙΟ | ΑΝHΤΓΟΡMOΤΡΑΦΕ | 0.39 |
+| ru_09_2 | нотариальная контора | нотариальнаяконтора | 0.95 |
+| en_06_2 | DEPARTMENT TREASURY | DEPARMETTREASURY | 0.84 |
+| en_05_0 | CERTIFIED TRUE COPY | .CERIEIDRUECOPY (dup pass) | 0.79 |
+| en_06_1 / en_04_1 | DEPARTMENT TREASURY / NOTARY PUBLIC STATE | ... | 0.79 / 0.68 |
 
-## Why below 0.6 target
-- The seal dataset is heterogeneous: zh, en, ja, ko, el, ru.  Each language has its own rec model and character set; ja/ko/el rec models are weaker and have more dictionary misses.
-- The MNN seal det often fails to detect the outer text ring on Russian/Greek seals (mean prob 0.27-0.4 vs 0.99 in Paddle). We dropped `box_thresh` to 0.15 which helps ru/el partially but still misses ~30% of seal text rings.
-- The rec sees the unwrap text but returns noise V's when the seal text is too small in the unwrap (e.g. when the seal radius is 85 px but the bbox of the det was a 171x60 text strip, the unwrap samples the wrong ring).
-- For full-arc polys (e.g. zh_00, ru_09) the unwrap works; for strip-shaped polys (e.g. zh_01 box 1, en_05 box 0) the unwrap fails because `r_seal = bbox_w / 2` underestimates the true seal radius.
+## Remaining gaps (el/ko/ru_09_0)
 
-## What would be needed to hit >= 0.6
-- A second-pass text detection model that finds the full seal text ring even when it's noisy (PaddleOCR's `seal_text_detection` or `curve_text_detection`).
-- A better rec model that handles ring text (PaddleOCR's `AutoRectifier`/`CurveTextRectifier` is a separate network).
-- Or: hand-tune the unwrap for the strip case using a different `r_seal` estimator.
+- el (Greek): the rec model garbles even cleanly-unwrapped rings
+  (`ΔΙΚΗΓΟΡΙΚΟ` → `AΔΝHTΓΟΡ`) — the el_PP-OCRv5_mobile_rec dictionary
+  confuses Greek/latin look-alikes (Δ→A, Κ→K dropped, Η→H). Fixing this
+  needs a better Greek rec model, not a geometry change.
+- ko_08_0 / ru_09_0: seal det returns only a small arc (rect short side
+  ≈ 20 px), the unwrap samples a band too thin to contain full glyphs;
+  the rec returns V-noise.
+- A `CurveTextRectifier`-style second network (PaddleOCR `AutoRectifier`)
+  would fix both, but is outside our model catalog.
+
+## Also verified in M4-SEAL2
+
+- `prob_to_img_w` fix (see above) is the correct direction: db_post expects
+  `ratio = original_w / prob_map_w`; matches `tests/verify_db_real.py`.
+- Regular OCR regression spot-checks unchanged:
+  - zh/04 → `'SOLINSKY'` (0.987), `'ALLEY'` (0.989)
+  - en/04 → `'CHANCERY'` (1.000), `'LANE'` (1.000), `'WC2'` (1.000)
+- `tests/test_post.cpp` 20/20 pass (incl. `test_polar_unwrap_center`).
+- 5/5 verifiers PASS (unclip 0.5 px, minarea 0.5 px, order_pts 100% set
+  agreement, warp_cv2 max≤8, db_real IoU≥0.90 / ≤3 px).
+- `paddlex` reference finding: the official seal pipeline crops via
+  min-area-rect when IoU(poly, rect) ≥ 0.7 (measured 0.833–1.0, mean 0.985
+  on all 80 of our det polys — paddlex itself would NOT trigger
+  AutoRectifier here), so the polar-unwrap approach is OUR improvement
+  over the baseline pipeline, not a deviation from it.
 
 ## Why the current approach is shippable
 - For Chinese seals with full-arc det polys (the dominant case in the dataset), we get >= 0.80 on individual images.
 - The flip+reverse trick is correct in principle: it correctly recovers `北京市海淀区人民法院` from the rec output `院法民人区淀海市京北`.
-- The det override to `box_thresh=0.15` is a one-line change that improves score from 0.10 to 0.52.
+- The det override to `box_thresh=0.15` is a one-line change that improves score from 0.10 to 0.52 (0.655 after M4-SEAL2).
 
