@@ -82,6 +82,29 @@ warp (POST-7: full 8-param projective transform, not 6-param affine).
 The 90° rotation if H/W >= 1.5 is the same as the normal text
 pipeline.
 
+**M4-SEAL2 update**: for seal mode the crop is NOT `warp_perspective_quad`
+but `polar_unwrap_band` with an adaptive radial band derived from the
+det poly's min-area-rect geometry:
+
+```
+rect_center = centroid(quad)
+d_rect      = |rect_center - image_center|
+h_rect      = short side of the rect
+r_outer     = d_rect + h_rect / 2          # ring's outer edge
+r_inner     = r_outer - max(30, 0.35*r_outer)
+angular_n   = min(2*pi*r_mid, rec_w)       # rec_w = 320
+radial_n    = rec_h = 48
+```
+
+Rationale: the det polys are rotated min-area rects whose VERTEX radii
+w.r.t. the image center overshoot the ring (290 vs true 220 on zh_00_0);
+`d_rect + h_rect/2` measured 212–216 on zh/en seals whose red-ink ring
+sits at r≈205–220 (verified by ink histograms). A fixed
+`[0.60·r_seal, 1.05·r_seal]` band (M4-SEAL) clipped the en rings at the
+strip's bottom edge. The rec output is UTF-8-codepoint-reversed because
+the unwrap samples theta CW in image coords while ring text reads CCW
+from the right.
+
 ### `run_full` (src/ppocr.cpp:run_full)
 
 **Difference from the normal text pipeline**: skip
