@@ -28,3 +28,13 @@ __pycache__/
 tests/build_post/
 .ipynb_checkpoints/
 tools/gen_reference.py
+
+# M5-PREP: platform build outputs
+platform/android/lib/
+platform/android/build-android-*/
+platform/ios/build/
+platform/ios/PpocrDemo.xcodeproj/xcuserdata/
+platform/ios/.build/
+platform/desktop/build/
+platform/desktop/dist/
+examples/build/

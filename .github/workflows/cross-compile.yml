@@ -1,0 +1,269 @@
+# pp-ocr-mnn — cross-compile CI matrix
+#
+# M5-PREP wires up the four cross-compile targets we ship
+# platform wrappers for. The matrix does NOT run any tests;
+# each job ends after a successful build of the platform's
+# primary deliverable. This is by design: M5 is about
+# packaging, not about correctness, and the M2/M3 hosts
+# already have the runtime results.
+#
+# Triggers:
+#   - push to main / ws/*  (always)
+#   - workflow_dispatch     (manual)
+#   - pull_request          (always; same as push)
+#
+# The matrix is **optional** via workflow_dispatch's
+# "matrix" input. The default empty array means "build
+# all four" on manual runs. The default is intentionally
+# empty so a CI admin can select "ios-only" or "windows-only"
+# to iterate on a single platform.
+
+name: cross-compile
+
+on:
+  push:
+    branches: [main, 'ws/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: 'Subset to build (empty = all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - android-aarch64
+          - ios
+          - macos
+          - windows-mingw
+
+concurrency:
+  group: cross-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- helper: decide which matrix entries to run -----------------------
+  filter:
+    name: decide matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - id: set
+        run: |
+          if [[ -z "${{ inputs.matrix }}" ]]; then
+            echo "include=[" > $GITHUB_OUTPUT
+            echo '{"platform":"android-aarch64","runner":"ubuntu-latest"},' >> $GITHUB_OUTPUT
+            echo '{"platform":"ios","runner":"macos-14"},' >> $GITHUB_OUTPUT
+            echo '{"platform":"macos","runner":"macos-14"},' >> $GITHUB_OUTPUT
+            echo '{"platform":"windows-mingw","runner":"ubuntu-latest"}' >> $GITHUB_OUTPUT
+            echo "]" >> $GITHUB_OUTPUT
+          else
+            case "${{ inputs.matrix }}" in
+              android-aarch64) echo 'include=[{"platform":"android-aarch64","runner":"ubuntu-latest"}]' >> $GITHUB_OUTPUT;;
+              ios)              echo 'include=[{"platform":"ios","runner":"macos-14"}]'              >> $GITHUB_OUTPUT;;
+              macos)            echo 'include=[{"platform":"macos","runner":"macos-14"}]'            >> $GITHUB_OUTPUT;;
+              windows-mingw)    echo 'include=[{"platform":"windows-mingw","runner":"ubuntu-latest"}]'>> $GITHUB_OUTPUT;;
+            esac
+          fi
+
+  # ---- matrix entries --------------------------------------------------
+  android-aarch64:
+    name: android aarch64 (NDK r27)
+    needs: filter
+    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'android-aarch64') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install unzip
+        run: sudo apt-get install -y unzip
+      - name: Install NDK r27
+        run: |
+          set -e
+          mkdir -p /opt
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+          unzip -q android-ndk-r27-linux.zip -d /opt
+          mv /opt/android-ndk-r27 /opt/android-ndk
+          /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --version | head -1
+      - name: Build JNI .so
+        run: |
+          ANDROID_NDK=/opt/android-ndk ./platform/android/build.sh
+      - name: Verify symbols
+        run: |
+          /opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm \
+            --dynamic platform/android/lib/libppocr-jni.so | grep -E 'Java_ppocr' | head
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libppocr-jni-arm64
+          path: platform/android/lib/libppocr-jni.so
+          if-no-files-found: error
+
+  ios:
+    name: ios (xcframework wiring)
+    needs: filter
+    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'ios') }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build MNN for iOS arm64
+        run: |
+          set -e
+          cmake -B build-ios -S third_party/MNN \
+                -DCMAKE_SYSTEM_NAME=iOS \
+                -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                -DCMAKE_OSX_SYSROOT=iphoneos \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+                -DMNN_BUILD_SHARED_LIBS=OFF \
+                -DMNN_METAL=ON \
+                -DMNN_OPENCL=OFF -DMNN_VULKAN=OFF \
+                -DMNN_CUDA=OFF -DMNN_ARM82=OFF \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-ios --target MNN -j
+      - name: Build PpocrC for iOS arm64
+        run: |
+          set -e
+          mkdir -p third_party/MNN/build_ios
+          ln -sf "$(pwd)/build-ios/libMNN.a" third_party/MNN/build_ios/libMNN.a
+          cmake -B build-ios-app -S . \
+                -DCMAKE_SYSTEM_NAME=iOS \
+                -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                -DCMAKE_OSX_SYSROOT=iphoneos \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+                -DPPOCR_BUILD_TESTS=OFF -DPPOCR_BUILD_TOOLS=OFF \
+                -DPPOCR_BUILD_CLS=OFF -DPPOCR_BUILD_JNI=OFF \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-ios-app --target ppocr_core -j
+      - name: Verify ObjC wrapper syntactic check
+        # The Swift Package needs Mac-side tooling (swift build)
+        # which this CI does not run. We do a syntactic ObjC++ check.
+        run: |
+          set -e
+          xcrun --sdk iphoneos --show-sdk-path > /tmp/sd
+          SDK=$(cat /tmp/sd)
+          xcrun --sdk iphoneos clang++ -x objective-c++ -fsyntax-only \
+                -isysroot "$SDK" -miphoneos-version-min=14.0 \
+                -I include -I third_party/MNN/include \
+                platform/ios/PpocrEngine.mm
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libppocr-core-ios-arm64
+          path: build-ios-app/libppocr_core.a
+          if-no-files-found: error
+
+  macos:
+    name: macos (x86_64)
+    needs: filter
+    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'macos') }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build (host toolchain)
+        run: |
+          set -e
+          cmake -B build-mac -S . \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DPPOCR_BUILD_TESTS=OFF
+          cmake --build build-mac --target ppocr_cli -j
+      - name: Smoke-test the CLI
+        run: |
+          set -e
+          if [[ ! -d /tmp/ppocr-models ]]; then
+            echo "Skipping smoke test: no model dir on this host"
+            exit 0
+          fi
+          ./build-mac/ppocr_cli --help
+      - name: Install + verify layout
+        run: |
+          set -e
+          DESTDIR=/tmp/ppocr-install cmake --install build-mac
+          find /tmp/ppocr-install -type f | sort
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppocr-cli-macos
+          path: build-mac/ppocr_cli
+          if-no-files-found: error
+
+  windows-mingw:
+    name: windows-mingw (x86_64)
+    needs: filter
+    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'windows-mingw') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install mingw
+        run: |
+          sudo apt-get install -y mingw-w64 libz-mingw-w64-dev
+      - name: Build MNN for Windows
+        run: |
+          set -e
+          CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+            cmake -B build-win-mnn -S third_party/MNN \
+                  -DCMAKE_SYSTEM_NAME=Windows \
+                  -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+                  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+                  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+                  -DMNN_BUILD_SHARED_LIBS=OFF -DMNN_BUILD_CONVERTER=OFF \
+                  -DMNN_BUILD_TOOLS=OFF -DMNN_BUILD_DEMO=OFF \
+                  -DMNN_BUILD_BENCHMARK=OFF -DMNN_BUILD_TEST=OFF \
+                  -DMNN_BUILD_CODEGEN=OFF -DMNN_BUILD_LLM=OFF \
+                  -DMNN_BUILD_PROTOBUFFER=OFF \
+                  -DMNN_OPENCL=OFF -DMNN_OPENGL=OFF -DMNN_VULKAN=OFF \
+                  -DMNN_CUDA=OFF -DMNN_TENSORRT=OFF -DMNN_COREML=OFF \
+                  -DMNN_NNAPI=OFF -DMNN_ARM82=OFF -DMNN_METAL=OFF \
+                  -DMNN_ONEDNN=OFF \
+                  -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-win-mnn --target MNN -j
+      - name: Build ppocr_core for Windows
+        run: |
+          set -e
+          mkdir -p third_party/MNN/build_windows
+          ln -sf "$(pwd)/build-win-mnn/libMNN.a" third_party/MNN/build_windows/libMNN.a
+          CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+            cmake -B build-windows -S . \
+                  -DCMAKE_SYSTEM_NAME=Windows \
+                  -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+                  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+                  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+                  -DPPOCR_BUILD_TESTS=OFF -DPPOCR_BUILD_TOOLS=OFF \
+                  -DPPOCR_BUILD_CLS=OFF \
+                  -DCMAKE_FIND_ROOT_PATH=/usr/x86_64-w64-mingw32 \
+                  -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+                  -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+                  -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-windows --target ppocr_core -j
+      - name: Build c_api_demo.exe
+        run: |
+          set -e
+          x86_64-w64-mingw32-gcc -std=c99 -Wall \
+            -I include \
+            examples/c_api_demo.c \
+            build-windows/libppocr_core.a \
+            third_party/MNN/build_windows/libMNN.a \
+            -L/usr/x86_64-w64-mingw32/lib \
+            -lstdc++ -lpthread -lm -lz -lws2_32 -lbcrypt \
+            -o c_api_demo.exe
+          head -c 2 c_api_demo.exe | xxd
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: c_api_demo-windows-mingw
+          path: c_api_demo.exe
+          if-no-files-found: error
