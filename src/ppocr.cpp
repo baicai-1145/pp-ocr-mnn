@@ -595,6 +595,47 @@ static void build_lines(Engine& e, const std::vector<DetBox>& boxes,
   e.last_result.n_lines = static_cast<int>(e.last_lines.size());
 }
 
+// M2-ISO: variant of run_full that takes externally-supplied box
+// polygons (the same [TL,TR,BR,BL] int poly[8] layout that the C ABI
+// uses) and skips the det pass. Used for the M2-ISO error-isolation
+// experiment: feed baseline det_polys straight into the rec crop/ctc
+// path and report CER. If CER drops to ~0, the residual error in
+// M2-REC2 (zh 0.13, en 0.24) lives in the det chain; if it stays
+// high, the rec preprocess is still divergent.
+static ppocr_status run_with_boxes(Engine& e, const uint8_t* bgr, int w, int h,
+                                   const int* polys, int n_polys) {
+  if (!bgr || w <= 0 || h <= 0) return PPOCR_ERR_PARAM;
+  if (!polys || n_polys <= 0) return PPOCR_ERR_PARAM;
+  if (!e.rec) return PPOCR_ERR_MODEL;
+
+  Image img;
+  img.w = w; img.h = h; img.c = 3;
+  img.data.assign(bgr, bgr + static_cast<size_t>(w) * h * 3);
+
+  std::vector<DetBox> boxes;
+  boxes.reserve(static_cast<size_t>(n_polys));
+  for (int i = 0; i < n_polys; ++i) {
+    DetBox b{};
+    for (int k = 0; k < 8; ++k) b.poly[k] = polys[i * 8 + k];
+    b.score = 1.0f;  // det score not part of the M2-ISO input
+    boxes.push_back(b);
+  }
+
+  float rec_ms = 0.f;
+  std::vector<std::pair<std::string, float>> texts;
+  run_rec_sync(e, img, boxes, texts, rec_ms);
+  build_lines(e, boxes, texts);
+
+  e.last_result.det_ms = 0.f;
+  e.last_result.rec_ms = rec_ms;
+  e.last_result.cls_ms = 0.f;
+  e.last_result.total_ms = rec_ms;
+  const char* bn = e.rec->backend_name();
+  std::snprintf(e.last_result.backend_used, sizeof(e.last_result.backend_used),
+                "%s", bn ? bn : "cpu");
+  return PPOCR_OK;
+}
+
 // Run a full image: det → rec (M2 real pipeline). Populates e.last_result.
 static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
   if (!bgr || w <= 0 || h <= 0) return PPOCR_ERR_PARAM;
@@ -810,6 +851,21 @@ extern "C" PPOCR_API ppocr_status ppocr_run_async(ppocr_engine* pe,
   }
   e->async_cv.notify_one();
   return PPOCR_OK;
+}
+
+extern "C" PPOCR_API ppocr_status ppocr_run_with_boxes(ppocr_engine* pe,
+                                                      const uint8_t* bgr,
+                                                      int w, int h,
+                                                      const int* polys,
+                                                      int n_polys,
+                                                      ppocr_result** out) {
+  if (!pe || !bgr || w <= 0 || h <= 0 || !polys || n_polys <= 0) {
+    return PPOCR_ERR_PARAM;
+  }
+  Engine* e = reinterpret_cast<Engine*>(pe);
+  ppocr_status st = run_with_boxes(*e, bgr, w, h, polys, n_polys);
+  if (st == PPOCR_OK && out) *out = &e->last_result;
+  return st;
 }
 
 } // namespace ppocr

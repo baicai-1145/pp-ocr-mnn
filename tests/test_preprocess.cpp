@@ -124,13 +124,21 @@ void test_rec_keep_ratio_and_pad() {
   CHECK(valid_w == 120);
   CHECK(chw.size() == static_cast<size_t>(3) * 48 * 320);
 
-  // Padded area (column >= 120) should normalize to -1 (zero in source).
-  // The (channel, y, x) linear index for CHW is c*H*W + y*W + x.
+  // Padded area (column >= valid_w) is left at the CHW init value
+  // of 0.0f. paddlex 3.x `resize_norm_img` does the same:
+  // `padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)` and
+  // then `padding_im[:, :, 0:resized_w] = resized_image`. Normalized
+  // zero corresponds to mid-gray (uint8 127.5); the rec network was
+  // trained against this convention. (The previous M1-PIPE behavior
+  // was to normalize uint8 zero padding to -1.0, which is a
+  // different semantic and shifted the model's predictions; that
+  // divergence is exactly what the M2-ISO experiment B pixel diff
+  // caught.)
   const int H = 48, W = 320;
   for (int c = 0; c < 3; ++c) {
     // Sample one cell deep in the padded region: y=10, x=300.
     float v = chw[c * H * W + 10 * W + 300];
-    CHECK(std::fabs(v - (-1.f)) < 1e-3f);
+    CHECK(std::fabs(v - 0.f) < 1e-3f);
   }
   // Unpadded interior (y=10, x=50) for a white image: (1 - 0.5)/0.5 = 1.0
   for (int c = 0; c < 3; ++c) {

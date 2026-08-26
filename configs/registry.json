@@ -11,8 +11,8 @@
     "name": "PP-OCRv4_mobile_det",
     "type": "det",
     "file": "PP-OCRv4_mobile_det.mnn",
-    "sha256": "34ac0610fb3fe1c053d24c5f1ad009a61cdebfd617d3fdb7a71cfdcc5064a5ed",
-    "bytes": 4746820,
+    "sha256": "c48e70b415253cca697face439ed0d05e723ecc12c25ff74d070e03b706c7fb8",
+    "bytes": 4739060,
     "url": "PP-OCRv4_mobile_det.mnn"
   },
   "PP-OCRv4_mobile_rec": {
@@ -67,8 +67,8 @@
     "name": "PP-OCRv5_mobile_det",
     "type": "det",
     "file": "PP-OCRv5_mobile_det.mnn",
-    "sha256": "d679515c619f8b242f540db06aa02d5746ad3d1f100857488c59962fd344ec52",
-    "bytes": 4746820,
+    "sha256": "e5776cad1abb1d329f6e36c54f9ef61edbcf6ead2d8f71a05c6bbc1bf7308090",
+    "bytes": 4739060,
     "url": "PP-OCRv5_mobile_det.mnn"
   },
   "PP-OCRv5_mobile_rec": {
@@ -83,7 +83,7 @@
     "name": "PP-OCRv5_server_det",
     "type": "det",
     "file": "PP-OCRv5_server_det.mnn",
-    "sha256": "99c6f6dd1aacd90e14170113b094c5bfcc37dd28cb83df3e88cc0f2a687fcd0a",
+    "sha256": "9e09e5033ac7d4c3edc69daf9c6c71e96c5bb859e1df26b68ae220665ed6afb9",
     "bytes": 63910712,
     "url": "PP-OCRv5_server_det.mnn"
   },
@@ -99,7 +99,7 @@
     "name": "PP-OCRv6_medium_det",
     "type": "det",
     "file": "PP-OCRv6_medium_det.mnn",
-    "sha256": "0247ee12177f28b3fc5dfbe89549bcc4b99e09b474fdb7b367826d30976e3082",
+    "sha256": "947e548f05e8f0e6609264fca845fb3d7424e2d2c1d951a4c70884a3ef004705",
     "bytes": 36178568,
     "url": "PP-OCRv6_medium_det.mnn"
   },
@@ -115,7 +115,7 @@
     "name": "PP-OCRv6_small_det",
     "type": "det",
     "file": "PP-OCRv6_small_det.mnn",
-    "sha256": "9181e47cd4bfff3ea6de016e83ab573cc452b6b1befcf2b72b08a55715710966",
+    "sha256": "2571cf02cfa36e368334a0fc8601cefd203785fbdeedcf696e39976dce2909b6",
     "bytes": 9191152,
     "url": "PP-OCRv6_small_det.mnn"
   },
@@ -131,7 +131,7 @@
     "name": "PP-OCRv6_tiny_det",
     "type": "det",
     "file": "PP-OCRv6_tiny_det.mnn",
-    "sha256": "8d22c1e80a4f2895c670ea29eaaa1ebbfbb8631434cd26cdb68e6223dd36620d",
+    "sha256": "6dda7cf9c5839b7870e4a504fb92e42e03b312c592fa8950de2f73095100139c",
     "bytes": 1746376,
     "url": "PP-OCRv6_tiny_det.mnn"
   },

@@ -25,3 +25,6 @@ __pycache__/
 .DS_Store
 # MNNConvert sidecar
 .__convert_external_data.bin
+tests/build_post/
+.ipynb_checkpoints/
+tools/gen_reference.py
