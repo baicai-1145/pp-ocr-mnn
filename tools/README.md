@@ -14,13 +14,16 @@ tools/
   run_reference.py    drive ppocr_cli across the reference matrix
   score.py            CER per cell; report.md + exit code
   cer_audit.py        re-score baseline vs sibling .jpg.txt; baseline sanity
+  verify_mnn_shapes.py  multi-resolution probe-driven verifier for det .mnn
+  verify_mnn_probe.cpp  C++ probe (built by verify_mnn_shapes, run via MNN)
 
   README.md           this file
   CER_VS_OFFICIAL.md  analysis: our CER vs PaddleOCR RecMetric
   REC_ONLY.md         rec-only contract gap (CLI patch request to m1)
+  DET_DYNAMIC.md      det .mnn dynamic-shape diagnostic (TOOLS-4)
 
 tests/
-  test_tools.py       unit + integration tests (30 tests, stdlib only)
+  test_tools.py       unit + integration tests (60 tests, stdlib only)
 
 configs/              generated per-model config JSONs + registry.json
 ```
