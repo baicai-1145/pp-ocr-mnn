@@ -500,17 +500,23 @@ static void run_rec_sync(Engine& e, const Image& bgr,
   //   1) batch_imgs = pre_tfs["ReisizeNorm"](imgs=batch_raw_imgs)
   //      where ReisizeNorm calls resize_norm_img(img, max_wh_ratio)
   //      with
+  //        max_wh_ratio = max(rec_w / rec_h, w/h) per image
   //        imgW = int(imgH * max_wh_ratio)            (truncate)
   //        resized_w = min(ceil(imgH * w / h), imgW)   per image
   //      So every image in the batch is resized to the SAME width
-  //      imgW = int(48 * max(wh_ratio in batch)). The remaining
-  //      columns are zero-padded.
+  //      imgW = int(48 * max(rec_w/rec_h, max(wh_ratio in chunk))).
+  //      The remaining columns are zero-padded.
   //   2) max_wh_ratio is computed from the FIRST `end_img_no =
   //      min(img_num, batch_num=8)` images (NOT the whole batch) but
   //      because the rec session is dynamic-width [1,3,48,-1] we can
   //      just compute it over the whole chunk and let MNN resize.
   //   3) max_imgW is 3200 (clamp the upper bound). The MNN rec
   //      session handles any width up to that ceiling.
+  //   4) `rec_w / rec_h = 320/48 = 6.67` is a HARD FLOOR — a single
+  //      tall image (w/h < 6.67) still gets `max_wh_ratio=6.67` so
+  //      `imgW = 320` (the rec_image_shape baseline). Skipping this
+  //      floor shrinks `imgW` and shifts the rec logits. (M2-NUM
+  //      single-character regression on en/03 'S'->'K'.)
   // We reproduce this. The per-image "min(ceil, imgW)" capping that
   // paddlex applies is implicit in `prep_rec_line` which already
   // does `if (w > batch_w) w = batch_w;`.
@@ -518,12 +524,28 @@ static void run_rec_sync(Engine& e, const Image& bgr,
   for (size_t start = 0; start < crops.size(); start += e.rec_batch) {
     size_t end = std::min(crops.size(), start + e.rec_batch);
     size_t n = end - start;
-    // batch_w = int(H * max(w_i / h_i over the chunk)). truncates.
-    int batch_w = 1;
+    // paddlex `ReisizeNorm.resize_norm_img` per-image uses
+    //   max_wh_ratio = max(rec_image_shape[2] / rec_image_shape[1], w/h)
+    // so the *floor* is `rec_w / rec_h = 320/48 = 6.67`, never
+    // less.  The first `batch_num = 8` imgs in the predictor drive
+    // a single `max_wh_ratio` for the whole chunk (in our case
+    // `e.rec_batch = 8`); we apply the same `max(rec_w/rec_h,
+    // max(w_i/h_i over chunk))` rule so the per-image resized_w
+    // is `min(int(ceil(H * w_i / h_i)), batch_w)` exactly as
+    // paddlex does.  Without this floor, a single tall crop
+    // (e.g. en/03 'S', 200x133, w/h=1.5) would feed the rec
+    // model with batch_w = int(48 * 1.5) = 72 instead of 320
+    // and the rec logits flip from "S" to "K" (single-character
+    // mis-recognition caught by the M2-NUM diff against
+    // paddle's rec dump).
+    const double ratio_floor =
+        static_cast<double>(batch_w_cap) / static_cast<double>(H);
+    int batch_w = static_cast<int>(H * ratio_floor);
     for (size_t i = start; i < end; ++i) {
       if (crops[i].img.data.empty()) continue;
       double ratio = static_cast<double>(crops[i].img.w) /
                      static_cast<double>(crops[i].img.h);
+      if (ratio < ratio_floor) ratio = ratio_floor;
       double bw_d = static_cast<double>(H) * ratio;
       int bw = static_cast<int>(bw_d);  // int() truncate, matches Python
       if (bw > batch_w) batch_w = bw;

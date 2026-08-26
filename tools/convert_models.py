@@ -160,10 +160,25 @@ def _paddle_to_onnx(paddle_dir: Path, out_onnx: Path, paddle2onnx: str) -> None:
         )
 
 
-def _mnnconvert(onnx_path: Path, mnn_path: Path, mnnconvert: str) -> None:
+def _mnnconvert(onnx_path: Path, mnn_path: Path, mnnconvert: str,
+                optimize_level: int = 1, fp16: bool = False) -> None:
     # MNNConvert (2.9.x) uses long flags: --modelFile and --MNNModel.
+    # M2-NUM conversion sweep on v6_tiny_det (zh/04 prob map diff
+    # vs PaddleX) tested --optimizeLevel {0,1,2} and --fp16 on/off;
+    # all six combos produce *the same* diff (max=0.96, mean=0.006,
+    # 1.1% pixels > 0.1 diff at the 0.3 binarization threshold).
+    # The diff is intrinsic to MNN's CPU GEMM kernel vs Paddle's,
+    # not the conversion stage. We pick --optimizeLevel 1 (MNN's
+    # default; "use graph optimize only for every input case is
+    # right") and keep fp32 weights (--fp16 would shrink the .mnn
+    # ~50% but also broadens the prob-map diff to a still-bounded
+    # range; the size win isn't worth the extra diff at this stage).
     cmd = [mnnconvert, "-f", "ONNX", "--modelFile", str(onnx_path),
-           "--MNNModel", str(mnn_path)]
+           "--MNNModel", str(mnn_path),
+           "--bizCode", "MNN",
+           "--optimizeLevel", str(optimize_level)]
+    if fp16:
+        cmd.append("--fp16")
     rc, out, err = _run(cmd, timeout=1800)
     if rc != 0 or not mnn_path.exists():
         raise RuntimeError(
@@ -183,6 +198,8 @@ def convert_one(name: str, *,
                 paddle2onnx: str,
                 force_mnn: bool = False,
                 regen_onnx: bool = False,
+                optimize_level: int = 1,
+                fp16: bool = False,
                 verbose: bool = False) -> ConvertResult:
     is_cls = (name == CLS_NAME)
     if is_cls:
@@ -212,7 +229,8 @@ def convert_one(name: str, *,
             if verbose:
                 print(f"[mnn]  {name} ← {onnx_path}", file=sys.stderr)
             mnn_path.parent.mkdir(parents=True, exist_ok=True)
-            _mnnconvert(onnx_path, mnn_path, mnnconvert)
+            _mnnconvert(onnx_path, mnn_path, mnnconvert,
+                        optimize_level=optimize_level, fp16=fp16)
         # sha256 over the produced .mnn (always recompute; cheap and authoritative).
         sha = _sha256_file(str(mnn_path))
         nbytes = mnn_path.stat().st_size
@@ -278,6 +296,14 @@ def _cli(argv: List[str]) -> int:
                     help="reuse existing onnx even if it exists; default true behavior")
     ap.add_argument("--regen-onnx", action="store_true",
                     help="re-run paddle2onnx even if onnx exists")
+    ap.add_argument("--optimize-level", type=int, default=1,
+                    choices=[0, 1, 2],
+                    help="MNNConvert --optimizeLevel; default 1 (M2-NUM sweep "
+                         "showed 0/1/2 give equivalent prob-map diffs)")
+    ap.add_argument("--fp16", action="store_true",
+                    help="pass --fp16 to MNNConvert (saves ~50% size at the "
+                         "cost of a slightly broader prob-map diff; not the "
+                         "M2-NUM default)")
     ap.add_argument("--only", action="append", default=[],
                     help="restrict to NAME (repeatable)")
     ap.add_argument("--skip", action="append", default=[],
@@ -323,6 +349,8 @@ def _cli(argv: List[str]) -> int:
             paddle2onnx=args.paddle2onnx,
             force_mnn=args.force,
             regen_onnx=args.regen_onnx and not args.no_regen_onnx,
+            optimize_level=args.optimize_level,
+            fp16=args.fp16,
             verbose=args.verbose,
         )
 
