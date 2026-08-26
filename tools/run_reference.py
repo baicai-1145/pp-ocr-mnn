@@ -101,7 +101,7 @@ def list_images(lang: str, rec_only: bool = False) -> List[Path]:
         return sorted(p for p in d.iterdir()
                       if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png"))
     return sorted(p for p in d.iterdir()
-                  if p.is_file() and p.name.startswith("0")
+                  if p.is_file()
                   and p.suffix.lower() in (".jpg", ".jpeg", ".png"))
 
 
@@ -166,24 +166,42 @@ def _run_one(cli: str, *, image: Path, det_cfg: Path, rec_cfg: Path,
              batch: int = 0) -> Optional[dict]:
     """Run the CLI on one image, return parsed JSON dict (or None on error).
 
-    Omit `--json` so the CLI writes to stdout (its default).
+    MNN-2.9.x's Interpreter constructor prints a 3-line device-support
+    banner ("The device support i8sdot:0, support fp16:0, support i8mm: 0"
+    + an "OpenCL init error, fallback ..." line + an "Error to use creator
+    of 3, delete it" line) to **stdout** before the JSON when running on
+    a CPU-only box that lacks OpenCL/Metal. Capturing the JSON from
+    stdout therefore needs a parse tolerant of leading garbage. The
+    CLI also supports `--json PATH` (a file) which writes a clean JSON
+    file; we use that to avoid the banner entirely.
     """
-    cmd = _build_cli_cmd(cli=cli, image=image, det_cfg=det_cfg, rec_cfg=rec_cfg,
-                         cls_cfg=cls_cfg, backend=backend, threads=threads,
-                         batch=batch, json_path=None)
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False) as f:
+        json_path = Path(f.name)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(f"[run] timeout img={image}\n")
-        return None
-    if p.returncode != 0:
-        sys.stderr.write(f"[run] rc={p.returncode} img={image} stderr={p.stderr[:200]}\n")
-        return None
-    try:
-        return json.loads(p.stdout)
-    except json.JSONDecodeError as e:
-        sys.stderr.write(f"[run] bad-json img={image} err={e} raw={p.stdout[:200]}\n")
-        return None
+        cmd = _build_cli_cmd(cli=cli, image=image, det_cfg=det_cfg,
+                             rec_cfg=rec_cfg, cls_cfg=cls_cfg, backend=backend,
+                             threads=threads, batch=batch, json_path=json_path)
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"[run] timeout img={image}\n")
+            return None
+        if p.returncode != 0:
+            sys.stderr.write(f"[run] rc={p.returncode} img={image} stderr={p.stderr[:200]}\n")
+            return None
+        try:
+            with open(json_path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            sys.stderr.write(f"[run] bad-json img={image} err={e}\n")
+            return None
+    finally:
+        try:
+            json_path.unlink()
+        except OSError:
+            pass
 
 
 def _run_one_rec(cli: str, *, image: Path, rec_cfg: Path,
