@@ -589,9 +589,12 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       crops.push_back({Image{}});
       continue;
     }
-    // Rotate 90° CCW if H/W >= 1.5, matching PaddleOCR's
-    //   if out.rows != 0 && 1.0 * out.rows / out.cols >= 1.5
-    //     cv::rotate(out, out, cv::ROTATE_90_COUNTERCLOCKWISE);
+    // Rotate 90° if H/W >= 1.5, matching paddlex crop_image_regions.py:
+    //   if dst_img_height * 1.0 / dst_img_width >= 1.5: dst_img = np.rot90(dst_img)
+    // numpy rot90 (CCW) mapping, verified against np.rot90 on real crops:
+    //   dst[i][j] = src[j][old_w - 1 - i]   (== flipud(src.T))
+    // The previous code wrote dst[x][old_h-1-y] = src[y][x] which is the CW
+    // transpose — vertical text (ja/ko columns) came out 90°-mirrored.
     if (static_cast<float>(warped.h) / static_cast<float>(warped.w)
         >= 1.5f) {
       Image rot;
@@ -599,15 +602,14 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       rot.h = warped.w;
       rot.c = warped.c;
       rot.data.assign(static_cast<size_t>(rot.w) * rot.h * rot.c, 0);
-      // CCW: new(x,y) = old(y, W-1-x) where W is old.w
       const int old_w = warped.w;
-      const int old_h = warped.h;
-      for (int y = 0; y < old_h; ++y) {
-        for (int x = 0; x < old_w; ++x) {
-          for (int c = 0; c < warped.c; ++c) {
-            rot.data[(x * rot.h + (old_h - 1 - y)) * rot.c + c] =
-                warped.data[(y * old_w + x) * warped.c + c];
-          }
+      for (int i = 0; i < rot.h; ++i) {        // dst row i
+        for (int j = 0; j < rot.w; ++j) {      // dst col j
+          const uint8_t* sp = warped.data.data() +
+              (static_cast<size_t>(j) * old_w + (old_w - 1 - i)) * warped.c;
+          uint8_t* dp = rot.data.data() +
+              (static_cast<size_t>(i) * rot.w + j) * rot.c;
+          for (int c = 0; c < warped.c; ++c) dp[c] = sp[c];
         }
       }
       warped = std::move(rot);
