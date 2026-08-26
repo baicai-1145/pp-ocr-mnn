@@ -73,6 +73,51 @@ else()
                  "add_subdirectory(third_party/MNN) (CPU only, converter OFF).")
 endif()
 
+# ---- libcurl (optional, for the auto-downloader) -----------------------
+# The downloader in src/downloader.cpp uses libcurl when available
+# (PPOCR_HAS_CURL is defined, the curl target is linked in). Without
+# curl, the downloader compiles to a stub that returns PPOCR_ERR_BACKEND
+# for any download request; offline / model_dir-local usage still works.
+# This matches the contract in include/ppocr/downloader.h and the
+# TOOLS-5 / M3 brief: "允许 #include <curl/curl.h> 但 CMake 要
+# find_package(CURL) 可选退化：无 curl 时 download=off 只用本地".
+find_package(CURL QUIET)
+if(NOT CURL_FOUND)
+  # find_package on Debian/Ubuntu often fails because the CMake
+  # config is missing; fall back to a direct find_library on the
+  # common libcurl.so filename. The system curl binary at /usr/bin/curl
+  # is not the same package as the dev headers, so we still need a
+  # curl/curl.h.
+  find_path(PPOCR_CURL_INCLUDE_DIRS
+            NAMES curl/curl.h
+            HINTS /usr/include /usr/local/include
+                  /opt/conda/include /opt/miniconda3/include /root/miniconda3/include
+            DOC "Directory containing curl/curl.h")
+  find_library(PPOCR_CURL_LIBRARIES
+               NAMES curl libcurl
+               HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib
+                     /opt/conda/lib /opt/miniconda3/lib /root/miniconda3/lib
+               DOC "Path to libcurl")
+  if(PPOCR_CURL_INCLUDE_DIRS AND PPOCR_CURL_LIBRARIES)
+    set(PPOCR_HAS_CURL TRUE)
+    add_library(CURL::CURL UNKNOWN IMPORTED)
+    set_target_properties(CURL::CURL PROPERTIES
+      IMPORTED_LOCATION "${PPOCR_CURL_LIBRARIES}"
+      INTERFACE_INCLUDE_DIRECTORIES "${PPOCR_CURL_INCLUDE_DIRS}")
+    message(STATUS "ppocr-mnn: found libcurl (manual) at ${PPOCR_CURL_LIBRARIES}")
+    message(STATUS "ppocr-mnn: curl headers at ${PPOCR_CURL_INCLUDE_DIRS}")
+  else()
+    set(PPOCR_HAS_CURL FALSE)
+    message(STATUS "ppocr-mnn: libcurl not found — downloader will refuse "
+                   "network calls (offline / model_dir-local only).")
+  endif()
+else()
+  set(PPOCR_HAS_CURL TRUE)
+endif()
+if(PPOCR_HAS_CURL)
+  message(STATUS "ppocr-mnn: model auto-downloader will use libcurl")
+endif()
+
 # ---- public library ------------------------------------------------------
 # Aggregates all platform-agnostic sources. Tests and apps link against
 # this; platform wrappers (added in M5) will too.
@@ -82,6 +127,7 @@ add_library(ppocr_core STATIC
   src/preprocess.cpp
   src/mnn_session.cpp
   src/ppocr.cpp
+  src/downloader.cpp
   src/postprocess/db_post.cpp
   src/postprocess/geometry.cpp
   src/postprocess/ctc_decode.cpp
@@ -102,6 +148,14 @@ target_link_libraries(ppocr_core PUBLIC
   Threads::Threads
   dl
 )
+if(PPOCR_HAS_CURL)
+  # Define the macro for every translation unit that includes
+  # src/downloader.cpp (or its header). PUBLIC propagates to
+  # consumers like ppocr_cli and test_downloader so they can also
+  # use the curl path if they want to.
+  target_compile_definitions(ppocr_core PUBLIC PPOCR_HAS_CURL=1)
+  target_link_libraries(ppocr_core PUBLIC CURL::CURL)
+endif()
 if(_ppocr_using_prebuilt_mnn)
   # libMNN.a needs zlib (for weight compression). MNN itself declares
   # -lz transitively, so we propagate that requirement up.
@@ -172,3 +226,23 @@ add_test(NAME test_preprocess COMMAND test_preprocess)
 # the working dir to the build dir so it doesn't pollute the source tree.
 set_tests_properties(test_preprocess PROPERTIES
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Auto-downloader test driver (TOOLS-5 / M3). It links against
+# ppocr_core via --whole-archive so the `ensure_model`, `load_registry`,
+# and `find_entry` symbols are pulled in (they are only called from
+# src/ppocr.cpp, which doesn't link this test binary). See
+# tests/test_downloader.cpp for the scenarios.
+add_executable(test_downloader tests/test_downloader.cpp)
+# Static libs don't pull unreferenced objects into a downstream
+# executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
+# and zlib are linked normally (the same set ppocr_core uses).
+target_link_libraries(test_downloader PRIVATE
+  -Wl,--whole-archive ppocr_core -Wl,--no-whole-archive
+  "${MNN_LIBRARY}"
+  "${PPOCR_ZLIB_LIBRARY}"
+  Threads::Threads
+  dl
+)
+if(PPOCR_HAS_CURL)
+  target_link_libraries(test_downloader PRIVATE CURL::CURL)
+endif()
