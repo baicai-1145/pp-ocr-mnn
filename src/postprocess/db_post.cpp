@@ -387,8 +387,18 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     ClipperLib::Path path;
     path.reserve(sorted_box4.size());
     for (const auto& p : sorted_box4) {
-      path << ClipperLib::IntPoint(static_cast<ClipperLib::cInt>(std::llround(p.x)),
-                                   static_cast<ClipperLib::cInt>(std::llround(p.y)));
+      // Paddle's ppocr/postprocess/db_postprocess.py unclip passes the box
+      // directly to pyclipper.PyclipperOffset.AddPath(...). pyclipper's
+      // Cython wrapper (`_to_clipper_point`) constructs the C++ IntPoint
+      // as `IntPoint(py_point[0], py_point[1])` — a direct C++ struct
+      // construction that **truncates** Python floats to int64. We must
+      // match that here. `std::llround` would round .5 toward +∞ and
+      // shifts each vertex by 0–1 px on every odd-fractional coord, which
+      // is the dominant source of the 1–7 px systematic offset we saw
+      // when comparing our C++ clipper output to pyclipper (see
+      // tests/verify_unclip.py).
+      path << ClipperLib::IntPoint(static_cast<ClipperLib::cInt>(p.x),
+                                   static_cast<ClipperLib::cInt>(p.y));
     }
     ClipperLib::ClipperOffset co;
     co.AddPath(path, ClipperLib::jtRound, ClipperLib::etClosedPolygon);
