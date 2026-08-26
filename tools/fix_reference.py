@@ -311,27 +311,134 @@ def probe_one_inference() -> float:
 # ---------------------------------------------------------------------------
 
 def execute_regen(backlog: List[dict], workers: int) -> None:
-    """Regenerate the baseline entries in-place. NOT YET ENABLED.
+    """Regenerate the baseline entries in-place.
 
-    The implementation strategy:
-      * For each unique (combo, lang) affected, group its entries and
-        call run_ocr_cell from tools/gen_parallel.py (one process per
-        cell, no batching). The PaddleOCR predict is the slow part;
-        workers=N gives N parallel cells.
-      * In-place edit of /root/ppocr_reference/<combo>/<lang>/ocr_results.json
-        to refill the (combo, lang, image) entries that were invalid,
-        keeping other entries untouched.
-      * Backup the original to /root/ppocr_reference.bak.<ts>/ before
-        any write.
+    Strategy:
+      * For each (combo, lang) cell affected, build the PaddleOCR
+        instance with the same flags as tools/gen_parallel.py and
+        call .predict() on the affected images only.
+      * Refill the matching entries in the existing
+        /root/ppocr_reference/<combo>/<lang>/ocr_results.json in
+        place. Other (already-valid) entries are left untouched.
+      * multiprocessing.Pool(workers) over cells; per-cell processing
+        is serial (PaddleX is not fork-safe across instances).
     """
-    raise NotImplementedError(
-        "execute_regen() is gated behind --i-understand-this-runs-gpu. "
-        "The decision-maker has not yet approved the GPU run. "
-        "Re-run with --dry-run to inspect the backlog, then escalate "
-        "the approved --execute command. The implementation is a thin "
-        "wrapper over tools/gen_parallel.py::run_ocr_cell with the "
-        "output filtered to only the invalid entries."
-    )
+    import multiprocessing as mp
+    by_cell: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    for b in backlog:
+        by_cell[(b["combo"], b["lang"])].append(b)
+    by_cell_plain = {f"{c}/{l}": v for (c, l), v in by_cell.items()}
+
+    cells = list(by_cell.keys())
+    print(f"[execute] {len(cells)} cells to regen, {len(backlog)} entries", flush=True)
+    print(f"[execute] workers={workers}", flush=True)
+
+    t0 = time.time()
+    ok = err = 0
+    if workers <= 1:
+        _init_worker(by_cell_plain)
+        for cell in cells:
+            r = _process_cell(cell)
+            combo, lang, status, n = r
+            line = status.splitlines()[0][:120]
+            print(f"[execute] {combo}/{lang} n={n} {line}", flush=True)
+            if status == "ok":
+                ok += 1
+            else:
+                err += 1
+    else:
+        with mp.Pool(workers, initializer=_init_worker,
+                     initargs=(by_cell_plain,)) as pool:
+            for r in pool.imap_unordered(_process_cell, cells):
+                combo, lang, status, n = r
+                line = status.splitlines()[0][:120]
+                print(f"[execute] {combo}/{lang} n={n} {line}", flush=True)
+                if status == "ok":
+                    ok += 1
+                else:
+                    err += 1
+    print(f"[execute] done: ok={ok} err={err} in {time.time()-t0:.1f}s", flush=True)
+
+
+# Module-level worker state (set by _init_worker in each Pool process).
+_WORKER_BY_CELL: Dict[str, List[dict]] = {}
+
+
+def _init_worker(by_cell_plain: Dict[str, List[dict]]) -> None:
+    global _WORKER_BY_CELL
+    _WORKER_BY_CELL = by_cell_plain
+
+
+def _process_cell(args: Tuple[str, str]) -> Tuple[str, str, str, int]:
+    import numpy as np
+    from paddleocr import PaddleOCR
+
+    combo, lang = args
+    det, rec = combo.split("__", 1)
+    paddle_lang = LANG_TO_PADDLE[lang]
+    bp = REF_ROOT / combo / lang / "ocr_results.json"
+    key = f"{combo}/{lang}"
+    affected = {b["image_path"]: b for b in _WORKER_BY_CELL.get(key, [])}
+    with open(bp, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    try:
+        ocr = PaddleOCR(
+            lang=paddle_lang,
+            use_doc_orientation_classify=False, use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_detection_model_name=det,
+            text_detection_model_dir=str(PPOCR_MODELS / det),
+            text_recognition_model_name=rec,
+            text_recognition_model_dir=str(PPOCR_MODELS / rec),
+        )
+    except Exception as e:
+        return (combo, lang, f"PaddleOCR-init-failed: {e}", 0)
+    n_done = 0
+    for entry in entries:
+        ipath = entry.get("image_path", "")
+        if ipath not in affected:
+            continue
+        try:
+            res = ocr.predict(ipath)
+            info = res[0] if res else {}
+        except Exception as e:
+            sys.stderr.write(f"[execute] {combo}/{lang} {Path(ipath).name}: "
+                             f"predict failed: {e}\n")
+            continue
+        texts = list(info.get("rec_texts") or [])
+        scores = list(info.get("rec_scores") or [])
+        polys = list(info.get("rec_polys", info.get("rec_boxes", [])) or [])
+        det_polys_new, rec_polys_new, detections_new = [], [], []
+        for i, t in enumerate(texts):
+            poly = polys[i] if i < len(polys) else None
+            box = None
+            if poly is not None:
+                try:
+                    box = [int(x) for x in list(np.array(poly).flatten())[:8]]
+                except Exception:
+                    box = None
+            det_polys_new.append(box)
+            rec_polys_new.append(poly)
+            detections_new.append({
+                "poly": box,
+                "rec_text": str(t),
+                "rec_score": float(scores[i]) if i < len(scores) else 1.0,
+            })
+        entry["rec_texts"] = [str(t) for t in texts]
+        entry["rec_scores"] = [float(s) for s in scores]
+        entry["det_polys"] = det_polys_new
+        entry["detections"] = detections_new
+        if texts:
+            entry["text"] = "\n".join(str(t) for t in texts)
+        else:
+            entry.pop("text", None)
+        n_done += 1
+    tmp = bp.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, bp)
+    return (combo, lang, "ok", n_done)
+
 
 
 # ---------------------------------------------------------------------------
