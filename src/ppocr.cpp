@@ -416,11 +416,130 @@ static void run_det_sync(Engine& e, const Image& bgr,
 //   3. Output is [N, T, C] in NCHW-ish (we measured 6906 classes
 //      after softmax-on-logits); we run ctc_decode on each row of
 //      the (T, C) slice per batch element.
+
+// Rotate a BGR image 180 degrees in place (equivalent to np.rot90(k=2)).
+// Used by the cls module when the textline orientation classifier
+// predicts 180°. PaddleOCR's PaddleClas::TextRecRotator does exactly
+// this (`cv::rotate(rotated_image, cv::ROTATE_180)`).
+static void rotate_180_inplace(Image& img) {
+  if (img.data.empty() || img.w <= 0 || img.h <= 0) return;
+  const int W = img.w;
+  const int H = img.h;
+  const int C = img.c;
+  const int total = W * H * C;
+  // Reverse the whole buffer in place. For 3-channel BGR this is
+  // identical to np.rot90(k=2) which reverses the (H, W) plane and
+  // then flips each row. Verify: pixel at (y, x, c) moves to
+  // (H-1-y, W-1-x, c) -> in the reversed buffer, the byte at
+  // (H-1-y, W-1-x, c) holds what was at byte (total-1 - (y*W*C + x*C + c))
+  // which IS the original (y, x, c) byte.
+  uint8_t* d = img.data.data();
+  for (int i = 0, j = total - 1; i < j; ++i, --j) {
+    uint8_t t = d[i];
+    d[i] = d[j];
+    d[j] = t;
+  }
+}
+
+// Run the textline orientation classifier (PP-LCNet_x1_0_textline_ori)
+// on each warped crop and rotate 180° the crops that score 180°.
+// `crops` is mutated in place: crops that score 180° are reversed.
+// `cls_labels_out[i] = 0` for 0° (no rotate), `1` for 180° (rotated).
+// `cls_score_out[i]` is the softmax confidence in the predicted class.
+//
+// The cls MNN output is [N, 2] softmax (verified on the converted
+// PP-LCNet_x1_0_textline_ori.mnn in M3). Indices 0 and 1 map to
+// labels[0]="0_degree" and labels[1]="180_degree" from
+// e.cls_cfg.cls.labels — we trust the cfg's order.
+//
+// This is the M3 cls path. When e.cls is null (the default), the
+// function is a no-op and cls_labels_out stays all zeros, matching
+// the "cls off" contract.
+static void run_cls_sync(Engine& e,
+                         std::vector<Image>& crops,
+                         std::vector<int>& cls_labels_out,
+                         std::vector<float>& cls_score_out,
+                         float& ms_out) {
+  auto t0 = std::chrono::steady_clock::now();
+  const int n = static_cast<int>(crops.size());
+  cls_labels_out.assign(n, 0);
+  cls_score_out.assign(n, 0.f);
+  if (n == 0) {
+    ms_out = 0.f;
+    return;
+  }
+  if (!e.cls) {
+    // cls disabled: leave labels=0 (no rotate), report 0 ms.
+    ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count());
+    return;
+  }
+  const ClsConfig& cfg = e.cls_cfg.cls;
+  const int CH = cfg.h > 0 ? cfg.h : 80;
+  const int CW = cfg.w > 0 ? cfg.w : 160;
+  // Run the cls model per-image. The cls MNN is [1,3,80,160] fixed
+  // shape (we converted with N=1 in MNNConvert; dynamic batch
+  // would need a re-convert). Per-image call is fine because the
+  // per-call latency is ~1 ms on this CPU and the input crop count
+  // is typically <50 (one per det box).
+  for (int i = 0; i < n; ++i) {
+    Image& c = crops[i];
+    if (c.data.empty() || c.w <= 0 || c.h <= 0) {
+      cls_labels_out[i] = 0;
+      cls_score_out[i] = 0.f;
+      continue;
+    }
+    try {
+      std::vector<float> chw = prep_cls(c, cfg);
+      std::vector<int> dims = {1, 3, CH, CW};
+      e.cls->set_input_float("x", dims, chw.data());
+      int ec = e.cls->run();
+      if (ec != 0) {
+        cls_labels_out[i] = 0;
+        cls_score_out[i] = 0.f;
+        continue;
+      }
+      SessionOutput so = e.cls->output("fetch_name_0");
+      if (so.data == nullptr || so.shape.size() != 2 ||
+          so.shape[0] != 1 || so.shape[1] != 2) {
+        // Fall back: try "softmax_0.tmp_0" (Paddle export variant).
+        so = e.cls->output("softmax_0.tmp_0");
+      }
+      if (so.data == nullptr || so.shape.size() != 2 ||
+          so.shape[0] != 1 || so.shape[1] != 2) {
+        cls_labels_out[i] = 0;
+        cls_score_out[i] = 0.f;
+        continue;
+      }
+      const float* row = so.data;
+      const int argmax = (row[0] >= row[1]) ? 0 : 1;
+      const float conf = row[argmax];
+      cls_labels_out[i] = argmax;
+      cls_score_out[i] = conf;
+      if (argmax == 1) {
+        // PaddleOCR's TextRecRotator: rotate the entire image 180°.
+        // This is the np.rot90(k=2) equivalence called out in the
+        // M3 brief.
+        rotate_180_inplace(c);
+      }
+    } catch (const std::exception&) {
+      // Defensive: a single bad crop must not abort the whole run.
+      cls_labels_out[i] = 0;
+      cls_score_out[i] = 0.f;
+    }
+  }
+  ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count());
+}
+
 static void run_rec_sync(Engine& e, const Image& bgr,
                          const std::vector<DetBox>& boxes,
                          std::vector<std::pair<std::string, float>>& texts,
-                         float& ms_out) {
+                         float& ms_out,
+                         float& cls_ms_out,
+                         std::vector<int>* cls_labels_out = nullptr) {
   auto t0 = std::chrono::steady_clock::now();
+  cls_ms_out = 0.f;
   texts.clear();
   texts.resize(boxes.size(), {std::string{}, 0.f});
   if (boxes.empty() || !e.rec) {
@@ -495,6 +614,34 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     }
     crops.push_back({std::move(warped)});
   }
+  // ---- M3 cls step ----
+  // Run the textline orientation classifier on each warped crop and
+  // rotate 180° any that score 180°. The rec step below then sees
+  // upright crops. PaddleOCR's pipeline does the same thing between
+  // TextClassifier and TextRecognizer (PaddleClas::TextRecRotator +
+  // ppocr::predict_cls).
+  //
+  // We do the cls as a per-image loop (n <= ~50 in the rec-8 batch
+  // regime) rather than a true batched forward. The cls MNN is
+  // [1,3,80,160] fixed-shape and the per-call latency is ~1 ms on
+  // this CPU; the loop's overhead is negligible. Doing it per-image
+  // also lets us short-circuit any per-image error (a single bad
+  // crop doesn't abort the run).
+  if (e.cls) {
+    std::vector<Image> cls_inputs;
+    cls_inputs.reserve(crops.size());
+    for (auto& c : crops) cls_inputs.push_back(c.img);
+    std::vector<int> cls_labels;
+    std::vector<float> cls_scores;
+    run_cls_sync(e, cls_inputs, cls_labels, cls_scores, cls_ms_out);
+    if (cls_labels_out) *cls_labels_out = std::move(cls_labels);
+    for (size_t i = 0; i < crops.size(); ++i) {
+      crops[i].img = std::move(cls_inputs[i]);
+    }
+  } else if (cls_labels_out) {
+    cls_labels_out->assign(crops.size(), 0);
+  }
+  // ---- end cls step ----
   // Process crops in chunks of rec_batch. paddlex 3.x
   // `predictor.process` does this:
   //   1) batch_imgs = pre_tfs["ReisizeNorm"](imgs=batch_raw_imgs)
@@ -644,14 +791,15 @@ static ppocr_status run_with_boxes(Engine& e, const uint8_t* bgr, int w, int h,
   }
 
   float rec_ms = 0.f;
+  float cls_ms = 0.f;
   std::vector<std::pair<std::string, float>> texts;
-  run_rec_sync(e, img, boxes, texts, rec_ms);
+  run_rec_sync(e, img, boxes, texts, rec_ms, cls_ms);
   build_lines(e, boxes, texts);
 
   e.last_result.det_ms = 0.f;
   e.last_result.rec_ms = rec_ms;
-  e.last_result.cls_ms = 0.f;
-  e.last_result.total_ms = rec_ms;
+  e.last_result.cls_ms = cls_ms;
+  e.last_result.total_ms = rec_ms + cls_ms;
   const char* bn = e.rec->backend_name();
   std::snprintf(e.last_result.backend_used, sizeof(e.last_result.backend_used),
                 "%s", bn ? bn : "cpu");
@@ -668,26 +816,28 @@ static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
   img.data.assign(bgr, bgr + static_cast<size_t>(w) * h * 3);
 
   std::vector<DetBox> boxes;
-  float det_ms = 0.f, rec_ms = 0.f;
+  float det_ms = 0.f, rec_ms = 0.f, cls_ms = 0.f;
   run_det_sync(e, img, boxes, det_ms);
 
   std::vector<std::pair<std::string, float>> texts;
   if (e.rec && !boxes.empty()) {
     // M2: real rec pipeline (crop + batch + ctc_decode). If a box
     // fails to crop, its text remains "" with score from the det box.
-    run_rec_sync(e, img, boxes, texts, rec_ms);
+    // M3: cls is invoked between det and rec when cfg->cls_name is set.
+    run_rec_sync(e, img, boxes, texts, rec_ms, cls_ms);
   } else {
     // det-only mode: every line gets score from the det box.
     texts.reserve(boxes.size());
     for (auto& b : boxes) texts.emplace_back(std::string{}, b.score);
     rec_ms = 0.f;
+    cls_ms = 0.f;
   }
   build_lines(e, boxes, texts);
 
   e.last_result.det_ms = det_ms;
   e.last_result.rec_ms = rec_ms;
-  e.last_result.cls_ms = 0.f;
-  e.last_result.total_ms = det_ms + rec_ms;
+  e.last_result.cls_ms = cls_ms;
+  e.last_result.total_ms = det_ms + rec_ms + cls_ms;
   const char* bn = e.det->backend_name();
   std::snprintf(e.last_result.backend_used, sizeof(e.last_result.backend_used),
                 "%s", bn ? bn : "cpu");
@@ -817,12 +967,12 @@ static void async_worker_main(Engine* e) {
       run_det_sync(*e, img, boxes, det_ms);
       std::vector<std::pair<std::string, float>> texts;
       if (e->rec && !boxes.empty()) {
-        run_rec_sync(*e, img, boxes, texts, rec_ms);
+        run_rec_sync(*e, img, boxes, texts, rec_ms, cls_ms);
       } else {
         texts.reserve(boxes.size());
         for (auto& b : boxes) texts.emplace_back(std::string{}, b.score);
       }
-      total_ms = det_ms + rec_ms;
+      total_ms = det_ms + rec_ms + cls_ms;
       text_storage.reserve(boxes.size());
       lines.reserve(boxes.size());
       for (size_t i = 0; i < boxes.size(); ++i) {
