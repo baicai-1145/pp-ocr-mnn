@@ -246,3 +246,12 @@ target_link_libraries(test_downloader PRIVATE
 if(PPOCR_HAS_CURL)
   target_link_libraries(test_downloader PRIVATE CURL::CURL)
 endif()
+
+# M3 cls integration test. Loads the cls model and verifies that
+# ppocr_run() with cls enabled reports cls_ms > 0 when there are
+# det boxes, and cls_ms == 0 when cls_name is null.
+add_executable(test_cls tests/test_cls.cpp)
+target_link_libraries(test_cls PRIVATE ppocr_core)
+add_test(NAME test_cls COMMAND test_cls)
+set_tests_properties(test_cls PROPERTIES
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
