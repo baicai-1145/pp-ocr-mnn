@@ -208,6 +208,7 @@ class JsonParser {
     if (k == "thresh") cfg.det.thresh = static_cast<float>(v);
     else if (k == "box_thresh") cfg.det.box_thresh = static_cast<float>(v);
     else if (k == "unclip_ratio") cfg.det.unclip_ratio = static_cast<float>(v);
+    else if (k == "min_size") cfg.det.min_size = static_cast<int>(v);
     else if (k == "max_candidates") cfg.det.max_candidates = static_cast<int>(v);
     else if (k == "limit_side_len") cfg.det.resize.limit_side_len = static_cast<int>(v);
     else if (k == "resize_long") cfg.det.resize.resize_long = static_cast<int>(v);

@@ -33,8 +33,11 @@ namespace ppocr {
 namespace {
 
 // Paddle's DBPostProcess.min_size — boxes with a shorter side below this are
-// discarded before unclip.
-constexpr int kMinSize = 3;
+// discarded before unclip. Now cfg-driven; the constexpr is the fallback
+// used when the JSON config does not specify min_size (Paddle's reference
+// default is 3). M2-ROBUST sweeps 3 / 5 / 10 in the JSON config to find
+// a noise-robust operating point for the MNN prob map.
+constexpr int kMinSizeDefault = 3;
 
 // --- connected components: 2-pass 8-connectivity union-find ------------------
 struct UnionFind {
@@ -437,7 +440,7 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
                          (final_box[1].y - final_box[2].y) *
                              (final_box[1].y - final_box[2].y));
     float sside = std::min({w1, w2, h1, h2});
-    if (sside < static_cast<float>(kMinSize + 2)) continue;
+    if (sside < static_cast<float>(cfg.min_size + 2)) continue;
 
     // Map bitmap coords -> original image coords. Paddle: x = round(bx / W *
     // dest_w); y = round(by / H * dest_h). ratio_w = dest_w / W, ratio_h =
