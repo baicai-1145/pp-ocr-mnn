@@ -11,6 +11,7 @@
 // exit code.
 #include "ppocr/ppocr.h"
 #include "ppocr/config.h"
+#include "ppocr/image.h"
 
 #include <chrono>
 #include <cstdint>
@@ -31,6 +32,7 @@ struct Args {
   std::string model_dir = "./models";
   std::string registry_path;     // optional
   std::string backend = "auto";
+  std::string boxes_json;        // M2-ISO: skip det, use boxes from this file
   int threads = 0;
   int batch   = 0;
   int det_only = 0;
@@ -66,6 +68,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (k == "--det-only")      { a.det_only = 1; }
     else if (k == "--max-side")      { auto v = need("--max-side");      if (!v) return false; a.max_side = std::atoi(v); }
     else if (k == "--json")          { auto v = need("--json");          if (!v) return false; a.out_path = v; }
+    else if (k == "--boxes-json")    { auto v = need("--boxes-json");    if (!v) return false; a.boxes_json = v; }
     else if (k == "--time")          { a.time = 1; }
     else if (k == "-h" || k == "--help") { a.help = 1; return true; }
     else {
@@ -169,9 +172,64 @@ int main(int argc, char** argv) {
   }
 
   ppocr_result* result = nullptr;
-  st = ppocr_run_file(engine, a.image.c_str(), &result);
+  if (!a.boxes_json.empty()) {
+    // M2-ISO: load the image, parse boxes from JSON, call
+    // ppocr_run_with_boxes. The JSON is a flat array of 8 ints per
+    // box (TL,TR,BR,BL), in the same order the C ABI uses. We do a
+    // tiny hand-rolled parser; the boxes file is produced by the
+    // M2-ISO script (extract from /root/ppocr_reference/...json
+    // field "det_polys" -> [N][8] flat array).
+    if (a.rec_config.empty()) {
+      std::fprintf(stderr, "error: --boxes-json requires --rec-config\n");
+      ppocr_destroy(engine);
+      return 2;
+    }
+    std::ifstream bj(a.boxes_json);
+    if (!bj) {
+      std::fprintf(stderr, "cannot open %s\n", a.boxes_json.c_str());
+      ppocr_destroy(engine);
+      return 4;
+    }
+    std::string buf((std::istreambuf_iterator<char>(bj)),
+                    std::istreambuf_iterator<char>());
+    std::vector<int> polys;
+    int cur = 0; int sign = 1; bool in_num = false;
+    for (char c : buf) {
+      if (c == '-') { sign = -1; continue; }
+      if (c >= '0' && c <= '9') {
+        cur = cur * 10 + (c - '0'); in_num = true; continue;
+      }
+      if (in_num) {
+        polys.push_back(sign * cur);
+        cur = 0; sign = 1; in_num = false;
+      }
+    }
+    if (in_num) polys.push_back(sign * cur);
+    if (polys.size() % 8 != 0) {
+      std::fprintf(stderr, "boxes-json: %d ints, not a multiple of 8\n",
+                   (int)polys.size());
+      ppocr_destroy(engine);
+      return 5;
+    }
+    int n_polys = static_cast<int>(polys.size() / 8);
+    std::fprintf(stderr, "boxes-json: %d polys loaded\n", n_polys);
+    // Load the image through the public image helper, then call
+    // ppocr_run_with_boxes. The BGR buffer is owned by the Image
+    // struct; ppocr_run_with_boxes only reads it.
+    ppocr::Image pim = ppocr::load_image(a.image);
+    if (pim.data.empty() || pim.w <= 0 || pim.h <= 0) {
+      std::fprintf(stderr, "load_image failed for %s\n", a.image.c_str());
+      ppocr_destroy(engine);
+      return 4;
+    }
+    st = ppocr_run_with_boxes(engine, pim.data.data(), pim.w, pim.h,
+                              polys.data(), n_polys, &result);
+  } else {
+    st = ppocr_run_file(engine, a.image.c_str(), &result);
+  }
   if (st != PPOCR_OK) {
-    std::fprintf(stderr, "ppocr_run_file failed: %s\n",
+    std::fprintf(stderr, "ppocr_run%s failed: %s\n",
+                 a.boxes_json.empty() ? "_file" : "_with_boxes",
                  ppocr_status_string(st));
     ppocr_destroy(engine);
     return 3;

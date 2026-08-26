@@ -106,6 +106,17 @@ typedef void (*ppocr_callback)(ppocr_engine* e, ppocr_status st, ppocr_result* r
 PPOCR_API ppocr_status ppocr_run_async(ppocr_engine* e, const uint8_t* bgr, int w, int h,
                                        ppocr_callback cb, void* user);
 
+// ---- M2-ISO: skip det, run rec on caller-supplied polygons ------------------
+// polys: array of 8 int32 per box (TL,TR,BR,BL in image pixel coords), in
+// caller-chosen order (e.g. reading order from a reference baseline).
+// n_polys: number of boxes. rec_name must be set in the engine config.
+// Experimental: added for the M2-ISO error-isolation audit; may move
+// behind a feature flag in M3.
+PPOCR_API ppocr_status ppocr_run_with_boxes(ppocr_engine* e, const uint8_t* bgr,
+                                            int w, int h,
+                                            const int* polys, int n_polys,
+                                            ppocr_result** out);
+
 // ---- utilities ----------------------------------------------------------------
 PPOCR_API const char* ppocr_status_string(ppocr_status st);
 

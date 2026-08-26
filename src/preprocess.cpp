@@ -278,10 +278,11 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w,
   valid_w = w;
 
   std::vector<uint8_t> resized(static_cast<size_t>(batch_w) * img_h * 3, 0);
+  std::vector<uint8_t> tmp;
   if (w > 0 && img_h > 0) {
     // The first `w` columns of each row get the resized pixels; the rest
     // stay zero (matches the zero-padded CHW tensor in resize_norm_img).
-    std::vector<uint8_t> tmp(static_cast<size_t>(w) * img_h * 3);
+    tmp.assign(static_cast<size_t>(w) * img_h * 3, 0);
     resize_bilinear_bgr(line_bgr.data.data(), line_bgr.w, line_bgr.h,
                         tmp.data(), w, img_h);
     for (int y = 0; y < img_h; ++y) {
@@ -291,15 +292,39 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w,
     }
   }
 
-  // Normalize (x/255 - 0.5) / 0.5 = (x - 127.5) / 127.5. Padding stays 0,
-  // so padded pixels normalize to (-0.5)/0.5 = -1. PaddleOCR's
-  // NormalizeImage with scale=1/255, mean=[0.5]*3, std=[0.5]*3 matches.
+  // Normalize the valid `w` columns only, then place into the CHW
+  // tensor. The remaining `batch_w - w` columns are left at the CHW
+  // init value of 0.0f — paddlex 3.x `resize_norm_img` does the same
+  // (`padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)`
+  // after the normalized image has been placed at
+  // `padding_im[:, :, 0:resized_w]`). Normalized zero corresponds
+  // to the original uint8 value 127.5 (mid-gray), but the rec
+  // network has been trained against paddlex's convention so we
+  // reproduce it exactly. (The previous M1-PIPE behavior normalized
+  // uint8 zeros to -1.0, which is a different semantic and shifts
+  // the model's predictions.)
   const float scale = 1.f / 255.f;
   const float mean[3] = {0.5f, 0.5f, 0.5f};
   const float std[3]  = {0.5f, 0.5f, 0.5f};
   std::vector<float> chw(3 * static_cast<size_t>(img_h) * batch_w, 0.f);
-  hwc_bgr_to_chw_float(resized.data(), batch_w, img_h, chw.data(),
-                       scale, mean, std);
+  if (w > 0) {
+    // tmp is a (w, img_h, 3) uint8 buffer of the kept-aspect resize.
+    // Normalize it in-place into a (3, img_h, w) float buffer, then
+    // copy into the first `w` columns of the per-row CHW layout.
+    std::vector<float> tmp_f(static_cast<size_t>(w) * img_h * 3);
+    hwc_bgr_to_chw_float(tmp.data(), w, img_h, tmp_f.data(),
+                         scale, mean, std);
+    // tmp_f is CHW (3, img_h, w). Scatter into chw (3, img_h, batch_w).
+    const size_t plane_in  = static_cast<size_t>(w)   * img_h;
+    const size_t plane_out = static_cast<size_t>(batch_w) * img_h;
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < img_h; ++y) {
+        std::memcpy(chw.data() + c * plane_out + y * batch_w,
+                    tmp_f.data() + c * plane_in + y * w,
+                    static_cast<size_t>(w) * sizeof(float));
+      }
+    }
+  }
   return chw;
 }
 
