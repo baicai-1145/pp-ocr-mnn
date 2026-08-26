@@ -1,0 +1,137 @@
+[
+  {
+    "variant": "stock",
+    "description": "baseline (MNN_USE_SSE=ON, AVX512=OFF, BF16=OFF, OpenMP=OFF)",
+    "flags": [],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/stock/libMNN.a",
+    "lib_size_kb": 10025,
+    "build_time_s": 9.489059448242188e-05,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "no-sse",
+    "description": "(a) naive CPU kernel, no SSE/AVX2",
+    "flags": [
+      "-DMNN_USE_SSE=OFF"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/no-sse/libMNN.a",
+    "lib_size_kb": 9581,
+    "build_time_s": 46.979870319366455,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "avx512",
+    "description": "(b) AVX512 codegen (no-op on EPYC 7502)",
+    "flags": [
+      "-DMNN_AVX512=ON"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/avx512/libMNN.a",
+    "lib_size_kb": 10456,
+    "build_time_s": 50.06984543800354,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "bf16",
+    "description": "(c) BF16 accumulator in conv/fc",
+    "flags": [
+      "-DMNN_SUPPORT_BF16=ON"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/bf16/libMNN.a",
+    "lib_size_kb": 10235,
+    "build_time_s": 57.10510039329529,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "openmp",
+    "description": "(d) OpenMP threadpool instead of MNN's own",
+    "flags": [
+      "-DMNN_OPENMP=ON"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/openmp/libMNN.a",
+    "lib_size_kb": 10025,
+    "build_time_s": 48.14856028556824,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "no-sparse",
+    "description": "(e) disable sparse-compute codegen",
+    "flags": [
+      "-DMNN_USE_SPARSE_COMPUTE=OFF"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/no-sparse/libMNN.a",
+    "lib_size_kb": 10023,
+    "build_time_s": 46.68195343017578,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "low-mem",
+    "description": "(f) low-memory weight path",
+    "flags": [
+      "-DMNN_LOW_MEMORY=ON"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/low-mem/libMNN.a",
+    "lib_size_kb": 10097,
+    "build_time_s": 50.21627163887024,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  },
+  {
+    "variant": "sse-fp16",
+    "description": "(g) FP16 instead of BF16 in x86 op",
+    "flags": [
+      "-DMNN_SUPPORT_BF16=ON",
+      "-DMNN_SSE_USE_FP16_INSTEAD=ON"
+    ],
+    "lib_path": "/root/pp-ocr-mnn/third_party/MNN/build_var/sse-fp16/libMNN.a",
+    "lib_size_kb": 10429,
+    "build_time_s": 50.30787014961243,
+    "diff": {
+      "max_abs": 0.963675,
+      "mean_abs": 0.005858,
+      "pct_gt_001": 2.11,
+      "pct_gt_01": 1.09
+    },
+    "ja00_box_count": 45
+  }
+]
