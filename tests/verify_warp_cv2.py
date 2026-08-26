@@ -22,22 +22,18 @@ import numpy as np
 
 def cv2_warp_ref(img: np.ndarray, quad: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
     """Reference: cv2.warpPerspective INTER_CUBIC BORDER_REPLICATE.
-    quad: (4,2) array of source coords in arbitrary order."""
-    # Destination rect in Paddle canonical order: TL, TR, BR, BL.
-    # NOTE: this test was written before the m2-iso merge (ac66723)
-    # changed warp_perspective_quad to use the "corners" convention
-    # (pts_std = [[0,0], [W,0], [W,H], [0,H]]) to match Paddle's
-    # get_rotate_crop_image. The cv2 reference here still uses the
-    # "centers" convention (dst = (W-1, H-1)) because that's what
-    # cv2.warpPerspective expects. The two conventions differ by
-    # ~1 px in the warp output, which shows up as ~30-40 / 256 mean
-    # pixel diff (well within the high-frequency bicubic tolerance
-    # but not the strict 8/256 gate). The newer m2-iso boxes-json
-    # test (which compares against Paddle's own rec input pipeline)
-    # supersedes this one; we keep verify_warp_cv2 as a coarse
-    # sanity check (status: pre-m2 expected, may diverge now).
+    quad: (4,2) array of source coords in arbitrary order.
+
+    POST-7 update: the C++ warp_perspective_quad uses Paddle's corners
+    convention (pts_std = [[0,0], [W,0], [W,H], [0,H]]), the same as
+    paddlex/inference/pipelines/components/common/crop_image_regions.py
+    -> cv2.warpPerspective(img, M, (W, H), INTER_CUBIC, BORDER_REPLICATE).
+    The pre-m2-iso reference here used (W-1, H-1) ("centers"), which
+    gave a systematic ~30-40/256 mean diff at the bicubic peak. With
+    the corners convention the comparison is like-for-like.
+    """
     dst = np.array(
-        [[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]],
+        [[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]],
         dtype=np.float32,
     )
     # We need a 3x3 homography. cv2.getPerspectiveTransform expects both
