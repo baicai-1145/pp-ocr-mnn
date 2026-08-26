@@ -234,8 +234,20 @@ Image warp_perspective_quad(const Image& src, const PointF quad_in[4],
   float TLx = q[0].x, TLy = q[0].y;
   float TRx = q[1].x, TRy = q[1].y;
   float BLx = q[3].x, BLy = q[3].y;
-  float w = static_cast<float>(dst_w - 1);
-  float h = static_cast<float>(dst_h - 1);
+  // Paddle's `get_rotate_crop_image` (paddlex 3.x,
+  // paddlex/inference/pipelines/components/common/crop_image_regions.py)
+  // builds the destination rectangle as `pts_std = [[0,0], [W,0],
+  // [W,H], [0,H]]` with W = int(max(norm(p0-p1), norm(p2-p3))) and
+  // H = int(max(norm(p0-p3), norm(p1-p2))). It then calls
+  // `cv2.warpPerspective(img, M, (W, H), INTER_CUBIC, BORDER_REPLICATE)`.
+  // The dst mapping therefore spans pixel indices [0, W-1] in i and
+  // [0, H-1] in j, but the *range* of i/j fed into the affine
+  // coefficients is [0, W] / [0, H], not [0, W-1] / [0, H-1]. Using
+  // (W-1) here would scale the perspective by (W-1)/W and shift the
+  // warp slightly. The previous M2-PIPE commit had `w = dst_w - 1`,
+  // which is the bug M2-REC2 fixes.
+  float w = static_cast<float>(dst_w);
+  float h = static_cast<float>(dst_h);
   if (w < 1.0f) w = 1.0f;
   if (h < 1.0f) h = 1.0f;
 

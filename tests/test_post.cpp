@@ -153,8 +153,15 @@ void test_warp_identity() {
       }
     }
   }
-  // Quad in canonical order: TL, TR, BR, BL.
-  PointF quad[4] = {{0, 0}, {W - 1, 0}, {W - 1, H - 1}, {0, H - 1}};
+  // Quad in canonical order: TL, TR, BR, BL. paddlex
+  // `get_rotate_crop_image` calls cv2.warpPerspective with
+  // pts_std = [[0,0],[W,0],[W,H],[0,H]] (W = int(max(...)) with
+  // no -1). Our warp_perspective_quad uses the same [0, W] / [0, H]
+  // affine range, so the source quad must also span [0, W] in x and
+  // [0, H] in y, not [0, W-1] / [0, H-1].
+  PointF quad[4] = {{0, 0}, {static_cast<float>(W), 0},
+                     {static_cast<float>(W), static_cast<float>(H)},
+                     {0, static_cast<float>(H)}};
   Image dst = warp_perspective_quad(src, quad, W, H);
   assert(dst.w == W && dst.h == H && dst.c == C);
   for (int y = 0; y < H; ++y) {
