@@ -183,6 +183,10 @@ if(PPOCR_HAS_CURL)
   target_compile_definitions(ppocr_core PUBLIC PPOCR_HAS_CURL=1)
   target_link_libraries(ppocr_core PUBLIC CURL::CURL)
 endif()
+option(PPOCR_PREP_BILEXACT "Use bit-exact OpenCV INTER_LINEAR replica in det prep (default: float bilinear)" OFF)
+if(PPOCR_PREP_BILEXACT)
+  target_compile_definitions(ppocr_core PUBLIC PPOCR_PREP_BILEXACT=1)
+endif()
 if(_ppocr_using_prebuilt_mnn)
   # libMNN.a needs zlib (for weight compression). MNN itself declares
   # -lz transitively, so we propagate that requirement up.

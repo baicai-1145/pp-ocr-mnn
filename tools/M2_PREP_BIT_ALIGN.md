@@ -1,105 +1,88 @@
-# M2-PREP-BIT-ALIGN: Decision-maker's hypothesis tested, neutral result
+# M2-PREP-BIT-ALIGN: three-audit follow-up (decision-maker directive)
 
-## Decision-maker's hypothesis (per task brief)
+## Audit 1: bilexact was NEVER compiled in (CONFIRMED, fixed)
 
-> MNN vs Paddle model consistent (same input 1.3e-7) → but CLI vs new baseline
-> ja 0.199 → only remaining variable is **det preprocessing input tensor
-> differing** (hand-written float bilinear vs cv2 INTER_LINEAR fixed-point,
-> ±1 px diff, model edge-sensitive amplified to box drift).
-> Verify and fix to bit level.
+`-DPPOCR_PREP_BILEXACT=0/1` on the cmake command line only set a cache
+variable; CMakeLists never attached it as a compile definition. The
+source's `#if !defined(PPOCR_PREP_BILEXACT) #define ... 0` fallback made
+every build (including all pilot runs) use float bilinear.
 
-## Step 1: Verified det input pixel diff (zh/04, ja/01, ja/05)
+Hard evidence: float dumps from "flag=0" and "flag=1" builds were
+BIT-IDENTICAL (0 nonzero) for zh/04, ja/01, ja/05.
 
-Wrote `tools/m2ba_step1c.py` to dump pilot (Python cv2) vs C++ `prep_det`
-(hand-written bilinear) on the same image bytes, normalized, CHW float.
-
-| image | nonzero pixels (old) | max diff (old) | mean diff (old) | nonzero (new bilexact) | max (bilexact) |
-|---|---|---|---|---|---|
-| zh/04 (3×704×1280) | 2,275,206/2,703,360 (84%) | 5.23e-2 | 2.91e-3 | 2,253,635/2,703,360 (84%) | **1.75e-2** |
-| ja/01 (3×864×1280) | 2,354,933/3,317,760 (71%) | 5.23e-2 | 2.73e-3 | 2,322,240/3,317,760 (70%) | **1.75e-2** |
-| ja/05 (3×1024×1280) | 2,624,424/3,932,160 (67%) | 5.25e-2 | 9.49e-4 | 2,581,701/3,932,160 (66%) | **4.77e-7** (bit-exact) |
-
-**Confirmed**: det input tensors differ. 84% of pixels differ in zh/04;
-mean diff 1.87e-3. ja/05 is **bit-exact** with bilexact.
-
-## Step 2: Bit-exact replica of OpenCV 4.x INTER_LINEAR
-
-Added `PPOCR_PREP_BILEXACT` (default OFF, opt-in via
-`-DPPOCR_PREP_BILEXACT=1`) in `src/preprocess.cpp`. Implements
-`interpolationLinear<uint8_t, ufixedpoint16, 2>` from
-`opencv/modules/imgproc/src/resize.cpp` + `fixedpoint.inl.hpp`:
+Fix: CMakeLists.txt now does
 
 ```
-src_x = (x + 0.5) * sx - 0.5   (x0 = floor, clamp to [0, src_w-2])
-alpha = src_x - x0
-m0 = round((1-alpha) * 256) as uint16  (ufp16, 8 frac bits)
-m1 = round(alpha * 256) as uint16
-horizontal: row[c] = saturate<ufp16>(m0*src[x0,c] + m1*src[x0+1,c])
-vertical:   dst[c] = saturate<uint8>((m0*row_top + m1*row_bot + 2^15) >> 16)
-boundary:   fval<0 → dst[y] = horizontal interp of src row 0 (no v-interp)
+option(PPOCR_PREP_BILEXACT "..." OFF)
+if(PPOCR_PREP_BILEXACT)
+    target_compile_definitions(ppocr_core PUBLIC PPOCR_PREP_BILEXACT=1)
+endif()
 ```
 
-Empirical bit-align vs cv2 INTER_LINEAR on the same BGR bytes:
-- ja/05: 0 nonzero pixels (bit-exact)
-- zh/04: 291K/2.7M (11%) nonzero, max diff = **1** (single LSB)
-- ja/01: 363K/3.3M (11%) nonzero, max diff = **2**
+Rebuilt and re-dumped: real bilexact differs from float by 33K px (zh/04),
+48K px (ja/01); still bit-exact on ja/05 (identity resize).
 
-The residual ±1 LSB is from cv2's vectorized SIMD path (128-bit v_dotprod
-with `v_add_wrap(src, 1<<15)` BEFORE the multiply, then `v_sub_wrap` of
-1<<7 at the end) differing from the scalar `(v+2^15)>>16` path cv2 takes
-when SIMD is unavailable. Both are cv2 — just different code paths.
+## Re-run with REAL bilexact (binary rebuilt via proper option)
 
-## Step 3: Re-run v3 pilot with bilexact
-
-| lang | v3 (float bilinear) | v3-bilexact (this) |
+| lang | A (new vs old) | B (MNN CLI vs new) |
 |---|---|---|
-| zh B (MNN vs new) | 0.1007 | 0.1007 |
-| en B | 0.0896 | 0.0896 |
-| ja B | 0.3960 | 0.3960 |
+| zh | 0.0380 | 0.0934 |
+| en | 0.0408 | 0.1090 |
+| ja | 0.1464 | 0.4104 |
 
-**Bilexact is NEUTRAL** — same CER as float bilinear. The input tensor
-diff (5.23e-2 → 1.75e-2 max) does NOT reduce box drift.
+Bilexact is NOT uniformly better than float bilinear (zh improved by
+~7e-3, en/ja got worse). It is not the bottleneck either way.
 
-## Why bilexact doesn't help
+## Audit 2: v3->v4 CER regression root cause (RESOLVED)
 
-The decision-maker's hypothesis was: input diff → SE block amplification
-→ box drift. Reducing the input diff from 5.23e-2 to 1.75e-2 (or to 0
-in the 11% off-by-1 region) **should** help. But the empirical CER
-doesn't move.
+NOT m4-seal (its `prob_to_img_w/prob_to_img_h` refactor is main-only;
+ws/m2-final-diag still uses `in.ratio_w = resize_w/bgr.w`, mathematically
+identical when resize == image size).
 
-**Actual cause** is something else:
-- The MNN model has 33 SE blocks. Each block amplifies 1e-7 → 1e-3
-  noise (M2-FINAL-DIAG finding). 33 such amplifications → max 1e-3
-  output drift regardless of input precision.
-- The det probability map drift is the **same** whether the input
-  is cv2-equivalent or float-bilinear-equivalent, because both are
-  well within the model's "noise band".
-- The PaddleX pipeline produces a 5.86e-3 mean diff at the det
-  output (M2-EXPORT-SWEEP), which is **separately** caused by
-  PaddleX's static-graph optimizations (IR, MKL-DNN, etc.) — this
-  is the actual MNN-vs-PaddleX gap that the new baseline fixes.
+The v3 numbers (zh 0.056 / en 0.026 / ja 0.199) were produced by a build
+that no longer exists; they are NOT reproducible. Current state:
+run-to-run IS deterministic (4 identical runs of ja/05 -> same polys and
+texts). The v3-vs-v4 discrepancy on zh/05 (22 boxes `CIYUNSI` vs 21 boxes
+`CIYUNSi`) was a different binary + a borderline box flipping across
+builds, amplified by string-join CER.
 
-**Conclusion**: bilexact resize is **not the bottleneck**. The
-residual CER vs the new baseline comes from somewhere else
-(probably the MNN conv kernel implementation, not the input tensor).
+## Audit 3: decisive experiment on ja/05 (bit-exact input)
 
-## Status
+Feed the SAME input tensor to MNN and paddle.inference direct:
 
-- `src/preprocess.cpp`: bilexact path added, default OFF (opt-in)
-- Pilot results: bilexact neutral, no improvement on zh/en/ja
-- Current best: zh B 0.10, en B 0.09, ja B 0.40 (same as v3)
+| Level | What compared | Result |
+|---|---|---|
+| L1 | det prob map MNN vs paddle | max **1.2e-3**, mean 1.1e-7 |
+| L2 | DB postprocess boxes (our C++ db_postprocess on both prob maps) | **35 = 35, coordinates BIT-IDENTICAL** (scores differ ~1e-5) |
+| L3 | rec text on those identical boxes | identical |
 
-## Per user directive ("若 ja >0.05, 暂停并报告")
+Conclusion: with a bit-exact det input our det→DB→rec path matches
+paddle.inference direct at the box level. EXPORT-SWEEP holds.
 
-**PAUSED**. ja CER 0.40 is still over 0.05. The bilexact experiment
-showed that **input tensor precision is not the bottleneck**. The
-remaining gap is in the MNN inference path, not the prep path.
+## TRUE root cause of remaining B-table gap
+
+`cv2.imread` (baseline side) vs `stb_image` (CLI side) JPEG decoders
+produce DIFFERENT pixel bytes:
+
+- ja/05.jpg: **169,087 differing pixels (13%), max abs diff = ±3,
+  total byte-sum diff 56,481**
+- baseline prep chw.sum = -2390465.00 (cv2 bytes)
+- CLI prep chw.sum   = -2389505.25 (stbi bytes)
+- Same byte source fed to both paths → BIT-EXACT match (ja/05).
+
+This decode noise is upstream of every resize/bilexact change and is the
+real source of box-count flips (threshold-boundary polygons) that inflate
+string-join CER.
+
+## Next-step options (for decision-maker)
+
+a. **Decode parity**: switch CLI jpeg load to libjpeg-turbo (matches cv2
+   bit-for-bit); keep stb for png/webp. Bounded: platform/desktop only.
+b. Scoring robustness: per-line matched CER instead of string join.
+c. Both: fix decode first, re-measure, then decide on scoring.
 
 ## Branch state
 
-`ws/m2-final-diag` at 26cfad7 (uncommitted: src/preprocess.cpp has
-bilexact code, default OFF). Decision needed:
-- a. Commit bilexact as opt-in (defensive, future-proof) and pause
-- b. Revert bilexact entirely (no value, dead code)
-- c. Try a different angle: investigate MNN conv kernel path
-  (might need OpenCL/CUDA backend comparison for stable diffs)
+ws/m2-final-diag, uncommitted:
+- CMakeLists.txt — PPOCR_PREP_BILEXACT now a real compile definition (fix)
+- tools/M2_PREP_BIT_ALIGN.md — this file
