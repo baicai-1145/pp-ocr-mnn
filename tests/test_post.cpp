@@ -493,6 +493,189 @@ void test_db_postprocess_zero_map() {
   std::printf("[ok] test_db_postprocess_zero_map: 0 boxes (no crash)\n");
 }
 
+// --- Test 17: sort_quad_boxes_reading_order, zh_02-style 3-row reorder ----
+// Reproduces the row-order bug: db_postprocess returns boxes in findContours
+// order (not reading order), so when there are 3 rows of text the join order
+// is e.g. (Chinese, Project, Text) instead of (Project, Chinese, Text).
+// After sort_quad_boxes_reading_order the boxes must be top-to-bottom
+// (y of TL ascending).
+void test_sort_quad_boxes_zh02_3rows() {
+  std::vector<DetBox> boxes;
+  // Simulate db_postprocess output for 3 horizontal text lines.
+  // Image is ~720px wide; each row is ~30px tall.
+  // Input order is the findContours order: middle row first, then top, then
+  // bottom (this is the actual bug — outlines are extracted in scan order
+  // and pick up rows in non-monotonic y).
+  {
+    DetBox b{};
+    // row 2: "Chinese" at y ~ 360
+    b.poly[0] = 100;  b.poly[1] = 360;
+    b.poly[2] = 600;  b.poly[3] = 360;
+    b.poly[4] = 600;  b.poly[5] = 390;
+    b.poly[6] = 100;  b.poly[7] = 390;
+    b.score = 0.95f;
+    boxes.push_back(b);
+  }
+  {
+    DetBox b{};
+    // row 1: "Project" at y ~ 180
+    b.poly[0] = 100;  b.poly[1] = 180;
+    b.poly[2] = 600;  b.poly[3] = 180;
+    b.poly[4] = 600;  b.poly[5] = 210;
+    b.poly[6] = 100;  b.poly[7] = 210;
+    b.score = 0.93f;
+    boxes.push_back(b);
+  }
+  {
+    DetBox b{};
+    // row 3: "Text" at y ~ 540
+    b.poly[0] = 100;  b.poly[1] = 540;
+    b.poly[2] = 600;  b.poly[3] = 540;
+    b.poly[4] = 600;  b.poly[5] = 570;
+    b.poly[6] = 100;  b.poly[7] = 570;
+    b.score = 0.90f;
+    boxes.push_back(b);
+  }
+  // Sanity: input order is (row2, row1, row3) — y of TL = (360, 180, 540).
+  assert(boxes[0].poly[1] == 360.0f);
+  assert(boxes[1].poly[1] == 180.0f);
+  assert(boxes[2].poly[1] == 540.0f);
+
+  sort_quad_boxes_reading_order(boxes);
+
+  // After sort: TL.y ascending → (180, 360, 540) = (row1, row2, row3)
+  // = ("Project", "Chinese", "Text").
+  if (!(boxes[0].poly[1] == 180.0f && boxes[0].poly[0] == 100.0f) ||
+      !(boxes[1].poly[1] == 360.0f && boxes[1].poly[0] == 100.0f) ||
+      !(boxes[2].poly[1] == 540.0f && boxes[2].poly[0] == 100.0f)) {
+    std::fprintf(stderr,
+                 "FAIL test_sort_quad_boxes_zh02_3rows: TL after sort = "
+                 "(%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f); expected "
+                 "(100,180) (100,360) (100,540)\n",
+                 boxes[0].poly[0], boxes[0].poly[1],
+                 boxes[1].poly[0], boxes[1].poly[1],
+                 boxes[2].poly[0], boxes[2].poly[1]);
+    std::exit(1);
+  }
+  // Scores should follow the boxes (re-ordered, not dropped).
+  if (boxes[0].score != 0.93f || boxes[1].score != 0.95f ||
+      boxes[2].score != 0.90f) {
+    std::fprintf(stderr,
+                 "FAIL test_sort_quad_boxes_zh02_3rows: score order = "
+                 "(%.2f, %.2f, %.2f); expected (0.93, 0.95, 0.90)\n",
+                 boxes[0].score, boxes[1].score, boxes[2].score);
+    std::exit(1);
+  }
+  std::printf("[ok] test_sort_quad_boxes_zh02_3rows: y=(180,360,540) "
+              "scores=(0.93,0.95,0.90)\n");
+}
+
+// --- Test 18: sort_quad_boxes_reading_order, same-row x re-order ----------
+// Three boxes all at y=200 (same row, within 10px tolerance), in x order
+// 500, 100, 300 (out of order). The bubble pass must move the leftmost
+// (x=100) box to the front.
+void test_sort_quad_boxes_same_row_xsort() {
+  std::vector<DetBox> boxes;
+  auto add = [&](float x) {
+    DetBox b{};
+    b.poly[0] = x;      b.poly[1] = 200;
+    b.poly[2] = x + 50; b.poly[3] = 200;
+    b.poly[4] = x + 50; b.poly[5] = 230;
+    b.poly[6] = x;      b.poly[7] = 230;
+    b.score = 0.9f;
+    boxes.push_back(b);
+  };
+  add(500.0f);  // rightmost
+  add(100.0f);  // leftmost (should be first)
+  add(300.0f);  // middle
+
+  // All have the same y=200. std::sort by (y, x) → (100, 300, 500) already.
+  // But to make this a real test of the bubble path, force a different
+  // primary sort: shift one box's y by 5 (still < 10 row tolerance) so the
+  // std::sort places it after the (y=200, x=500) box, then the bubble
+  // must walk it back left.
+  boxes[2].poly[1] = 205.0f;  // y=205, x=300 — within 5px of y=200
+  boxes[2].poly[3] = 205.0f;
+
+  sort_quad_boxes_reading_order(boxes);
+
+  // Expected: x ascending → (100, 300, 500).
+  if (!(boxes[0].poly[0] == 100.0f) ||
+      !(boxes[1].poly[0] == 300.0f) ||
+      !(boxes[2].poly[0] == 500.0f)) {
+    std::fprintf(stderr,
+                 "FAIL test_sort_quad_boxes_same_row_xsort: x after sort = "
+                 "(%.0f, %.0f, %.0f); expected (100, 300, 500)\n",
+                 boxes[0].poly[0], boxes[1].poly[0], boxes[2].poly[0]);
+    std::exit(1);
+  }
+  std::printf("[ok] test_sort_quad_boxes_same_row_xsort: x=(100,300,500)\n");
+}
+
+// --- Test 19: sort_quad_boxes_reading_order, y diff == 10px boundary ------
+// When |y_j - y_{j-1}| is exactly 10.0, the bubble pass condition is
+// `fabs(10) < 10` which is FALSE → no swap. (Strict `<` boundary, matches
+// Paddle's `std::abs(...) < 10`.) Two boxes at y=100 and y=110 should
+// therefore stay in y-order even if x is out of order — they are considered
+// different rows.
+void test_sort_quad_boxes_y_boundary_10px() {
+  std::vector<DetBox> boxes;
+  // Box 0: y=100, x=500 (top, rightmost)
+  {
+    DetBox b{};
+    b.poly[0] = 500; b.poly[1] = 100;
+    b.poly[2] = 550; b.poly[3] = 100;
+    b.poly[4] = 550; b.poly[5] = 130;
+    b.poly[6] = 500; b.poly[7] = 130;
+    b.score = 0.9f;
+    boxes.push_back(b);
+  }
+  // Box 1: y=110, x=100 (10px below, but leftmost — should NOT swap)
+  {
+    DetBox b{};
+    b.poly[0] = 100; b.poly[1] = 110;
+    b.poly[2] = 150; b.poly[3] = 110;
+    b.poly[4] = 150; b.poly[5] = 140;
+    b.poly[6] = 100; b.poly[7] = 140;
+    b.score = 0.8f;
+    boxes.push_back(b);
+  }
+  // Sanity: input is in y-order already.
+  assert(boxes[0].poly[1] == 100.0f);
+  assert(boxes[1].poly[1] == 110.0f);
+
+  sort_quad_boxes_reading_order(boxes);
+
+  // No swap: box 0 stays at y=100, x=500; box 1 stays at y=110, x=100.
+  if (!(boxes[0].poly[1] == 100.0f && boxes[0].poly[0] == 500.0f) ||
+      !(boxes[1].poly[1] == 110.0f && boxes[1].poly[0] == 100.0f)) {
+    std::fprintf(stderr,
+                 "FAIL test_sort_quad_boxes_y_boundary_10px: TL after sort = "
+                 "(%.0f,%.0f) (%.0f,%.0f); expected (500,100) (100,110) "
+                 "(no swap because y diff is exactly 10.0, not <10)\n",
+                 boxes[0].poly[0], boxes[0].poly[1],
+                 boxes[1].poly[0], boxes[1].poly[1]);
+    std::exit(1);
+  }
+  // Also confirm a 9.9px diff WOULD swap (sanity for the boundary).
+  std::vector<DetBox> b2 = boxes;  // copy
+  b2[1].poly[1] = 109.9f;
+  b2[1].poly[3] = 109.9f;
+  sort_quad_boxes_reading_order(b2);
+  if (!(b2[0].poly[1] == 109.9f && b2[0].poly[0] == 100.0f) ||
+      !(b2[1].poly[1] == 100.0f && b2[1].poly[0] == 500.0f)) {
+    std::fprintf(stderr,
+                 "FAIL test_sort_quad_boxes_y_boundary_10px: at 9.9px diff "
+                 "the bubble SHOULD swap; got (%.0f,%.0f) (%.0f,%.0f), "
+                 "expected (100,109.9) (500,100)\n",
+                 b2[0].poly[0], b2[0].poly[1],
+                 b2[1].poly[0], b2[1].poly[1]);
+    std::exit(1);
+  }
+  std::printf("[ok] test_sort_quad_boxes_y_boundary_10px: 10.0 no-swap, "
+              "9.9 swaps\n");
+}
+
 }  // namespace
 
 int main() {
@@ -506,12 +689,15 @@ int main() {
   test_db_postprocess_white_rect();
   test_db_postprocess_two_rects();
   test_db_postprocess_zero_map();
+  test_sort_quad_boxes_zh02_3rows();
+  test_sort_quad_boxes_same_row_xsort();
+  test_sort_quad_boxes_y_boundary_10px();
   test_ctc_decode_basic();
   test_ctc_decode_with_space();
   test_ctc_decode_utf8();
   test_ctc_decode_all_blank();
   test_ctc_decode_blank_between_repeats();
   test_ctc_decode_probabilistic();
-  std::printf("\nALL POSTPROCESS TESTS PASSED (16/16)\n");
+  std::printf("\nALL POSTPROCESS TESTS PASSED (19/19)\n");
   return 0;
 }

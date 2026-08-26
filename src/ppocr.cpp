@@ -297,6 +297,17 @@ static void run_det_sync(Engine& e, const Image& bgr,
   const int W = so.shape[3];
   boxes_out = db_postprocess(so.data, H, W, bgr.w, bgr.h,
                              in.ratio_w, in.ratio_h, e.det_cfg.det);
+  // NOTE (POST-4): db_postprocess emits boxes in cv::findContours order,
+  // which is NOT reading order. Paddle's pipeline applies
+  // ComponentsProcessor::SortQuadBoxes (top-to-bottom, then left-to-right
+  // within a 10px row tolerance) AFTER db_postprocess, so the rec layer
+  // sees boxes in reading order. Without this step the join of rec_texts
+  // is line-permuted (e.g. zh/02: "Chinese\nProject\nText" instead of
+  // "Project\nChinese\nText") and CER is high even though every line
+  // is correctly recognized. The fix lives in db_post as
+  // sort_quad_boxes_reading_order — call it here, before rec, so the
+  // rec batch and the final lines are both in reading order.
+  sort_quad_boxes_reading_order(boxes_out);
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
 }

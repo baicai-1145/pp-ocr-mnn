@@ -450,4 +450,36 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
   return out;
 }
 
+void sort_quad_boxes_reading_order(std::vector<DetBox>& boxes) {
+  // Faithful port of Paddle C++ ComponentsProcessor::SortQuadBoxes
+  // (deploy/cpp_infer/src/common/processors.cc:590-611).
+  //   1) std::sort by (a.poly[1] < b.poly[1]) || (== && a.poly[0] < b.poly[0])
+  //      — primary key is the y of the first vertex (the TL corner of the
+  //        mini-box that db_postprocess emits, since we sort_min_area_rect_points
+  //        puts TL at poly[0]).
+  //   2) Bubble pass: for each i in [0..N-2), walk j from i+1 down to 1; if
+  //      |y_j - y_{j-1}| < 10 && x_j < x_{j-1} then swap, else break. This
+  //      re-orders boxes that landed in the wrong row bucket (e.g. when two
+  //      rows have a y difference < 10 px the primary sort may group them
+  //      together; the bubble pass enforces left-to-right within that group).
+  // The strict < ordering matches cv::Point2f's float comparison in Paddle
+  // (no epsilon, NaN propagates the same way).
+  if (boxes.size() < 2) return;
+  std::sort(boxes.begin(), boxes.end(),
+            [](const DetBox& a, const DetBox& b) {
+              return (a.poly[1] < b.poly[1]) ||
+                     (a.poly[1] == b.poly[1] && a.poly[0] < b.poly[0]);
+            });
+  for (size_t i = 0; i + 1 < boxes.size(); ++i) {
+    for (size_t j = i + 1; j > 0; --j) {
+      if (std::fabs(boxes[j].poly[1] - boxes[j - 1].poly[1]) < 10.0f &&
+          boxes[j].poly[0] < boxes[j - 1].poly[0]) {
+        std::swap(boxes[j], boxes[j - 1]);
+      } else {
+        break;
+      }
+    }
+  }
+}
+
 }  // namespace ppocr
