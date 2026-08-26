@@ -16,14 +16,17 @@ tools/
   cer_audit.py        re-score baseline vs sibling .jpg.txt; baseline sanity
   verify_mnn_shapes.py  multi-resolution probe-driven verifier for det .mnn
   verify_mnn_probe.cpp  C++ probe (built by verify_mnn_shapes, run via MNN)
+  serve_registry.py   local HTTP file server (mirrors for the auto-downloader)
 
   README.md           this file
   CER_VS_OFFICIAL.md  analysis: our CER vs PaddleOCR RecMetric
   REC_ONLY.md         rec-only contract gap (CLI patch request to m1)
   DET_DYNAMIC.md      det .mnn dynamic-shape diagnostic (TOOLS-4)
+  AUTO_DOWNLOAD.md    C++ auto-downloader design + test evidence (TOOLS-5)
 
 tests/
   test_tools.py       unit + integration tests (60 tests, stdlib only)
+  test_downloader.py  downloader E2E (server + C++ driver, TOOLS-5)
 
 configs/              generated per-model config JSONs + registry.json
 ```

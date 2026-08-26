@@ -59,14 +59,6 @@ void write_random_file(const fs::path& p, size_t bytes, uint32_t seed) {
   }
 }
 
-std::string read_file_bytes(const fs::path& p) {
-  std::ifstream f(p, std::ios::binary);
-  if (!f) return {};
-  std::ostringstream oss;
-  oss << f.rdbuf();
-  return oss.str();
-}
-
 struct Args {
   std::string registry_path;
   std::string model_dir;
