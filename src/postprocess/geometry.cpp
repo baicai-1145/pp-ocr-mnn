@@ -118,6 +118,88 @@ bool min_area_rect_convex(const std::vector<PointF>& h, PointF out[4],
   return true;
 }
 
+// --- 3x3 inverse (Gauss-Jordan on the doubled matrix) ----------------------
+// Used by warp_perspective_quad below. Single-purpose: invert one 3x3.
+static bool invert3x3(const double m[9], double out[9]) {
+  double a[3][3] = {{m[0], m[1], m[2]}, {m[3], m[4], m[5]}, {m[6], m[7], m[8]}};
+  double inv[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+  for (int k = 0; k < 3; ++k) {
+    int piv = k;
+    double maxv = std::fabs(a[k][k]);
+    for (int i = k + 1; i < 3; ++i) {
+      if (std::fabs(a[i][k]) > maxv) { piv = i; maxv = std::fabs(a[i][k]); }
+    }
+    if (maxv < 1e-12) return false;
+    if (piv != k) {
+      for (int j = 0; j < 3; ++j) std::swap(a[k][j], a[piv][j]);
+      for (int j = 0; j < 3; ++j) std::swap(inv[k][j], inv[piv][j]);
+    }
+    for (int i = 0; i < 3; ++i) {
+      if (i == k) continue;
+      double f = a[i][k] / a[k][k];
+      for (int j = 0; j < 3; ++j) {
+        a[i][j] -= f * a[k][j];
+        inv[i][j] -= f * inv[k][j];
+      }
+    }
+    double d = a[k][k];
+    for (int j = 0; j < 3; ++j) { a[k][j] /= d; inv[k][j] /= d; }
+  }
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) out[i * 3 + j] = inv[i][j];
+  return true;
+}
+
+// --- perspective transform solver (8x8 Gauss-Jordan) -----------------------
+// Computes M (3x3 row-major) such that [u_i, v_i, 1]^T ~ M * [x_i, y_i, 1]^T
+// for i = 0..3. Matches cv2.getPerspectiveTransform bit-for-bit (same
+// 8-equation form, same pivot ordering, double precision). Paddle's
+// `get_rotate_crop_image` uses the same OpenCV call, so we mirror it here.
+static bool get_perspective_transform(const double src[8], const double dst[8],
+                                       double M[9]) {
+  // 8 equations, 8 unknowns (a, b, c, d, e, f, g, h), with M[2,2] = 1.
+  //   a*x_i + b*y_i + c - g*x_i*u_i - h*y_i*u_i = u_i
+  //   d*x_i + e*y_i + f - g*x_i*v_i - h*y_i*v_i = v_i
+  double A[8][8] = {{0}};
+  double b[8] = {0};
+  for (int i = 0; i < 4; ++i) {
+    double x = src[i * 2], y = src[i * 2 + 1];
+    double u = dst[i * 2], v = dst[i * 2 + 1];
+    A[i][0] = x; A[i][1] = y; A[i][2] = 1;
+    A[i][6] = -x * u; A[i][7] = -y * u;
+    b[i] = u;
+    A[i + 4][3] = x; A[i + 4][4] = y; A[i + 4][5] = 1;
+    A[i + 4][6] = -x * v; A[i + 4][7] = -y * v;
+    b[i + 4] = v;
+  }
+  // Augmented matrix M_aug[i][8] = b[i].
+  double aug[8][9];
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) aug[i][j] = A[i][j];
+    aug[i][8] = b[i];
+  }
+  for (int k = 0; k < 8; ++k) {
+    int piv = k;
+    double maxv = std::fabs(aug[k][k]);
+    for (int i = k + 1; i < 8; ++i) {
+      if (std::fabs(aug[i][k]) > maxv) { piv = i; maxv = std::fabs(aug[i][k]); }
+    }
+    if (maxv < 1e-15) return false;
+    if (piv != k) for (int j = 0; j < 9; ++j) std::swap(aug[k][j], aug[piv][j]);
+    for (int i = 0; i < 8; ++i) {
+      if (i == k) continue;
+      double f = aug[i][k] / aug[k][k];
+      for (int j = k; j < 9; ++j) aug[i][j] -= f * aug[k][j];
+    }
+  }
+  double x[8];
+  for (int i = 0; i < 8; ++i) x[i] = aug[i][8] / aug[i][i];
+  M[0] = x[0]; M[1] = x[1]; M[2] = x[2];
+  M[3] = x[3]; M[4] = x[4]; M[5] = x[5];
+  M[6] = x[6]; M[7] = x[7]; M[8] = 1.0;
+  return true;
+}
+
 // --- bicubic (OpenCV INTER_CUBIC, a = -0.75) ---------------------------------
 // Port of OpenCV's interpolateCubic: 3 explicit weights + 1 residual. The 4
 // samples are at offsets -1, 0, 1, 2 from x0 (where x0 = floor(sample)). The
@@ -231,9 +313,6 @@ Image warp_perspective_quad(const Image& src, const PointF quad_in[4],
   PointF q[4];
   for (int k = 0; k < 4; ++k) q[k] = quad_in[k];
 
-  float TLx = q[0].x, TLy = q[0].y;
-  float TRx = q[1].x, TRy = q[1].y;
-  float BLx = q[3].x, BLy = q[3].y;
   // Paddle's `get_rotate_crop_image` (paddlex 3.x,
   // paddlex/inference/pipelines/components/common/crop_image_regions.py)
   // builds the destination rectangle as `pts_std = [[0,0], [W,0],
@@ -244,23 +323,44 @@ Image warp_perspective_quad(const Image& src, const PointF quad_in[4],
   // [0, H-1] in j, but the *range* of i/j fed into the affine
   // coefficients is [0, W] / [0, H], not [0, W-1] / [0, H-1]. Using
   // (W-1) here would scale the perspective by (W-1)/W and shift the
-  // warp slightly. The previous M2-PIPE commit had `w = dst_w - 1`,
-  // which is the bug M2-REC2 fixes.
-  float w = static_cast<float>(dst_w);
-  float h = static_cast<float>(dst_h);
-  if (w < 1.0f) w = 1.0f;
-  if (h < 1.0f) h = 1.0f;
+  // warp slightly.
+  double w = static_cast<double>(dst_w);
+  double h = static_cast<double>(dst_h);
+  if (w < 1.0) w = 1.0;
+  if (h < 1.0) h = 1.0;
 
-  // For an axis-aligned rectangle in dst, the warp is affine:
-  //   x(i,j) = a*i + b*j + c
-  //   y(i,j) = d*i + e*j + f
-  // Boundary conditions: (0,0)->TL, (w,0)->TR, (0,h)->BL.
-  float a = (TRx - TLx) / w;
-  float b = (BLx - TLx) / h;
-  float c = TLx;
-  float d = (TRy - TLy) / w;
-  float e = (BLy - TLy) / h;
-  float f = TLy;
+  // POST-7: use a full 8-parameter perspective transform (cv2's
+  // getPerspectiveTransform), not the 6-parameter affine approximation
+  // that the previous version used. The affine form assumed the
+  // source quad was a perfect parallelogram; for general quads (and
+  // especially for vertical / rotated text where the top and bottom
+  // edges are not parallel — e.g. ja/00 box0 with TL=(509,0),
+  // TR=(550,0), BR=(543,213), BL=(502,212)) the affine map misses
+  // the perspective component and the warped crop is shifted by up
+  // to ~30 px in src coordinates. That systematic shift is what made
+  // vert-text CER zero. Mirroring cv2's 8x8 linear solve restores
+  // pixel-level parity.
+  const double src_pts[8] = {
+      q[0].x, q[0].y,  q[1].x, q[1].y,  q[2].x, q[2].y,  q[3].x, q[3].y,
+  };
+  const double dst_pts[8] = {0.0, 0.0,  w, 0.0,  w, h,  0.0, h};
+  double M[9];
+  if (!get_perspective_transform(src_pts, dst_pts, M)) {
+    // Degenerate quad (collinear points etc.) — fall back to zero
+    // image. Caller checks the returned image via .data.empty().
+    return dst;
+  }
+  double M_inv[9];
+  if (!invert3x3(M, M_inv)) {
+    return dst;
+  }
+  // Pre-extract the inverse entries (M_inv * dst_h = src_h) for the
+  // inner loop. Using doubles here keeps the per-pixel arithmetic
+  // well-conditioned; we cast back to float when feeding the bicubic
+  // sampler.
+  const double m00 = M_inv[0], m01 = M_inv[1], m02 = M_inv[2];
+  const double m10 = M_inv[3], m11 = M_inv[4], m12 = M_inv[5];
+  const double m20 = M_inv[6], m21 = M_inv[7], m22 = M_inv[8];
 
   dst.w = dst_w;
   dst.h = dst_h;
@@ -272,13 +372,19 @@ Image warp_perspective_quad(const Image& src, const PointF quad_in[4],
   for (int j = 0; j < dst_h; ++j) {
     uint8_t* drow = dst.data.data() + j * dstride;
     for (int i = 0; i < dst_w; ++i) {
-      float sx = a * i + b * j + c;
-      float sy = d * i + e * j + f;
+      // Inverse-warp: src_h = M_inv * (i, j, 1). The last row
+      // carries the perspective denominator. With our (W, H)
+      // corners convention, dst (0, 0) lands on src TL exactly
+      // (M_inv[0,2] = TLx, M_inv[1,2] = TLy), matching cv2.
+      const double w_denom = m20 * i + m21 * j + m22;
+      const double sx = (m00 * i + m01 * j + m02) / w_denom;
+      const double sy = (m10 * i + m11 * j + m12) / w_denom;
       for (int ch = 0; ch < src.c; ++ch) {
         // Pass ch_stride = src.c so the sampler indexes
         // (xs[i] * src.c + ch) per row, matching HWC layout.
         drow[i * src.c + ch] = sample_bicubic_replicate_plane(
-            src.data.data() + ch, src.w, src.h, sstride, src.c, sx, sy);
+            src.data.data() + ch, src.w, src.h, sstride, src.c,
+            static_cast<float>(sx), static_cast<float>(sy));
       }
     }
   }
