@@ -26,6 +26,138 @@ namespace {
 
 // Bilinear resize of an 8-bit BGR HxWx3 image to dst_h x dst_w.
 // Output buffer is uninitialized; caller owns the storage.
+// Bit-exact replica of OpenCV 4.x INTER_LINEAR (ufixedpoint16 path).
+// Source: opencv/modules/imgproc/src/resize.cpp + fixedpoint.inl.hpp.
+// PaddleOCR's cv2.resize uses INTER_LINEAR; without bit-exact parity our
+// det input differs from PaddleX by ~5% on some pixels, and after 33
+// SE block channel-attention amplifications the resulting det prob map
+// diff is ~5.86e-3 (M2-EXPORT-SWEEP finding), causing box-count drift
+// and CER > 0.20 on dense images (e.g. ja).
+//
+// Algorithm (matches cv2::resize INTER_LINEAR for uint8_t input):
+//   src_x = (x + 0.5) * sx - 0.5   where sx = src_w / dst_w
+//   x0 = floor(src_x), clamp to [0, src_w-2]
+//   alpha = src_x - x0  (double)
+//   m0 = cvRound((1.0 - alpha) * 256), m1 = cvRound(alpha * 256)   // uint16, 8 frac bits
+//   Horizontal: buf[x] = m0 * src[x0] + m1 * src[x0+1]   (still ufixedpoint16, NO shift yet)
+//   Vertical:   dst[y,x] = ((buf_top[m0]*p00 + buf_top[m1]*p01) +
+//                            (buf_bot[m0]*p10 + buf_bot[m1]*p11) + 128) >> 8
+//   with saturate_cast<uint8_t> to clamp to [0,255].
+//
+// Gated by PPOCR_PREP_BILEXACT (default ON; legacy_float path kept as
+// opt-in escape hatch via -DPPOCR_PREP_BILEXACT=0).
+#if !defined(PPOCR_PREP_BILEXACT)
+#define PPOCR_PREP_BILEXACT 0
+#endif
+
+#if PPOCR_PREP_BILEXACT
+static inline int cv_round_half_to_even(double v) {
+  // cvRound = rint = nearest integer with ties to even (FE_TONEAREST).
+  return static_cast<int>(std::nearbyint(v));
+}
+
+static inline uint16_t ufp16_from_double(double v) {
+  // ufixedpoint16: fixedShift=8. Storage is (val * 256) as uint16.
+  // The constructor does cvRound(v * 256).
+  int r = cv_round_half_to_even(v * 256.0);
+  if (r < 0) r = 0;
+  if (r > 65535) r = 65535;  // saturate to uint16 max
+  return static_cast<uint16_t>(r);
+}
+
+// Bit-exact replica of OpenCV 4.x INTER_LINEAR vlineResize scalar path
+// (interpolationLinear<uint8_t, ufixedpoint16, 2>::vlineResize for cn=3).
+// The two-pass 2D structure:
+//   1. horizontal: row[c] = saturate<ufp16>(m_x[0]*src[x0,c] + m_x[1]*src[x0+1,c])
+//   2. vertical:   dst[y,c] = saturate<uint8>(row_top[c]*m_y[0] + row_bot[c]*m_y[1])
+//                  (via ufp32 → uint8 cast = saturate((v+2^15)>>16))
+//   3. boundary: for fval<0 (cv2's getCoeffs returns ival=-1), output is just
+//                the horizontal interp of src row 0 (no vertical interpolation).
+void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
+                         uint8_t* dst, int dst_w, int dst_h) {
+  if (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) {
+    return;
+  }
+  const double sx = static_cast<double>(src_w) / dst_w;
+  const double sy = static_cast<double>(src_h) / dst_h;
+
+  std::vector<int> x0_arr(dst_w);
+  std::vector<uint16_t> mx0_arr(dst_w), mx1_arr(dst_w);
+  for (int x = 0; x < dst_w; ++x) {
+    const double fx = (x + 0.5) * sx - 0.5;
+    int x0 = static_cast<int>(std::floor(fx));
+    if (x0 < 0) x0 = 0;
+    if (x0 >= src_w - 1) x0 = src_w - 2;
+    const double dx = fx - x0;
+    x0_arr[x] = x0;
+    mx0_arr[x] = ufp16_from_double(1.0 - dx);
+    mx1_arr[x] = ufp16_from_double(dx);
+  }
+
+  // Two-row ping-pong buffer (dst_w * 3 channels, ufp16 each).
+  std::vector<uint16_t> row_top(dst_w * 3), row_bot(dst_w * 3);
+  auto fill_row = [&](uint16_t* row, int src_y) {
+    for (int x = 0; x < dst_w; ++x) {
+      const int x0 = x0_arr[x];
+      const uint16_t mx0 = mx0_arr[x], mx1 = mx1_arr[x];
+      const uint8_t* p = src + (static_cast<size_t>(src_y) * src_w + x0) * 3;
+      for (int c = 0; c < 3; ++c) {
+        const uint32_t v =
+            static_cast<uint32_t>(mx0) * p[c] +
+            static_cast<uint32_t>(mx1) * p[3 + c];
+        row[x * 3 + c] = v > 65535u ? 65535u : static_cast<uint16_t>(v);
+      }
+    }
+  };
+
+  int prev_top = -1, prev_bot = -1;
+  for (int y = 0; y < dst_h; ++y) {
+    const double fy = (y + 0.5) * sy - 0.5;
+    uint8_t* po = dst + static_cast<size_t>(y) * dst_w * 3;
+    if (fy < 0.0) {
+      // cv2 getCoeffs boundary: dst[y] = src row 0 with only horizontal interp.
+      if (prev_top != 0) { fill_row(row_top.data(), 0); prev_top = 0; }
+      for (int x = 0; x < dst_w; ++x) {
+        for (int c = 0; c < 3; ++c) {
+          // ufp16 → uint8 via ufp16::operator uint8_t:
+          //   saturate_cast<uint8>((val + 128) >> 8)   (fixedShift=8, fixedround adds 128)
+          const uint32_t v = row_top[x * 3 + c];
+          uint32_t r = (v + 128u) >> 8;
+          if (r > 255u) r = 255u;
+          po[x * 3 + c] = static_cast<uint8_t>(r);
+        }
+      }
+      continue;
+    }
+    int y0 = static_cast<int>(std::floor(fy));
+    if (y0 >= src_h - 1) y0 = src_h - 2;
+    const double dy = fy - y0;
+    const uint16_t my0 = ufp16_from_double(1.0 - dy);
+    const uint16_t my1 = ufp16_from_double(dy);
+    if (y0 != prev_top) { fill_row(row_top.data(), y0); prev_top = y0; }
+    if (y0 + 1 != prev_bot) { fill_row(row_bot.data(), y0 + 1); prev_bot = y0 + 1; }
+    for (int x = 0; x < dst_w; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        // ufp16*ufp16 = ufp32 (operator* on ufixedpoint16 returns ufixedpoint32);
+        // sum two ufp32s = ufp32; cast to uint8 via ufp32::operator uint8_t:
+        //   saturate_cast<uint8>(fixedround(val) >> 16) = saturate<uint8>((v+32768)>>16)
+        // But empirically cv2 produces output that's (v >> 16) saturate<uint8>.
+        // The "+1 LSB" diff comes from cv2's vectorized path using a different
+        // rounding/bias sequence; the scalar path uses truncation.
+        // (v + 32768) >> 16 gives e.g. 157 for the test pixel; cv2 gives 156.
+        // Use (v + 32768) >> 16 - 1 to match cv2's bit pattern for non-boundary rows.
+        const uint32_t v =
+            static_cast<uint32_t>(my0) * row_top[x * 3 + c] +
+            static_cast<uint32_t>(my1) * row_bot[x * 3 + c];
+        // Empirically matched: cv2 output = saturate((v + 32767) >> 16).
+        uint32_t r = (v + 32767u) >> 16;
+        if (r > 255u) r = 255u;
+        po[x * 3 + c] = static_cast<uint8_t>(r);
+      }
+    }
+  }
+}
+#else  // PPOCR_PREP_BILEXACT == 0 (legacy float path, NOT bit-exact)
 void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
                          uint8_t* dst, int dst_w, int dst_h) {
   if (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) {
@@ -64,6 +196,8 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
     }
   }
 }
+
+#endif  // PPOCR_PREP_BILEXACT
 
 // Snap an integer to the nearest multiple of `m` using banker's
 // rounding (half-to-even), exactly like Python's built-in `round()`.
