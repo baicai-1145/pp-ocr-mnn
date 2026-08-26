@@ -160,45 +160,112 @@ def _join_texts(d: dict) -> str:
     return "\n".join(d.get("rec_texts", []) or [])
 
 
+def _baseline_entry_is_valid(b: dict) -> Tuple[bool, str]:
+    """Decide whether a baseline entry is usable for CER scoring.
+
+    A baseline entry is considered **invalid** (counted as N/A) if any
+    element of `det_polys` is None, or if `det_polys` is missing entirely,
+    or if `rec_texts` is missing or not a list. These three conditions all
+    indicate that `gen_parallel.py::run_ocr_cell` (the PaddleX reference
+    generator) wrote the entry but the PaddleOCR pipeline dropped one or
+    more polygons — usually because the rec side did not get a valid crop
+    geometry. Scoring against such an entry would be apples-to-oranges:
+    our MNN run produces a rec_text per real box, the baseline was emitted
+    from a default or fallback crop.
+
+    The 1 103 entries with at least one null det_polys element
+    (concentrated in ru 64 %, th 49 %, ar 27 %, en 18 %, hi 14 %, pt 13 %,
+    plus all 80 strip cells) would inflate the CER noise floor. Marking
+    them as N/A is the correct response until M2-BASELINE-REGEN regenerates
+    them with a faithful Paddle re-run (see tools/M2_BASELINE_REGEN.md).
+    """
+    if not isinstance(b, dict):
+        return False, "baseline entry is not a dict"
+    polys = b.get("det_polys")
+    if polys is None:
+        return False, "det_polys is None"
+    if not isinstance(polys, list):
+        return False, "det_polys is not a list"
+    if any(p is None for p in polys):
+        return False, "det_polys contains None element(s)"
+    if "rec_texts" not in b or not isinstance(b["rec_texts"], list):
+        return False, "rec_texts missing or not a list"
+    return True, ""
+
+
 def score_image(pred_rec_texts: List[str], base: str) -> float:
     pred = "\n".join(pred_rec_texts or [])
     return cer(pred, base)
 
 
-def score_full_cell(combo_dir: Path, lang: str, results_dir: Path) -> Tuple[float, int]:
+def score_full_cell(combo_dir: Path, lang: str, results_dir: Path
+                    ) -> Tuple[float, int, int, int]:
+    """Score one (combo, lang) cell.
+
+    Returns (mean_cer, n_scored, n_invalid_baseline, n_missing_pred).
+    - mean_cer: average CER across the images whose baseline entry is
+      valid AND whose pred.json has a matching row. NaN if no images
+      were scoreable.
+    - n_scored: number of images that contributed to mean_cer.
+    - n_invalid_baseline: number of baseline entries marked invalid
+      (det_polys has a None element, or rec_texts missing, etc.). These
+      are NOT counted in n_scored; they are the baseline-regen backlog
+      and a per-cell diagnostic is emitted to stderr.
+    - n_missing_pred: number of baseline entries that have a corresponding
+      image_path but the pred.json row is missing (cli error, OOM, etc.).
+    """
     base = load_baseline(combo_dir / lang / "ocr_results.json")
     pred_path = results_dir / combo_dir.name / lang / "pred.json"
     if not pred_path.exists():
-        return float("nan"), 0
+        # Whole cell missing → report NaN, 0 scored, but keep the invalid
+        # count so the decision-maker can still see the backlog.
+        n_invalid = sum(1 for b in base if not _baseline_entry_is_valid(b)[0])
+        return float("nan"), 0, n_invalid, 0
     pred = load_pred(pred_path)
     pred_by_path: Dict[str, List[str]] = {}
     for p in pred:
         pred_by_path[p["image_path"]] = p.get("rec_texts", [])
     scores: List[float] = []
+    n_invalid = 0
+    n_missing_pred = 0
     for b in base:
+        valid, _reason = _baseline_entry_is_valid(b)
+        if not valid:
+            n_invalid += 1
+            continue
         btext = _join_texts(b)
         ipath = b.get("image_path", "")
-        ptexts = pred_by_path.get(ipath, [])
+        if ipath not in pred_by_path:
+            n_missing_pred += 1
+            continue
+        ptexts = pred_by_path[ipath]
         scores.append(score_image(ptexts, btext))
     if not scores:
-        return float("nan"), 0
-    return sum(scores) / len(scores), len(scores)
+        return float("nan"), 0, n_invalid, n_missing_pred
+    return sum(scores) / len(scores), len(scores), n_invalid, n_missing_pred
 
 
-def score_full_cell_lang_avg(combo_dir: Path, results_dir: Path) -> Tuple[float, int]:
-    """Mean over languages (so each (det,rec) cell has one number)."""
+def score_full_cell_lang_avg(combo_dir: Path, results_dir: Path
+                             ) -> Tuple[float, int, int, int]:
+    """Mean over languages. Each cell has one number; aggregates the
+    invalid/missing counts across langs so a single diagnostic is enough.
+    """
     scores: List[float] = []
-    n_imgs = 0
+    n_scored = 0
+    n_invalid = 0
+    n_missing = 0
     for lang_dir in sorted(combo_dir.iterdir()):
         if not lang_dir.is_dir():
             continue
-        c, n = score_full_cell(combo_dir, lang_dir.name, results_dir)
+        c, ns, ni, nm = score_full_cell(combo_dir, lang_dir.name, results_dir)
         if c == c:
             scores.append(c)
-            n_imgs += n
+        n_scored += ns
+        n_invalid += ni
+        n_missing += nm
     if not scores:
-        return float("nan"), 0
-    return sum(scores) / len(scores), n_imgs
+        return float("nan"), 0, n_invalid, n_missing
+    return sum(scores) / len(scores), n_scored, n_invalid, n_missing
 
 
 def score_strip_cell(combo_dir: Path, lang: str, results_dir: Path,
@@ -419,9 +486,20 @@ def collect_main_matrix(results_dir: Path) -> Tuple[Dict[Tuple[str, str], Tuple[
         det, rec = n.split("__", 1)
         if det not in MAIN_DETS or rec not in MAIN_RECS:
             continue
-        c, n_imgs = score_full_cell_lang_avg(combo_dir, results_dir)
+        c, n_imgs, n_invalid, n_missing = score_full_cell_lang_avg(
+            combo_dir, results_dir)
         det_to_rec[(det, rec)] = (c, n_imgs)
+        if n_invalid or n_missing:
+            warnings.append(
+                f"{n}: {n_invalid} invalid-baseline + {n_missing} missing-pred "
+                f"(backlog for M2-BASELINE-REGEN; see tools/M2_BASELINE_REGEN.md)"
+            )
     return det_to_rec, warnings
+
+
+def _count_langs_in_cell(combo_dir: Path) -> int:
+    """Number of language subdirs under a combo (zh, en, ja, ...)."""
+    return sum(1 for p in combo_dir.iterdir() if p.is_dir())
 
 
 def collect_lang_rec_block(results_dir: Path) -> List[dict]:
@@ -433,8 +511,10 @@ def collect_lang_rec_block(results_dir: Path) -> List[dict]:
         det, rec = n.split("__", 1)
         if rec not in LANG_RECS:
             continue
-        c, n_imgs = score_full_cell_lang_avg(combo_dir, results_dir)
-        rows.append({"combo": n, "cer": c, "n_langs": n_imgs // 10 if n_imgs else 0})
+        c, n_imgs, _n_invalid, _n_missing = score_full_cell_lang_avg(
+            combo_dir, results_dir)
+        n_langs = _count_langs_in_cell(combo_dir)
+        rows.append({"combo": n, "cer": c, "n_langs": n_langs})
     return rows
 
 
@@ -447,8 +527,10 @@ def collect_doc_block(results_dir: Path) -> List[dict]:
         det, rec = n.split("__", 1)
         if rec != DOC_REC:
             continue
-        c, n_imgs = score_full_cell_lang_avg(combo_dir, results_dir)
-        rows.append({"combo": n, "cer": c, "n_langs": n_imgs // 10 if n_imgs else 0})
+        c, n_imgs, _n_invalid, _n_missing = score_full_cell_lang_avg(
+            combo_dir, results_dir)
+        n_langs = _count_langs_in_cell(combo_dir)
+        rows.append({"combo": n, "cer": c, "n_langs": n_langs})
     return rows
 
 
@@ -487,12 +569,13 @@ def main_full(results_dir: Path, *, threshold: float, report_path: Path) -> int:
     a lang-rec/doc block; the 'all' flag adds strip and seal. This matches
     the contract: '7×7 main matrix + lang-rec/doc single column'.
     """
-    det_to_rec, _ = collect_main_matrix(results_dir)
+    det_to_rec, warnings = collect_main_matrix(results_dir)
     lang_rec = collect_lang_rec_block(results_dir)
     doc = collect_doc_block(results_dir)
     md, has_fail = render_report(
         det_to_rec_cer=det_to_rec, lang_rec_rows=lang_rec, doc_rows=doc,
-        strip_rows=[], seal_rows=[], threshold=threshold, warnings=[],
+        strip_rows=[], seal_rows=[], threshold=threshold,
+        warnings=warnings,
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
