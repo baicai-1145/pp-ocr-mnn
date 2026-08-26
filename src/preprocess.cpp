@@ -173,7 +173,11 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   int resize_w = w;
   int resize_h = h;
   if (rc.mode == DetResizeConfig::Mode::LimitMin) {
-    double ratio = (std::min(w, h) > 0)
+    // PaddleOCR type0 limit_type="min": only UPSCALE when min(h,w) < limit.
+    // Images already >= limit keep ratio 1.0 (this is the PaddleX baseline
+    // path: limit=64 never downscales real photos; zh/04 1280x720 stays
+    // 1280x720 then stride-snaps to 1280x704).
+    double ratio = (std::min(w, h) > 0 && std::min(w, h) < limit_side)
         ? static_cast<double>(limit_side) / std::min(w, h) : 1.0;
     resize_w = static_cast<int>(std::round(w * ratio));
     resize_h = static_cast<int>(std::round(h * ratio));
@@ -183,15 +187,10 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
     resize_w = static_cast<int>(std::round(w * ratio));
     resize_h = static_cast<int>(std::round(h * ratio));
   } else {
-    // NoResize: PaddleOCR's `DetResizeForTest: null` would feed the
-    // image at native resolution. The v6_tiny_det .mnn we ship is
-    // only partially-dynamic — MNN's shape inference fails for
-    // native inputs ("Broad cast error, dim1=46, dim2=45"). We
-    // therefore fall back to the same `limit_min` resize the
-    // `LimitMin` mode uses, so the model still runs. Decision-maker
-    // can re-export the v6 det .mnn with fully-dynamic shapes to
-    // enable a true null pipeline.
-    double ratio = (std::min(w, h) > 0)
+    // NoResize: feed native resolution (model is /32-dynamic per
+    // tools/DET_DYNAMIC.md). Legacy fallback scaled like limit_min — kept
+    // only for pathological inputs; normal path never lands here.
+    double ratio = (std::min(w, h) > 0 && std::min(w, h) < limit_side)
         ? static_cast<double>(limit_side) / std::min(w, h) : 1.0;
     resize_w = static_cast<int>(std::round(w * ratio));
     resize_h = static_cast<int>(std::round(h * ratio));
