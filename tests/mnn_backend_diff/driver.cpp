@@ -229,17 +229,41 @@ static DiffStats diff_stats(const std::vector<float>& a, const std::vector<float
 }
 
 int main(int argc, char** argv) {
-  if (argc < 5) {
+  // Parse optional flags before positional args.
+  int forward_type = MNN_FORWARD_CPU;
+  const char* mnn_lib_path = nullptr;
+  const char* single_name = nullptr;
+  std::vector<const char*> positional;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--forward") == 0 && i + 1 < argc) {
+      forward_type = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--mnn-lib") == 0 && i + 1 < argc) {
+      mnn_lib_path = argv[++i];
+    } else if (std::strcmp(argv[i], "--single") == 0 && i + 1 < argc) {
+      single_name = argv[++i];
+    } else {
+      positional.push_back(argv[i]);
+    }
+  }
+  if (positional.size() < 4) {
     std::fprintf(stderr,
-                 "usage: %s <model.mnn> <input.npy> <out_prefix> <num_threads> [paddle_ref.npy]\n",
+                 "usage: %s [--forward N] [--single NAME] [--mnn-lib PATH] "
+                 "<model.mnn> <input.npy> <out_prefix> <num_threads> [paddle_ref.npy]\n"
+                 "  --forward N    MNN_FORWARD_* constant (0=CPU, 2=CUDA, 3=OpenCL, 7=Vulkan). Default 0.\n"
+                 "  --single NAME  run ONLY this combo (e.g. cuda, vulkan) instead of the 4-CPU sweep.\n"
+                 "  --mnn-lib PATH recorded in the run log; not used by the driver itself.\n",
                  argv[0]);
     return 99;
   }
-  const char* model_path = argv[1];
-  const char* input_path = argv[2];
-  const char* out_prefix = argv[3];
-  int num_threads = std::atoi(argv[4]);
-  const char* paddle_ref_path = (argc >= 6) ? argv[5] : nullptr;
+  const char* model_path = positional[0];
+  const char* input_path = positional[1];
+  const char* out_prefix = positional[2];
+  int num_threads = std::atoi(positional[3]);
+  const char* paddle_ref_path = (positional.size() >= 5) ? positional[4] : nullptr;
+  if (mnn_lib_path) {
+    std::printf("linked MNN lib: %s\n", mnn_lib_path);
+  }
+  std::printf("forward type: %d\n", forward_type);
 
   // Load input
   std::vector<float> input;
@@ -278,13 +302,24 @@ int main(int argc, char** argv) {
   }
   std::printf("model output name: %s\n", output_name.c_str());
 
-  // Combos to test.
-  std::vector<Combo> combos = {
-    {"cpu_normal",  MNN_FORWARD_CPU, MNN::BackendConfig::Precision_Normal},
-    {"cpu_high",    MNN_FORWARD_CPU, MNN::BackendConfig::Precision_High},
-    {"cpu_low",     MNN_FORWARD_CPU, MNN::BackendConfig::Precision_Low},
-    {"cpu_low_bf16",MNN_FORWARD_CPU, MNN::BackendConfig::Precision_Low_BF16},
-  };
+  // Combos to test. The default CPU sweep covers the 4 MNN CPU
+  // precision modes (m2-num, post-6). When the caller asks for a
+  // non-CPU forward type via `--forward N`, run a single combo
+  // (one Precision_Normal inference) at that forward type. This is
+  // what M3-CUDA / M3-Vulkan use to compare one GPU backend at a time.
+  std::vector<Combo> combos;
+  if (forward_type == MNN_FORWARD_CPU) {
+    combos = {
+      {"cpu_normal",  MNN_FORWARD_CPU, MNN::BackendConfig::Precision_Normal},
+      {"cpu_high",    MNN_FORWARD_CPU, MNN::BackendConfig::Precision_High},
+      {"cpu_low",     MNN_FORWARD_CPU, MNN::BackendConfig::Precision_Low},
+      {"cpu_low_bf16",MNN_FORWARD_CPU, MNN::BackendConfig::Precision_Low_BF16},
+    };
+  } else {
+    const char* name = single_name ? single_name : "noncpu";
+    combos.push_back({name, static_cast<MNNForwardType>(forward_type),
+                      MNN::BackendConfig::Precision_Normal});
+  }
 
   // Run all combos
   for (auto& c : combos) {
