@@ -161,14 +161,19 @@ def _extract_det(name: str, d: Dict[str, Any]) -> DetCfg:
                 resize_node = v
             break
     resize = _resize_policy(name, resize_node)
-    # M2-FIX: PaddleX overrides the per-model PostProcess at runtime
-    # with thresh=0.3, box_thresh=0.6, unclip_ratio=1.5 for every
-    # non-seal det. Emit those values so the C++ pipeline matches
-    # the baseline. The yml values (v6: 0.2/0.4/1.4) are NOT used
-    # by the baseline generator; reproducing the yml would cause
-    # the C++ path to diverge from the PaddleX baseline. For the
-    # seal det, keep the yml values since PaddleX's seal pipeline
-    # does not override PostProcess.
+    # M2-DET-FINAL: PaddleX overrides the per-model PostProcess at
+    # runtime with the values from paddlex/configs/pipelines/OCR.yaml
+    # (thresh=0.3, box_thresh=0.6, unclip_ratio=1.5 for all v4/v5/v6
+    # det). The per-model inference.yml values (e.g. v6: 0.2/0.4/1.4)
+    # are NOT used by the PaddleX `PaddleOCR` runtime path; the
+    # yml values are only used if a downstream user explicitly
+    # constructs the predictor with `thresh=0.2` etc. and the
+    # /root/ppocr_reference/ baselines were generated with the
+    # OCR.yaml override. Emitting the OCR.yaml values for the
+    # C++ path keeps us matched to the baseline. For the seal
+    # det, the seal pipeline does not load OCR.yaml, so we
+    # fall back to the yml values (which is what the seal
+    # baseline generator uses).
     if "seal" in name.lower():
         pp2 = d.get("PostProcess", {}) or {}
         return DetCfg(
