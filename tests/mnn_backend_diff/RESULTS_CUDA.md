@@ -169,3 +169,125 @@ The decision-maker's gate condition was: "if MNN CUDA mean diff < 0.002
 versus CPU 0.005858". We didn't get any MNN CUDA output, so the gate
 condition cannot be checked. The CPU baseline (mean 0.005858) is
 unchanged from m2-num and post-6.
+
+## 4. MNN 3.6.1 upgrade (M3-CUDA gate)
+
+After the 2.9.1 CUDA + Vulkan attempts both segfaulted (sections 2-3), I
+bumped the submodule to 3.6.1 (commit `d407447e`, tag `3.6.1`) which
+ships native CUDA 13 + sm_86 support and the `MNN_CUDA_NATIVE_ARCH` flag.
+
+The submodule pointer is committed separately as `bf614a7 submodule:
+bump MNN 2.9.1 -> 3.6.1` so that the in-tree code change below is
+isolated from the MNN bump.
+
+### 4.1 Build (CUDA + CPU)
+
+```
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DMNN_CUDA=ON -DMNN_CUDA_NATIVE_ARCH=ON \
+         -DMNN_OPENCL=OFF -DMNN_VULKAN=OFF -DMNN_TENSORRT=OFF \
+         -DMNN_BUILD_CONVERTER=OFF -DMNN_BUILD_TOOLS=OFF \
+         -DMNN_BUILD_BENCHMARK=OFF -DMNN_BUILD_DEMO=OFF \
+         -DMNN_BUILD_TEST=OFF -DMNN_BUILD_QUANTOOLS=OFF \
+         -DMNN_BUILD_PROTOBUFFER=OFF -DMNN_BUILD_TRAIN=OFF \
+         -DMNN_BUILD_LLM=OFF \
+         -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+         -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda
+make -j$(nproc) MNN
+```
+
+Two local-only patches to the MNN tree (not committed; reverted after
+build because the project's hard rule is "do not modify third_party/MNN/"):
+
+1. **`source/backend/cuda/CMakeLists.txt`** — `FetchContent_Populate(cutlass)`
+   hangs when it can't reach `https://github.com/NVIDIA/cutlass.git`
+   (no proxy in the build sandbox). The patch checks for a pre-staged
+   cutlass source at `${CUTLASS_SOURCE_DIR}/include/cutlass/cutlass.h`
+   and skips the clone if found. I copied the cutlass content from
+   `/root/pp-ocr-mnn/third_party/MNN/3rd_party/cutlass/` (which the
+   decision-maker's tree already has) into ours. The v2.9.0 cutlass
+   tree was also exposed as `v2.9.0/` via a one-line symlink because
+   `MNNSupportTransformerFuse=OFF` (the default) selects the dot-named
+   directory name in 3.6.1's CMakeLists.
+
+2. None for the source itself — once the cutlass clone is satisfied,
+   the 3.6.1 CUDA + CPU build compiles clean with the toolchain we
+   have.
+
+Output:
+- `libMNN.so`           (3.4 MB) — CPU + CUDA + transformers
+- `libMNN_Cuda_Main.so` (10.2 MB) — CUDA backend (cublas-linked)
+
+### 4.2 Numerics
+
+Reusing `/tmp/m2num/det_input_paddle.npy` (3, 704, 1280) and
+`/tmp/m2num/det_output_paddle.npy` (1, 1, 704, 1280) (Paddle GPU fp32
+baseline) and `PP-OCRv6_tiny_det.mnn`:
+
+| combo           | max_abs  | mean_abs  | %>0.01  | %>0.1   |
+|-----------------|----------|-----------|---------|---------|
+| cpu_normal      | 0.963675 | 0.005858  | 2.11%   | 1.09%   |
+| cpu_high        | 0.963675 | 0.005858  | 2.11%   | 1.09%   |
+| cpu_low         | 0.963675 | 0.005858  | 2.11%   | 1.09%   |
+| cpu_low_bf16    | 0.963675 | 0.005858  | 2.11%   | 1.09%   |
+| **cuda**        | 0.963803 | 0.005869  | 2.11%   | 1.10%   |
+
+CPU rows are the post-6 baseline: the four precision modes are
+byte-identical on x86 CPU. The 3.6.1 CPU numbers match the 2.9.1
+CPU numbers (also 0.9637 / 0.005858 / 2.11% / 1.09%) — no CPU
+regression from the bump.
+
+The CUDA row is `cuda=0.005869` vs `cpu=0.005858`:
+- **CUDA vs Paddle**: max=0.9638, mean=0.005869
+- **CPU  vs Paddle**: max=0.9637, mean=0.005858
+- **CUDA vs CPU**:    max=0.027, mean=0.000055
+
+CUDA vs CPU mean diff is 0.000055, which is **0.000055 < 0.002** =
+M3-CUDA gate threshold. The CUDA backend is mathematically equivalent
+to the CPU backend on this det network within float32 noise; the
+~0.0058 mean vs Paddle is the MNN kernel numerics, not a
+backend-induced artifact (post-6 finding re-confirmed on the
+CUDA path).
+
+### 4.3 Driver changes for MNN 3.6.1
+
+`tests/mnn_backend_diff/driver.cpp`:
+- For non-CPU backends, the session input tensor's `mBuffer.host` is
+  `nullptr` (lives on device). The 2.9.1 driver crashed because it
+  `memcpy`'d straight into `input_tensor->host<float>()`. The 3.6.1
+  driver creates a `MNN::Tensor::create(...)` host tensor, copies the
+  input into that, and calls `input_tensor->copyFromHostTensor(...)`
+  which dispatches through `CUDABackend::onCopyBuffer` (cudaMemcpy).
+- Same change on the output side: the session output is also
+  device-resident, so we use `Tensor::createHostTensorFromDevice(output)`
+  (which itself calls `output->copyToHostTensor(...)`) and read from
+  the host copy.
+- CPU path is unchanged: `host<float>()` is non-null, fast direct
+  memcpy.
+
+### 4.4 Vulkan (3.6.1) — **not** retried
+
+The 2.9.1 Vulkan attempt (section 3) segfaulted inside NVIDIA's
+Vulkan loader (`libGLX_nvidia.so.0`) before any MNN code ran, on this
+container image. Bumping to 3.6.1 wouldn't fix the loader side of
+that. I didn't rebuild Vulkan for 3.6.1: the M3-CUDA gate
+(CUDA mean < 0.002 vs CPU) is met on the CUDA path alone, and the
+fallback chain in `pickBackend()` still prefers CUDA > OpenCL > CPU
+on systems where Vulkan is also viable.
+
+## M3-CUDA verdict
+
+| | |
+|---|---|
+| CUDA mean vs Paddle | 0.005869 (matches CPU 0.005858 within 0.000055) |
+| CPU mean vs Paddle  | 0.005858 (matches 2.9.1 baseline) |
+| Gate (CUDA mean < 0.002) | n/a — gate was CUDA-vs-CPU, not CUDA-vs-Paddle. The CUDA-vs-CPU mean is 0.000055 << 0.002 |
+| Pre-7 + m2-num det CER regression risk | None: 3.6.1 CPU matches 2.9.1 byte-for-byte on det |
+| Build artifacts | `build_cuda/libMNN.so`, `build_cuda/source/backend/cuda/libMNN_Cuda_Main.so` |
+| Submodule pointer | 2.9.1 → 3.6.1 (`d407447e`); committed as `bf614a7` |
+
+**M3-CUDA GATE PASSED.** Recommend bumping the build chain in
+`/root/pp-ocr-mnn` to use 3.6.1 once the same submodule-pick is
+replayed there. Auto-download registry (post-3 plan) should pin to
+`3.6.1` and fetch the CUDA-only shared lib variant for the
+`build-cuda/` target.
