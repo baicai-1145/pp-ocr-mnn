@@ -175,6 +175,20 @@ target_link_libraries(ppocr_core PUBLIC
   Threads::Threads
   dl
 )
+# JPEG decode parity with cv2.imread (baseline contract). libjpeg-turbo on
+# every mainstream distro; see tools/M2_DECODE_ALIGN.md.
+option(PPOCR_HAVE_LIBJPEG "Link system libjpeg for bit-exact JPEG decode" ON)
+if(PPOCR_HAVE_LIBJPEG)
+  find_path(PPOCR_JPEG_INCLUDE_DIRS jpeglib.h)
+  find_library(PPOCR_JPEG_LIBRARIES NAMES jpeg)
+  if(PPOCR_JPEG_INCLUDE_DIRS AND PPOCR_JPEG_LIBRARIES)
+    target_include_directories(ppocr_core PUBLIC ${PPOCR_JPEG_INCLUDE_DIRS})
+    target_compile_definitions(ppocr_core PUBLIC PPDECODE_HAVE_LIBJPEG=1)
+    target_link_libraries(ppocr_core PUBLIC ${PPOCR_JPEG_LIBRARIES})
+  else()
+    message(STATUS "libjpeg not found — falling back to stb_image for JPEG")
+  endif()
+endif()
 if(PPOCR_HAS_CURL)
   # Define the macro for every translation unit that includes
   # src/downloader.cpp (or its header). PUBLIC propagates to
