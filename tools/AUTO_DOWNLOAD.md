@@ -204,3 +204,12 @@ PPOCR_BUILD_DIR=/root/pp-ocr-mnn/build-tools \
 Expected: 5/5 Python tests pass; 17/17 C++ scenario checks pass; the
 file `/tmp/dl_model/foo.mnn` and `/tmp/dl_cache/foo.mnn` both exist,
 are 10000 bytes, and their sha matches the registry.
+
+## Status
+
+| Date | Commit | Note |
+|---|---|---|
+| 2026-08-26 | `8cfd417` (ws/tools) | First pass: serve_registry.py + design doc |
+| 2026-08-26 | `c8ad257` (ws/tools) | `git merge main` (3 m2/post commits behind) |
+| 2026-08-26 | `4398bac` (ws/tools) | C++ downloader files dropped during merge → re-landed here. 4-scenario Python test rewritten to match the brief. 6/6 Python + 17/17 C++ scenarios pass. |
+
