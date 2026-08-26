@@ -11,10 +11,10 @@
     "unclip_ratio": 1.5,
     "max_candidates": 1000,
     "resize": {
-      "mode": "resize_long",
-      "limit_side_len": 736,
+      "mode": "limit_min",
+      "limit_side_len": 64,
       "resize_long": 960,
-      "stride": 128,
+      "stride": 32,
       "max_side_limit": 4000
     }
   }

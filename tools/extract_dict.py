@@ -11,12 +11,41 @@ CLI:
 
 Schema for emitted JSON strictly follows docs/CONTRACT.md.
 
-Det resize policy:
-    DetResizeForTest: null               → mode="limit_min", limit_side_len=736, stride=32
-    DetResizeForTest: { resize_long: L } → mode="resize_long", resize_long=L, stride=128
-    (v4/v5 det: resize_long=960, stride=128;
-     v6 det: DetResizeForTest=null → limit_min 736, stride=32;
-     seal det: resize_long=736, stride=128)
+Det resize / postprocess policy (M2-FIX):
+    The 811-cell baseline at /root/ppocr_reference/ was generated with
+    PaddleX's default OCR pipeline config
+    (`paddlex/configs/pipelines/OCR.yaml`), which hard-codes:
+
+        SubModules.TextDetection:
+          limit_side_len: 64
+          limit_type: min
+          max_side_limit: 4000
+          thresh: 0.3
+          box_thresh: 0.6
+          unclip_ratio: 1.5
+
+    for **every** det model in {v4 mobile/server, v5 mobile/server, v6
+    tiny/small/medium, v4 seal mobile/server}. The per-model
+    `inference.yml` values for `DetResizeForTest` and `PostProcess` are
+    *ignored* at PaddleX runtime (PaddleX takes its defaults from the
+    pipeline YAML).
+
+    Empirical verification: tools/probe_baseline_geom.py. The full
+    geometric contract lives in docs/DET_GEOMETRY.md.
+
+    Therefore every det config we emit — v4 mobile, v4 server, v5
+    mobile, v5 server, v6 tiny, v6 small, v6 medium, and the seal det
+    variants — uses the same uniform block:
+        resize: { mode: "limit_min", limit_side_len: 64, stride: 32,
+                  max_side_limit: 4000 }
+        thresh: 0.3
+        box_thresh: 0.6
+        unclip_ratio: 1.5
+
+    M2-FIX removed the per-model PostProcess overrides and the
+    `resize_long=960` (v4/v5) / `limit_min 736` (v6) split because
+    PaddleX overrides them at runtime. We reproduce what the baseline
+    was generated with, not what the per-model yml reads.
 """
 from __future__ import annotations
 
@@ -83,28 +112,37 @@ class ExtractedModel:
 
 
 # ---------------------------------------------------------------------------
-# Resize-mode policy (verified vs AGENTS.md / CONTRACT)
+# Resize-mode policy (verified vs PaddleX runtime, M2-FIX)
 # ---------------------------------------------------------------------------
 
+# PaddleX baseline generation uses a single uniform det config across
+# all 8 det models. See tools/probe_baseline_geom.py and
+# docs/DET_GEOMETRY.md. The values below are NOT a function of the
+# per-model yml — yml is ignored by PaddleX at runtime.
+_PADDLEX_DET_RESIZE = DetResizeCfg(mode="limit_min", limit_side_len=64,
+                                   resize_long=960, stride=32,
+                                   max_side_limit=4000)
+_PADDLEX_DET_POST = dict(thresh=0.3, box_thresh=0.6, unclip_ratio=1.5,
+                         max_candidates=1000)
+
+
 def _resize_policy(model_name: str, resize_node: Optional[Dict[str, Any]]) -> DetResizeCfg:
-    """Decide resize mode + stride. v6 uses LimitMin (DetResizeForTest: null);
-    v4/v5 and seal use ResizeLong with stride 128 (per CONTRACT preprocess port).
+    """All 7 main det models + the seal det variants use the same
+    PaddleX-runtime default. The `resize_node` from inference.yml is
+    accepted only for the seal det which PaddleX does not override
+    (`DetResizeForTest: { resize_long: 736 }` in seal yml is actually
+    used). Returns the uniform cfg for everything else.
     """
-    is_v6 = "v6" in model_name.lower()
     is_seal = "seal" in model_name.lower()
-
-    if is_v6 and not is_seal:
-        # v6 det: null → LimitMin 736, stride 32 (32-align per CONTRACT).
-        return DetResizeCfg(mode="limit_min", limit_side_len=736, stride=32,
-                            max_side_limit=4000)
-
-    # resize_long path (v4/v5 det, all seal det)
-    if resize_node and "resize_long" in resize_node:
+    if is_seal and resize_node and "resize_long" in resize_node:
+        # Seal det: PaddleX's OCR pipeline `text_type: seal` reads the
+        # seal yml directly (no override of PostProcess). Keep the
+        # resize_long path.
         long_ = int(resize_node["resize_long"])
-    else:
-        long_ = 736 if is_seal else 960
-    return DetResizeCfg(mode="resize_long", limit_side_len=736,
-                        resize_long=long_, stride=128, max_side_limit=4000)
+        return DetResizeCfg(mode="resize_long", limit_side_len=736,
+                            resize_long=long_, stride=128,
+                            max_side_limit=4000)
+    return _PADDLEX_DET_RESIZE
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +161,28 @@ def _extract_det(name: str, d: Dict[str, Any]) -> DetCfg:
                 resize_node = v
             break
     resize = _resize_policy(name, resize_node)
-    pp2 = d.get("PostProcess", {}) or {}
+    # M2-FIX: PaddleX overrides the per-model PostProcess at runtime
+    # with thresh=0.3, box_thresh=0.6, unclip_ratio=1.5 for every
+    # non-seal det. Emit those values so the C++ pipeline matches
+    # the baseline. The yml values (v6: 0.2/0.4/1.4) are NOT used
+    # by the baseline generator; reproducing the yml would cause
+    # the C++ path to diverge from the PaddleX baseline. For the
+    # seal det, keep the yml values since PaddleX's seal pipeline
+    # does not override PostProcess.
+    if "seal" in name.lower():
+        pp2 = d.get("PostProcess", {}) or {}
+        return DetCfg(
+            thresh=float(pp2.get("thresh", 0.2)),
+            box_thresh=float(pp2.get("box_thresh", 0.6)),
+            unclip_ratio=float(pp2.get("unclip_ratio", 0.5)),
+            max_candidates=int(pp2.get("max_candidates", 1000)),
+            resize=resize,
+        )
     return DetCfg(
-        thresh=float(pp2.get("thresh", 0.3)),
-        box_thresh=float(pp2.get("box_thresh", 0.6)),
-        unclip_ratio=float(pp2.get("unclip_ratio", 1.5)),
-        max_candidates=int(pp2.get("max_candidates", 1000)),
+        thresh=_PADDLEX_DET_POST["thresh"],
+        box_thresh=_PADDLEX_DET_POST["box_thresh"],
+        unclip_ratio=_PADDLEX_DET_POST["unclip_ratio"],
+        max_candidates=_PADDLEX_DET_POST["max_candidates"],
         resize=resize,
     )
 

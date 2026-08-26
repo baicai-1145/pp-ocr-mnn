@@ -65,17 +65,23 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
   }
 }
 
-// Pad an integer up to the next multiple of `m` (PaddleOCR uses Python's
-// built-in round; we use std::round for parity, then clamp to >= m).
-int round_up_to_stride(int v, int m) {
-  if (m <= 1) return v;
-  int q = (v + m - 1) / m;
-  int r = q * m;
-  // PaddleOCR keeps a minimum of `m` so a fully degenerate image still
-  // produces a non-empty network input.
-  return r < m ? m : r;
-}
-
+// Snap an integer to the nearest multiple of `m` using banker's
+// rounding (half-to-even), exactly like Python's built-in `round()`.
+// PaddleOCR's `DetResizeForTest` is implemented in NumPy and uses
+// `int(round(... / m) * m)`; numpy.round is half-to-even on IEEE 754
+// floats. We use `std::nearbyint` which defaults to FE_TONEAREST (the
+// same half-to-even rule) and so matches NumPy bit-for-bit on the
+// PaddleOCR det resize path.
+//
+// Why this matters: at the PaddleX baseline geometry (limit_min 64,
+// stride 32), a 720-pixel-tall image becomes `round(720/32)*32 = 704`
+// with Python's `round`. If we use ceiling instead (the previous
+// `(v + m - 1)/m * m`) the resize would land on 736, which is 32 px
+// taller in the prob map, and the DB contours would land on a
+// different pixel row than the baseline — box position error of
+// 10-30 px and CER > 0.5.
+//
+// Test cases (see tests/test_preprocess.cpp::test_stride_align):
 // Convert HxWx3 BGR uint8 to CHW float32 with the given per-channel
 // scale, mean, std. scale is applied first: y = (x*scale - mean) / std.
 // The mean/std arrays are aligned with the BGR channel order PaddleOCR
@@ -103,6 +109,38 @@ void hwc_bgr_to_chw_float(const uint8_t* src, int w, int h,
 }
 
 } // namespace
+
+// Snap an integer to the nearest multiple of `m` using banker's
+// rounding (half-to-even), exactly like Python's built-in `round()`.
+// PaddleOCR's `DetResizeForTest` is implemented in NumPy and uses
+// `int(round(... / m) * m)`; numpy.round is half-to-even on IEEE 754
+// floats. We use `std::nearbyint` which defaults to FE_TONEAREST (the
+// same half-to-even rule) and so matches NumPy bit-for-bit on the
+// PaddleOCR det resize path.
+//
+// Why this matters: at the PaddleX baseline geometry (limit_min 64,
+// stride 32), a 720-pixel-tall image becomes `round(720/32)*32 = 704`
+// with Python's `round`. If we use ceiling instead (the previous
+// `(v + m - 1)/m * m`) the resize would land on 736, which is 32 px
+// taller in the prob map, and the DB contours would land on a
+// different pixel row than the baseline — box position error of
+// 10-30 px and CER > 0.5.
+//
+// Test cases (see tests/test_preprocess.cpp::test_stride_align):
+//   720/32 = 22.5  -> 22*32 = 704  (half-to-even: 22 even -> 22)
+//   736/32 = 23    -> 23*32 = 736
+//   944/32 = 29.5  -> 30*32 = 960  (half-to-even: 30 even -> 30)
+//   976/32 = 30.5  -> 30*32 = 960  (half-to-even: 30 even -> 30)
+//   992/32 = 31    -> 31*32 = 992
+int round_up_to_stride(int v, int m) {
+  if (m <= 1) return v;
+  double q = static_cast<double>(v) / static_cast<double>(m);
+  long q_int = static_cast<long>(std::nearbyint(q));  // FE_TONEAREST, half-to-even
+  long r = q_int * m;
+  // PaddleOCR keeps a minimum of `m` so a fully degenerate image still
+  // produces a non-empty network input.
+  return r < m ? m : static_cast<int>(r);
+}
 
 DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   if (bgr.c != 3 || bgr.w <= 0 || bgr.h <= 0) {
@@ -170,7 +208,18 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   // Snap to stride (PaddleOCR uses `resize_h = max(round(...), stride)`).
   // Skipped for NoResize: PaddleOCR doesn't align when no resize is
   // applied — the network input is the raw image.
-  if (rc.mode != DetResizeConfig::Mode::NoResize) {
+//   PaddleOCR's type-0 path uses `int(round(resize / 32) * 32)`
+//   (banker's rounding, half-to-even). Type-2 (resize_long) uses
+//   `(resize + 127) // 128 * 128` (ceiling). We model the difference
+//   here so the resize shape matches PaddleOCR's numpy output bit for
+//   bit — at limit_min=64, stride=32 (the PaddleX baseline path) a
+//   720-tall image lands on 704 (= round(720/32)*32), not 736.
+  if (rc.mode == DetResizeConfig::Mode::ResizeLong) {
+    resize_h = ((resize_h + stride - 1) / stride) * stride;
+    resize_w = ((resize_w + stride - 1) / stride) * stride;
+    if (resize_h < stride) resize_h = stride;
+    if (resize_w < stride) resize_w = stride;
+  } else if (rc.mode != DetResizeConfig::Mode::NoResize) {
     resize_h = round_up_to_stride(resize_h, stride);
     resize_w = round_up_to_stride(resize_w, stride);
     if (resize_h < stride) resize_h = stride;
