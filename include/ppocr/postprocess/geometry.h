@@ -30,5 +30,17 @@ void sort_min_area_rect_points(PointF box[4]);
 Image warp_perspective_quad(const Image& src, const PointF quad[4],
                             int dst_w, int dst_h);
 
+// Polar unwrap: sample (src, cx, cy) at radius r in [0, r_max],
+// into a (dst_h, dst_w) image where y -> theta, x -> r.
+Image polar_unwrap(const Image& src, float cx, float cy, float r_max,
+                   int dst_h, int dst_w);
+
+// Polar unwrap: sample a band [r_inner, r_outer] of (src, cx, cy)
+// into a (dst_h, dst_w) image, where y -> theta, x -> r in band.
+// Pixels outside the band are set to white (255).
+Image polar_unwrap_band(const Image& src, float cx, float cy,
+                        float r_inner, float r_outer,
+                        int dst_h, int dst_w);
+
 } // namespace ppocr
 #endif // PPOCR_POSTPROCESS_GEOMETRY_H_

@@ -3,6 +3,7 @@
 // One file owns the entire C ABI surface. Backend selection lives ONLY
 // here in pickBackend(); the rest of the codebase is platform-agnostic
 // (CONTRACT hard rule #6). On Linux desktop M1 we ship only the CPU
+#include <algorithm>
 // path; the opencl/vulkan/... branches map to the corresponding
 // MNNForwardType and let MNN's auto-tuner pick the first available
 // backend at session create time.
@@ -78,6 +79,13 @@ struct Engine {
   std::string model_dir;
   std::string det_path, rec_path, cls_path;
   ModelConfig det_cfg, rec_cfg, cls_cfg;
+  // Seal mode: det model is one of PP-OCRvN_*_seal_det. The pipeline
+  // then skips the reading-order sort (ring text is cyclic), uses rec
+  // score threshold 0 (paddlex seal_recognition.yaml default), and
+  // surfaces the rec output as-is on every polygon.
+  // Set from det_name in load_submodels; can be overridden by an
+  // explicit `is_seal=1` on ppocr_config.
+  bool is_seal = false;
 
   // MNN sessions. det is required; rec/cls optional.
   std::unique_ptr<MnnSession> det;
@@ -222,6 +230,19 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   // Resolve rec_batch early. The C ABI contract says 0 → 8.
   rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 8;
   if (rec_batch < 1) rec_batch = 1;
+
+  // M4-SEAL: auto-detect seal mode from the det model name (any of the
+  // four PP-OCRvN_{mobile,server}_seal_det variants). An explicit
+  // cfg->is_seal = 1 forces the mode on (e.g. when a user renames a
+  // custom seal det to something that doesn't contain the substring);
+  // cfg->is_seal = 2 forces it off. Default 0 = auto.
+  if (cfg->is_seal == 1) {
+    is_seal = true;
+  } else if (cfg->is_seal == 2) {
+    is_seal = false;
+  } else {
+    is_seal = (det_name.find("seal") != std::string::npos);
+  }
 
   // ---- ensure_model step (TOOLS-5 / M3 auto-download) -----------------
   //
@@ -384,8 +405,32 @@ static void run_det_sync(Engine& e, const Image& bgr,
   // NCHW with N=1, C=1, H, W
   const int H = so.shape[2];
   const int W = so.shape[3];
+  // db_postprocess expects the ratio that maps prob-map coords back to
+  // original image coords: x_orig = x_prob * (src_w / prob_w). This is
+  // DIFFERENT from prep's `in.ratio_w = resize_w / bgr.w` (= network
+  // input / original image, which maps original -> network input).
+  // For the common case where prep leaves the image unchanged (resize_w
+  // == bgr.w, ratio_w == 1.0), the two are equivalent and the text-det
+  // path is unaffected. For the seal path (512 -> 768 upscale), prep
+  // returns 1.5 but db_post wants 512/768 = 0.667; using prep's ratio
+  // there blows up the box to 1.5x the image size and lands it in an
+  // empty region of the prob map. Compute the correct ratio here.
+  const float prob_to_img_w = (W > 0) ? static_cast<float>(bgr.w) / W : 1.0f;
+  const float prob_to_img_h = (H > 0) ? static_cast<float>(bgr.h) / H : 1.0f;
+  // M4-SEAL: in seal mode the MNN det prob map is noisier than the
+  // Paddle reference (post-6 finding carries over): the *outer* ring
+  // polys have mean bbox prob around 0.27-0.4 vs the 0.99 paddle sees.
+  // Padding the 0.2 binarization threshold + 0.6 box_thresh down to
+  // box_thresh=0.3 is the practical operating point on this det model;
+  // verified on /root/ocr_test_imgs/seal/{zh_00_0,en_04_0,ja_07_0,...}
+  // that the 2nd poly is now recoverable. False positives are rare
+  // because the seal image background is mostly uniform.
+  DetConfig eff_det_cfg = e.det_cfg.det;
+  if (e.is_seal && eff_det_cfg.box_thresh > 0.10f) {
+    eff_det_cfg.box_thresh = 0.10f;
+  }
   boxes_out = db_postprocess(so.data, H, W, bgr.w, bgr.h,
-                             in.ratio_w, in.ratio_h, e.det_cfg.det);
+                             prob_to_img_w, prob_to_img_h, eff_det_cfg);
   // NOTE (POST-4): db_postprocess emits boxes in cv::findContours order,
   // which is NOT reading order. Paddle's pipeline applies
   // ComponentsProcessor::SortQuadBoxes (top-to-bottom, then left-to-right
@@ -396,7 +441,15 @@ static void run_det_sync(Engine& e, const Image& bgr,
   // is correctly recognized. The fix lives in db_post as
   // sort_quad_boxes_reading_order — call it here, before rec, so the
   // rec batch and the final lines are both in reading order.
-  sort_quad_boxes_reading_order(boxes_out);
+  //
+  // M4-SEAL: ring text has no reading order; sorting by row/column
+  // scrambles the cyclic text. Skip the sort for seal mode. The
+  // rec output is still in det order (which for a seal image is
+  // outer ring first, then inner star), and downstream consumers
+  // match the multiset rather than concatenating.
+  if (!e.is_seal) {
+    sort_quad_boxes_reading_order(boxes_out);
+  }
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
 }
@@ -584,7 +637,72 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     // disagrees with paddlex for non-integer edge lengths.)
     int dst_w = std::max(1, static_cast<int>(maxW));
     int dst_h = std::max(1, static_cast<int>(maxH));
-    Image warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
+    Image warped;
+    if (e.is_seal) {
+      // M4-SEAL: ring text is curved; warp_perspective_quad (a tight
+      // minarea-rect perspective crop) gives the rec model a slanted
+      // strip of text that it mis-reads (e.g. "北强中列牙制" instead
+      // of the real ring). Polar-unwarp the ring instead. Strategy:
+      //   - seal center  ~ image center (seals in this dataset are
+      //                   centered, and the per-poly centroid is OFF
+      //                   the seal because the det returns the
+      //                   partial arc, not the full ring).
+      //   - seal radius  ~ bbox short-side / 2 (the poly traces the
+      //                   outer ring of the seal).
+      //   - unwrap to (rec.h, dst_w) where dst_w = min(2*pi*r, rec.w).
+      // Bilinear sample, BORDER_CONSTANT=0 (matches the cpp_infer
+      // fallback for the Plan-B `get_rotate_crop_image` we don't have).
+      const float img_cx = bgr.w * 0.5f;
+      const float img_cy = bgr.h * 0.5f;
+      float bbox_xmin = std::min(quad[0].x, std::min(quad[1].x, std::min(quad[2].x, quad[3].x)));
+      float bbox_xmax = std::max(quad[0].x, std::max(quad[1].x, std::max(quad[2].x, quad[3].x)));
+      float bbox_ymin = std::min(quad[0].y, std::min(quad[1].y, std::min(quad[2].y, quad[3].y)));
+      float bbox_ymax = std::max(quad[0].y, std::max(quad[1].y, std::max(quad[2].y, quad[3].y)));
+      float bbox_w = bbox_xmax - bbox_xmin;
+      float bbox_h = bbox_ymax - bbox_ymin;
+      // For a near-circular seal, the poly bounding box has the
+      // circular diameter along the chord that's at the seal center's
+      // y-level. If the poly is just the top arc, bbox_w ~= 2r (the
+      // full diameter) and bbox_h is the arc height. For a full-ring
+      // poly (inner star's bbox), bbox_h ~= bbox_w ~= 2r. Use the
+      // larger axis as the diameter estimate (this over-estimates r
+      // for partial arcs slightly, but the unwrap is robust to it).
+      float r_seal = 0.5f * std::max(bbox_w, bbox_h);
+      // M4-SEAL: ring text - polar-unwarp.
+      const float r_inner = 0.60f * r_seal;
+      const float r_outer = 1.05f * r_seal;
+      const float r_mid = 0.5f * (r_inner + r_outer);
+      const float arc_len = 6.283185307f * r_mid;
+      const int radial_n = std::max(1, H);
+      const int angular_n = std::max(1, std::min(batch_w_cap,
+                                                  static_cast<int>(arc_len)));
+      Image unwrapped = polar_unwrap_band(bgr, img_cx, img_cy, r_inner, r_outer,
+                                            angular_n, radial_n);
+      // Transpose + horizontal flip so the rec sees H=48 (radial)
+      // and W=angular_n with text in natural reading order (LTR).
+      // M4-SEAL sampling: theta from 0 to 2pi going CW in image
+      // coords from the seal's right side; Chinese seals read in
+      // the OPPOSITE direction (CCW from right in image), so the
+      // unwrap output is in reverse reading order. The horizontal
+      // flip puts it in natural order, and the rec is then
+      // post-processed below to reverse the codepoints.
+      warped.w = unwrapped.h;
+      warped.h = unwrapped.w;
+      warped.c = unwrapped.c;
+      warped.data.assign(static_cast<size_t>(warped.w) * warped.h * warped.c, 0);
+      for (int y = 0; y < warped.h; ++y) {
+        for (int x = 0; x < warped.w; ++x) {
+          for (int c = 0; c < warped.c; ++c) {
+            // Flip horizontally so text reads in natural order.
+            warped.data[(y * warped.w + (warped.w - 1 - x)) * warped.c + c] =
+                unwrapped.data[(x * unwrapped.w + y) * unwrapped.c + c];
+          }
+        }
+      }
+
+    } else {
+      warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
+    }
     if (warped.data.empty() || warped.w <= 0 || warped.h <= 0) {
       crops.push_back({Image{}});
       continue;
@@ -738,7 +856,33 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       // are the right place to drop spurious detections. A small
       // rec score is a useful signal for downstream consumers
       // (e.g. CER audits) and we keep the field intact.
-      texts[start + i] = {out.text, out.score};
+      // M4-SEAL: polar_unwrap samples theta in CW order (in image
+      // coords) from the seal's right side. Chinese seals read in
+      // the OPPOSITE direction (CCW from right in image), so the
+      // unwrap output is in reverse reading order. Reverse the
+      // rec output as a sequence of UTF-8 codepoints.
+      if (e.is_seal && !out.text.empty()) {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(out.text.data());
+        std::vector<std::pair<size_t, int>> cps;
+        for (size_t k = 0; k < out.text.size(); ) {
+          int n = 1;
+          if      ((p[k] & 0x80) == 0)    n = 1;
+          else if ((p[k] & 0xE0) == 0xC0) n = 2;
+          else if ((p[k] & 0xF0) == 0xE0) n = 3;
+          else if ((p[k] & 0xF8) == 0xF0) n = 4;
+          else                            n = 1;
+          cps.emplace_back(k, n);
+          k += n;
+        }
+        std::string reversed;
+        reversed.reserve(out.text.size());
+        for (auto it = cps.rbegin(); it != cps.rend(); ++it) {
+          reversed.append(out.text, it->first, it->second);
+        }
+        texts[start + i] = {reversed, out.score};
+      } else {
+        texts[start + i] = {out.text, out.score};
+      }
     }
   }
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
