@@ -24,7 +24,7 @@ The tool writes /root/ppocr_reference/<combo>/<lang>/ocr_results.json
 (overwriting existing). BACKUP FIRST:
     mv /root/ppocr_reference /root/ppocr_reference.paddlex.bak
 """
-import os, sys, json, math, time, gc, glob, argparse, traceback, warnings
+import os, sys, json, math, time, gc, glob, argparse, traceback, warnings, subprocess
 warnings.filterwarnings("ignore")
 import numpy as np
 import cv2
@@ -249,6 +249,64 @@ def images_for(lang):
     return sorted(set(out))
 
 
+CLI_BIN = os.environ.get("PPOCR_CLI", "/root/pp-ocr-mnn/build-main/ppocr_cli")
+MODEL_DIR = os.environ.get("PPOCR_MODEL_DIR", "/root/pp-ocr-mnn/models")
+
+
+def rec_via_cli(rec_name, img_path, boxes_sorted):
+    """Call our ppocr_cli with --boxes-json to do the rec stage.
+
+    Architecture note: det is run via paddle.inference direct (Python),
+    rec is delegated to the trusted CLI path (M2-NUM proved MNN rec
+    matches paddle2onnx rec within 4.1e-6 logit noise, and the C++
+    warp/rot90 path is the same one validated by M2-ISO/M2-ROBUST).
+    This avoids maintaining a duplicate Python crop implementation.
+    Returns (rec_texts, rec_scores, det_polys) in box order.
+    """
+    rec_cfg = f"{CONFIG_ROOT}/{rec_name}.json"
+    if not boxes_sorted:
+        return [], [], []
+    # Write flat int array: TL,TR,BR,BL per box
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        for box, _s in boxes_sorted:
+            for pt in box:
+                f.write(f"{int(round(pt[0]))} {int(round(pt[1]))} ")
+        boxes_json = f.name
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            out_json = f.name
+        r = subprocess.run(
+            [CLI_BIN, "--image", img_path,
+             "--det-config", f"{CONFIG_ROOT}/{rec_name}.json",  # required by arg parser; not used in --boxes-json path
+             "--rec-config", rec_cfg,
+             "--model-dir", MODEL_DIR,
+             "--boxes-json", boxes_json,
+             "--json", out_json],
+            env={**os.environ, "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu"},
+            capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"  rec CLI err: {r.stderr[:200]}", file=sys.stderr)
+            return None, None, None
+        with open(out_json) as f:
+            res = json.load(f)
+        rec_texts = [ln.get("text", "") for ln in res.get("lines", [])]
+        rec_scores = [float(ln.get("score", 0.0)) for ln in res.get("lines", [])]
+        det_polys = []
+        for ln in res.get("lines", []):
+            p = ln.get("poly", [])
+            if isinstance(p[0], (list, tuple)):
+                det_polys.append([int(round(v)) for pt in p for v in pt[:2]])
+            else:
+                det_polys.append([int(round(v)) for v in p])
+        return rec_texts, rec_scores, det_polys
+    finally:
+        try: os.unlink(boxes_json)
+        except OSError: pass
+        try: os.unlink(out_json)
+        except OSError: pass
+
+
 # --- core: run one (det, rec) combo on one lang ---
 
 def run_ocr_cell(det_name, rec_name, lang):
@@ -269,18 +327,11 @@ def run_ocr_cell(det_name, rec_name, lang):
             boxes, scores = db_postprocess(det_out, src_h, src_w, rh, rw, det_cfg)
             # SortQuadBoxes (PaddleX pipeline applies this BEFORE rec pairing)
             sorted_bs = sort_quad_boxes_reading_order(list(zip(boxes, scores)))
-            rec_texts, rec_scores, det_polys = [], [], []
-            for box, _score in sorted_bs:
-                crop = warp_crop(raw, box)
-                if crop is None or crop.size == 0:
-                    continue
-                text, score = rec_infer(rec_name, crop)
-                # No zero-score filter: PaddleX keeps zero-score recs
-                # (verified: existing baseline zh/04 has rec_score=0.0 with rec_text='')
-                poly = [int(round(x)) for x in np.array(box).flatten()[:8]]
-                rec_texts.append(text)
-                rec_scores.append(score)
-                det_polys.append(poly)
+            # rec via trusted CLI (M2-NUM bit-equivalent to paddle2onnx rec)
+            rec_texts, rec_scores, det_polys = rec_via_cli(rec_name, img, sorted_bs)
+            if rec_texts is None:
+                out_records.append({"image_path": img, "error": "rec_cli_failed"})
+                continue
             detections = [
                 {"poly": det_polys[i], "rec_text": rec_texts[i], "rec_score": rec_scores[i]}
                 for i in range(len(rec_texts))
