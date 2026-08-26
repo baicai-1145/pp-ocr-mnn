@@ -75,6 +75,28 @@ CONFIG_ROOT = "/root/pp-ocr-mnn/configs"
 
 # --- helpers ---
 
+def sort_quad_boxes_reading_order(boxes_with_scores):
+    """Port of Paddle C++ ComponentsProcessor::SortQuadBoxes
+    (deploy/cpp_infer/src/common/processors.cc:590-611).
+    Input: list of (box_pts[4][2], score); each box's first vertex is its
+    TL (sort_min_area_rect_points output, so poly[0]=(x0,y0)).
+    """
+    if len(boxes_with_scores) < 2:
+        return boxes_with_scores
+    # primary: (y0, x0)
+    bs = sorted(boxes_with_scores, key=lambda b: (b[0][0][1], b[0][0][0]))
+    # bubble pass: left-to-right within |dy|<10
+    for i in range(len(bs) - 1):
+        for j in range(i + 1, 0, -1):
+            y_j = bs[j][0][0][1]
+            y_jm1 = bs[j-1][0][0][1]
+            if abs(y_j - y_jm1) < 10.0 and bs[j][0][0][0] < bs[j-1][0][0][0]:
+                bs[j], bs[j-1] = bs[j-1], bs[j]
+            else:
+                break
+    return bs
+
+
 def warp_crop(raw, points):
     """PaddleX-style GetRotateCropImage port (cv2.warpPerspective)."""
     points = np.asarray(points, dtype=np.float32)
@@ -245,18 +267,20 @@ def run_ocr_cell(det_name, rec_name, lang):
             chw, rh, rw = det_preprocess(raw, det_cfg)
             det_out = det_infer(det_name, chw, rh, rw)
             boxes, scores = db_postprocess(det_out, src_h, src_w, rh, rw, det_cfg)
-            order = sorted(range(len(boxes)), key=lambda i: (boxes[i][0][1], boxes[i][0][0]))
+            # SortQuadBoxes (PaddleX pipeline applies this BEFORE rec pairing)
+            sorted_bs = sort_quad_boxes_reading_order(list(zip(boxes, scores)))
             rec_texts, rec_scores, det_polys = [], [], []
-            for i in order:
-                crop = warp_crop(raw, boxes[i])
+            for box, _score in sorted_bs:
+                crop = warp_crop(raw, box)
                 if crop is None or crop.size == 0:
                     continue
                 text, score = rec_infer(rec_name, crop)
-                if score > 0.0:  # match PaddleX default
-                    poly = [int(round(x)) for x in np.array(boxes[i]).flatten()[:8]]
-                    rec_texts.append(text)
-                    rec_scores.append(score)
-                    det_polys.append(poly)
+                # No zero-score filter: PaddleX keeps zero-score recs
+                # (verified: existing baseline zh/04 has rec_score=0.0 with rec_text='')
+                poly = [int(round(x)) for x in np.array(box).flatten()[:8]]
+                rec_texts.append(text)
+                rec_scores.append(score)
+                det_polys.append(poly)
             detections = [
                 {"poly": det_polys[i], "rec_text": rec_texts[i], "rec_score": rec_scores[i]}
                 for i in range(len(rec_texts))
