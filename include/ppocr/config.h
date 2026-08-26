@@ -38,6 +38,12 @@ struct DetConfig {
   float thresh       = 0.3f;  // binarization threshold on probability map
   float box_thresh   = 0.6f;  // min box score to keep
   float unclip_ratio = 1.5f;  // polygon expansion factor (matches PaddleOCR)
+  int   min_size     = 3;     // min shortest-side (px) of an unclip'd box;
+                              // boxes below this are dropped. Paddle's
+                              // DBPostProcess default is 3; v6 family keeps
+                              // the same. M2-ROBUST sweeps 3 / 5 / 10 to
+                              // find a noise-robust operating point for
+                              // MNN's noisier prob map.
   int   max_candidates = 1000;
   DetResizeConfig resize;
 };
