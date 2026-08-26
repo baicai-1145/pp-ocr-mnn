@@ -9,6 +9,7 @@
 #include "ppocr/ppocr.h"
 
 #include "ppocr/config.h"
+#include "ppocr/downloader.h"
 #include "ppocr/image.h"
 #include "ppocr/mnn_session.h"
 #include "ppocr/postprocess/ctc_decode.h"
@@ -222,8 +223,96 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 8;
   if (rec_batch < 1) rec_batch = 1;
 
-  ppocr_status st = resolve_config_paths(*this, cfg, err, elen,
-                                         det_name, rec_name, cls_name);
+  // ---- ensure_model step (TOOLS-5 / M3 auto-download) -----------------
+  //
+  // We resolve model_dir, cache_dir, and mirror from the public cfg
+  // with env-var fallbacks. The registry is loaded only when
+  // auto-download is enabled; if the registry file is missing, we
+  // silently fall back to the local-files-only path (M1 behavior).
+  //
+  // The contract fields are:
+  //   cfg->model_dir: dir that holds the .mnn files (default
+  //                   $PPORC_MNN_MODELS or ./models).
+  //   cfg->cache_dir: download cache dir (default
+  //                   $PPORC_MNN_CACHE or ~/.cache/ppocr-mnn).
+  //   cfg->registry_path: explicit override for the registry.json
+  //                   (default <model_dir>/configs/registry.json).
+  //   cfg->mirror: download base URL (default
+  //                $PPORC_MNN_MIRROR or "https://example.com/ppocr-mnn-models"
+  //                per the M3 placeholder documented in AGENTS.md).
+  //   cfg->offline: 1 = never download.
+  //   cfg->download: 0 = never download (overrides env / mirror).
+  std::string model_dir   = trim_back_slash(cfg->model_dir
+                                              ? std::string(cfg->model_dir)
+                                              : env_or("PPORC_MNN_MODELS", "./models"));
+  std::string cache_dir   = cfg->cache_dir
+                              ? trim_back_slash(std::string(cfg->cache_dir))
+                              : env_or("PPORC_MNN_CACHE", std::string());
+  if (cache_dir.empty()) {
+    const char* home = std::getenv("HOME");
+    cache_dir = home ? (std::string(home) + "/.cache/ppocr-mnn")
+                     : (model_dir + "/.cache");
+  }
+  std::string mirror      = cfg->mirror
+                              ? std::string(cfg->mirror)
+                              : env_or("PPORC_MNN_MIRROR",
+                                       std::string("https://example.com/ppocr-mnn-models"));
+  int offline  = cfg->offline  ? 1 : 0;
+  int download = cfg->download ? 1 : 0;
+
+  // Load the registry (optional). If the file is missing, an empty
+  // registry is fine: ensure_model will simply use whatever files
+  // are already on disk and skip the download branch (the per-name
+  // lookup will return nullptr; that path produces PPOCR_ERR_MODEL
+  // for missing files, matching the M1 hard-fail behavior).
+  Registry reg;
+  std::string reg_path = cfg->registry_path
+                            ? std::string(cfg->registry_path)
+                            : std::string();
+  if (reg_path.empty()) {
+    std::vector<std::string> candidates = {
+        model_dir + "/configs/registry.json",
+    };
+    auto slash = model_dir.find_last_of("/\\");
+    if (slash != std::string::npos) {
+      candidates.push_back(model_dir.substr(0, slash) + "/configs/registry.json");
+    }
+    for (const auto& c : candidates) {
+      std::ifstream f(c, std::ios::binary);
+      if (f) { reg_path = c; break; }
+    }
+  }
+  if (!reg_path.empty()) {
+    try {
+      reg = load_registry(reg_path);
+    } catch (const std::exception& ex) {
+      // Bad registry is non-fatal in offline mode: we just won't be
+      // able to verify or download. In online mode we still try to
+      // log and continue.
+      if (err && elen) {
+        std::snprintf(err, elen, "registry load: %s", ex.what());
+      }
+    }
+  }
+
+  // Helper: ensure a single model is on disk.
+  auto ensure = [&](const std::string& name) -> ppocr_status {
+    if (name.empty()) return PPOCR_OK;
+    EnsureResult er = ensure_model(reg, name, model_dir, cache_dir, mirror,
+                                   offline, download);
+    if (er.status == PPOCR_OK) return PPOCR_OK;
+    if (err && elen) std::snprintf(err, elen, "%s", er.detail.c_str());
+    return er.status;
+  };
+  ppocr_status st = ensure(det_name);
+  if (st != PPOCR_OK) return st;
+  st = ensure(rec_name);
+  if (st != PPOCR_OK) return st;
+  st = ensure(cls_name);
+  if (st != PPOCR_OK) return st;
+
+  st = resolve_config_paths(*this, cfg, err, elen,
+                            det_name, rec_name, cls_name);
   if (st != PPOCR_OK) {
     if (err && elen) std::snprintf(err, elen, "model path resolution failed");
     return st;
@@ -297,6 +386,17 @@ static void run_det_sync(Engine& e, const Image& bgr,
   const int W = so.shape[3];
   boxes_out = db_postprocess(so.data, H, W, bgr.w, bgr.h,
                              in.ratio_w, in.ratio_h, e.det_cfg.det);
+  // NOTE (POST-4): db_postprocess emits boxes in cv::findContours order,
+  // which is NOT reading order. Paddle's pipeline applies
+  // ComponentsProcessor::SortQuadBoxes (top-to-bottom, then left-to-right
+  // within a 10px row tolerance) AFTER db_postprocess, so the rec layer
+  // sees boxes in reading order. Without this step the join of rec_texts
+  // is line-permuted (e.g. zh/02: "Chinese\nProject\nText" instead of
+  // "Project\nChinese\nText") and CER is high even though every line
+  // is correctly recognized. The fix lives in db_post as
+  // sort_quad_boxes_reading_order — call it here, before rec, so the
+  // rec batch and the final lines are both in reading order.
+  sort_quad_boxes_reading_order(boxes_out);
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
 }
@@ -307,10 +407,12 @@ static void run_det_sync(Engine& e, const Image& bgr,
 //   1. For each DetBox, GetRotateCropImage (deploy/cpp_infer ...
 //      GetRotateCropImage): 4-point perspective warp into a tight
 //      (maxW, maxH) rectangle; rotate 90° CCW if maxH/maxW >= 1.5.
-//   2. Batch all crops. Each batch is the max valid_w within the
-//      chunk; all crops in a chunk are prep_rec_line'd to that width
-//      (zero-padded). The rec MNN session is dynamic-width
-//      [1,3,48,-1] so we resize to {N,3,48,batch_w} and runSession.
+//   2. Batch all crops. Each chunk (default size 8) gets a single
+//      batch_w = int(imgH * max(wh_ratio in chunk)), the paddlex
+//      3.x `ReisizeNorm.resize_norm_img` algorithm. Every crop in
+//      the chunk is resized to (H, batch_w) and zero-padded on the
+//      right; the rec MNN session is dynamic-width [1,3,48,-1] so
+//      we resize to {N,3,48,batch_w} and runSession.
 //   3. Output is [N, T, C] in NCHW-ish (we measured 6906 classes
 //      after softmax-on-logits); we run ctc_decode on each row of
 //      the (T, C) slice per batch element.
@@ -329,7 +431,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
   const int H = e.rec_cfg.rec.h > 0 ? e.rec_cfg.rec.h : 48;
   const int batch_w_cap = e.rec_cfg.rec.w > 0 ? e.rec_cfg.rec.w : 320;
   // Pre-compute crops in a vector aligned with `boxes`.
-  struct Crop { Image img; int valid_w = 0; };
+  struct Crop { Image img; };
   std::vector<Crop> crops;
   crops.reserve(boxes.size());
   for (const auto& b : boxes) {
@@ -355,11 +457,17 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     float hRight  = dist(quad[1], quad[2]);
     float maxW = std::max(wTop, wBottom);
     float maxH = std::max(hLeft, hRight);
-    int dst_w = std::max(1, static_cast<int>(std::lround(maxW)));
-    int dst_h = std::max(1, static_cast<int>(std::lround(maxH)));
+    // paddlex 3.x `get_rotate_crop_image`:
+    //   img_crop_width  = int(max(norm(p0-p1), norm(p2-p3)))
+    //   img_crop_height = int(max(norm(p0-p3), norm(p1-p2)))
+    // `int()` in Python is truncate-toward-zero. We replicate that
+    // here. (std::lround / std::round was the M2-PIPE choice and
+    // disagrees with paddlex for non-integer edge lengths.)
+    int dst_w = std::max(1, static_cast<int>(maxW));
+    int dst_h = std::max(1, static_cast<int>(maxH));
     Image warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
     if (warped.data.empty() || warped.w <= 0 || warped.h <= 0) {
-      crops.push_back({Image{}, 0});
+      crops.push_back({Image{}});
       continue;
     }
     // Rotate 90° CCW if H/W >= 1.5, matching PaddleOCR's
@@ -385,23 +493,44 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       }
       warped = std::move(rot);
     }
-    crops.push_back({std::move(warped), 0});  // valid_w set below
+    crops.push_back({std::move(warped)});
   }
-  // Process crops in chunks of rec_batch.
+  // Process crops in chunks of rec_batch. paddlex 3.x
+  // `predictor.process` does this:
+  //   1) batch_imgs = pre_tfs["ReisizeNorm"](imgs=batch_raw_imgs)
+  //      where ReisizeNorm calls resize_norm_img(img, max_wh_ratio)
+  //      with
+  //        imgW = int(imgH * max_wh_ratio)            (truncate)
+  //        resized_w = min(ceil(imgH * w / h), imgW)   per image
+  //      So every image in the batch is resized to the SAME width
+  //      imgW = int(48 * max(wh_ratio in batch)). The remaining
+  //      columns are zero-padded.
+  //   2) max_wh_ratio is computed from the FIRST `end_img_no =
+  //      min(img_num, batch_num=8)` images (NOT the whole batch) but
+  //      because the rec session is dynamic-width [1,3,48,-1] we can
+  //      just compute it over the whole chunk and let MNN resize.
+  //   3) max_imgW is 3200 (clamp the upper bound). The MNN rec
+  //      session handles any width up to that ceiling.
+  // We reproduce this. The per-image "min(ceil, imgW)" capping that
+  // paddlex applies is implicit in `prep_rec_line` which already
+  // does `if (w > batch_w) w = batch_w;`.
+  constexpr int kMaxImgW = 3200;
   for (size_t start = 0; start < crops.size(); start += e.rec_batch) {
     size_t end = std::min(crops.size(), start + e.rec_batch);
     size_t n = end - start;
-    // Determine batch_w = max valid_w within this chunk (still capped).
+    // batch_w = int(H * max(w_i / h_i over the chunk)). truncates.
     int batch_w = 1;
     for (size_t i = start; i < end; ++i) {
-      int vw = 1;
-      if (!crops[i].img.data.empty()) {
-        std::vector<float> tmp = prep_rec_line(crops[i].img, H, batch_w_cap, vw);
-        crops[i].valid_w = vw;
-        if (vw > batch_w) batch_w = vw;
-      }
+      if (crops[i].img.data.empty()) continue;
+      double ratio = static_cast<double>(crops[i].img.w) /
+                     static_cast<double>(crops[i].img.h);
+      double bw_d = static_cast<double>(H) * ratio;
+      int bw = static_cast<int>(bw_d);  // int() truncate, matches Python
+      if (bw > batch_w) batch_w = bw;
     }
+    if (batch_w > kMaxImgW) batch_w = kMaxImgW;
     if (batch_w > batch_w_cap) batch_w = batch_w_cap;
+    if (batch_w < 1) batch_w = 1;
     // Build the CHW tensor: N * 3 * H * batch_w.
     std::vector<float> chw(static_cast<size_t>(n) * 3 * H * batch_w, 0.f);
     for (size_t i = 0; i < n; ++i) {
@@ -409,7 +538,6 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       int vw = 0;
       std::vector<float> line_chw =
           prep_rec_line(crops[start + i].img, H, batch_w, vw);
-      if (vw > batch_w) vw = batch_w;
       std::memcpy(chw.data() + i * 3 * H * batch_w, line_chw.data(),
                   static_cast<size_t>(3) * H * batch_w * sizeof(float));
     }

@@ -264,14 +264,15 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w,
   if (img_h <= 0 || batch_w <= 0) {
     throw std::runtime_error("prep_rec_line: invalid target size");
   }
-  // Keep-ratio resize so h = img_h. PaddleOCR uses
-  //   ratio = img_h / src_h
-  //   w'   = round(src_w * ratio)
-  // and then:
-  //   if w' > batch_w: rescale w' down to batch_w (preserving aspect)
-  //   else:            zero-pad the rest of the row to batch_w.
+  // Keep-ratio resize so h = img_h. paddlex `resize_norm_img`:
+  //   ratio = w / float(h)                 (h = warped crop height)
+  //   resized_w = int(math.ceil(imgH * ratio))   (Python `int` is
+  //         truncate-toward-zero, but `math.ceil` is applied first so
+  //         the value is the small integer >= the real resize width)
+  // We replicate that exactly: `static_cast<int>(std::ceil(...))`
+  // which is the C++ equivalent of `int(math.ceil(...))`.
   const double ratio = static_cast<double>(img_h) / line_bgr.h;
-  int w = static_cast<int>(std::round(line_bgr.w * ratio));
+  int w = static_cast<int>(std::ceil(line_bgr.w * ratio));
   if (w <= 0) w = 1;
   if (w > batch_w) w = batch_w;
   valid_w = w;
