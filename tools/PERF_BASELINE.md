@@ -262,3 +262,78 @@ bit-exact host-side work cannot touch; the post fixes did help t8
 (-13.1%, where the host work was a larger share). Next CPU lever is
 conv-kernel level (MNN build flags A/B — hyp. 5, needs a variant
 rebuild + numerics gate) or det input size (hyp. 3, CER-gated)..
+
+## Round 2 (M3-PERF3)
+
+Scope: (1) MNN CUDA rebuild A/B, (2) batch-mode CPU/GPU overlap. All A/Bs
+interleaved or batched under identical host load. Binaries:
+`build-cuda` (baseline .so) vs `build-cuda-tune` (variant .so).
+
+### 1. MNN CUDA rebuild A/B — REJECTED (baseline .so kept)
+
+Survey of MNN 3.6.1 CUDA backend (no source changes; separate build dir):
+
+- **cuDNN: does not exist in MNN.** `grep -ri cudnn third_party/MNN` over
+  CMakeLists + `source/backend/cuda/` returns nothing — MNN's CUDA backend
+  is cutlass-only (implicit-GEMM > Winograd > cutlass fallback selection
+  order, `ConvSingleInputExecution.cu`). There is no `MNN_USE_CUDNN` knob.
+- The only runtime-relevant CUDA build knobs: `MNN_CUDA_TUNE_PARAM`
+  (cutlass autotune), `MNN_CUDA_BF16` (precision-3 path, text-accuracy
+  risk), `MNN_CUDA_QUANT` (int8 path, out of scope). Variant built with
+  `-DMNN_CUDA_TUNE_PARAM=ON` (build_cuda_tune/, sm_86, same flags else).
+
+Evidence (interleaved single-image runs, zh/03, 3 fresh processes each):
+
+| variant | det_run | e2e |
+|---|---|---|
+| baseline .so | 16.7-17.0 | 73-89 |
+| tune .so | 18.2-18.7 | 716-724 |
+
+The tune variant pays a **~300 ms per-new-input-shape re-tune** inside the
+first runSession after each resize (cutlass param sweep per problem size,
+`CUDARuntime::mTunedBlockWarpShape`). In batch mode (one process, 10
+distinct shapes) tune mean e2e 353 ms vs base 70 ms; on a same-shape dir
+(6x en/08) the first image tunes (1257 ms) and warm images match baseline
+(det_run 1.4 vs 1.3, e2e 367 vs 385 — noise-level). Outputs were
+char-identical between .so variants; the variant is rejected purely on
+speed. (Persisting the tune cache via `Interpreter::setCacheFile` was
+considered; since warm-state speed equals baseline, there is no upside to
+justify shipping a second .so.)
+
+Byproduct finding (important for interpreting ALL prior CUDA numbers): in
+a single process, baseline det_run drops from ~17 ms (first run per shape)
+to **1.1-1.3 ms** warm. The per-image e2e in single-image CLI runs was
+dominated by one-time cutlass selection/workspace alloc, not conv time —
+batch-mode amortizes it.
+
+### 2. Batch mode CPU/GPU overlap — KEPT (`--batch-dir`, engine-per-worker)
+
+`ppocr_cli --batch-dir DIR [--workers N]` (apps/ppocr_cli.cpp): scans DIR
+for images, spawns N workers, each with its own `ppocr_engine` (C ABI is
+multi-instance thread-safe), pulling images off an atomic index. Each
+image runs the full serial pipeline unchanged — CPU post of image N-1
+overlaps GPU runs of image N across workers. Output JSON is an array of
+per-image results (identical schema per image) + a `_bench` object
+(n_images, workers, wall_s, throughput_fps, mean/max e2e_ms, failures).
+
+Correctness: workers=1 vs workers=3 outputs **identical** on zh dir;
+batch(w1) vs serial single-image CLI outputs **identical** on zh (10
+imgs) and en (10 imgs, incl. dense en/08 283 lines).
+
+Throughput (v6_tiny/cuda/t4, 3 reps each, zh dir = 10 mixed images;
+dense6 = 6x en/08 duplicates):
+
+| dir | w1 | w2 | w3 | w4 |
+|---|---|---|---|---|
+| zh fps | 10.4 | 13.4 | 14.0 | 15.9 |
+| dense6 fps | 2.31 | 3.04 | 3.71 | 4.03 |
+| en fps | 7.72 | — | — | 11.47 |
+
+vs the ≥25% bar: zh +29% @w2 / +53% @w4; dense +32% @w2 / +74% @w4; en
++49% @w4. Target met. CPU backend also improves: t4 w1 4.13 → w4 5.54
+FPS (+34%) on zh.
+
+The 15 FPS single-image target from round 1 is now effectively met at the
+batch level: zh dir @w4 = 15.9 FPS CUDA tiny (vs 9.45 single-image);
+warm det_run 1.2 ms means the batch pipeline is postprocess-bound, which
+is exactly what workers parallelize.
