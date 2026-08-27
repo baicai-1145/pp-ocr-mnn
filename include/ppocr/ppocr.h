@@ -71,6 +71,12 @@ typedef struct ppocr_config {
   int profile;                // M3-PERF1: 1 = collect per-stage timings,
                               // readable via ppocr_last_profile(). 0 = off
                               // (default; zero instrumentation cost).
+  int warmup;                 // M3-PERF4: 1 = at ppocr_create, run one
+                              // dummy det/rec/cls inference so the first
+                              // real image skips the one-time backend init
+                              // (~15ms cutlass select + workspace alloc on
+                              // CUDA). 0 (default, matches {} zero-init) =
+                              // skip; the CLI passes 1 unless --no-warmup.
 } ppocr_config;
 
 // ---- results ---------------------------------------------------------------

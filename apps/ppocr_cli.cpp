@@ -50,6 +50,7 @@ struct Args {
   // M3-PERF3 batch mode
   std::string batch_dir;         // --batch-dir DIR: process all images in DIR
   int workers = 2;               // --workers N: engine-per-worker (default 2)
+  int warmup = 1;                // M3-PERF4: dummy inference at create
 };
 
 void usage() {
@@ -85,6 +86,7 @@ bool parse_args(int argc, char** argv, Args& a) {
   else if (k == "--profile")       { a.profile = 1; }
   else if (k == "--batch-dir")     { auto v = need("--batch-dir");     if (!v) return false; a.batch_dir = v; }
   else if (k == "--workers")       { auto v = need("--workers");       if (!v) return false; a.workers = std::atoi(v); }
+  else if (k == "--no-warmup")     { a.warmup = 0; }
     else if (k == "-h" || k == "--help") { a.help = 1; return true; }
     else {
       std::fprintf(stderr, "unknown flag: %s\n", k.c_str());
@@ -228,6 +230,8 @@ int run_batch(const Args& a) {
     cfg.backend    = parse_backend(a.backend);
     cfg.num_threads = a.threads;
     cfg.rec_batch  = a.batch;
+  cfg.warmup     = a.warmup;
+    cfg.warmup     = a.warmup;
     cfg.max_side   = a.max_side;
     cfg.offline    = 1;
     cfg.download   = 0;
@@ -360,6 +364,7 @@ int main(int argc, char** argv) {
   cfg.backend    = parse_backend(a.backend);
   cfg.num_threads = a.threads;
   cfg.rec_batch  = a.batch;
+  cfg.warmup     = a.warmup;
   cfg.max_side   = a.max_side;
   cfg.offline    = 1; // M1: never download; if file is missing we want a hard error
   cfg.download   = 0;

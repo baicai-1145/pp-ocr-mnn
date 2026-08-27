@@ -124,6 +124,11 @@ struct Engine {
 
   // Helpers
   ppocr_status load_submodels(const ppocr_config* cfg, char* err, size_t elen);
+  // M3-PERF4: one dummy inference per loaded model (det 640x640, rec
+  // 1x3x48x320, cls 1x3x80x160) to absorb the one-time backend init
+  // (cutlass param selection + workspace allocation on CUDA) at create
+  // time instead of on the first real image. Outputs are discarded.
+  void warmup();
 };
 
 // ---- helpers -------------------------------------------------------------
@@ -381,6 +386,24 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
     }
   }
   return PPOCR_OK;
+}
+
+void Engine::warmup() {
+  auto run_dummy = [this](MnnSession* s, const std::vector<int>& dims) {
+    if (!s) return;
+    try {
+      const size_t n = static_cast<size_t>(dims[0]) * dims[1] * dims[2] * dims[3];
+      std::vector<float> zeros(n, 0.f);
+      s->set_input_float("x", dims, zeros.data());
+      (void)s->run();
+    } catch (...) {
+      // Warmup is best-effort: a failure here doesn't invalidate the
+      // engine; the first real inference will surface real errors.
+    }
+  };
+  run_dummy(det.get(), {1, 3, 640, 640});
+  run_dummy(rec.get(), {1, 3, 48, 320});
+  run_dummy(cls.get(), {1, 3, 80, 160});
 }
 
 // ---- det / rec helpers ---------------------------------------------------
@@ -1213,6 +1236,11 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
       // Best-effort error string: we don't always have a useful message.
     }
     return st;
+  }
+  // M3-PERF4: opt-in warmup (cfg->warmup == 1). The CLI passes 1 by
+  // default; plain C users keep the zero-init cold-start behavior.
+  if (e->cfg_shadow.warmup) {
+    e->warmup();
   }
   if (e->want_profile) {
     e->create_ms_stored = std::chrono::duration<float, std::milli>(
