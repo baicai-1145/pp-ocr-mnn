@@ -240,13 +240,6 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
                                              : std::string("PP-OCRv6_tiny_rec");
   const std::string cls_name = cfg->cls_name ? cfg->cls_name : std::string();
 
-  // Resolve rec_batch early. The C ABI default 0 → 16 (M3-PERF4:
-  // width-neutral vs 8 because batch_w is always floored/capped to the
-  // 320 rec shape, so chunk size only changes the session batch dim N;
-  // dense e2e -15% at 16, rec_run 21.9→11.3ms. 32 regresses).
-  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 16;
-  if (rec_batch < 1) rec_batch = 1;
-
   // M4-SEAL: auto-detect seal mode from the det model name (any of the
   // four PP-OCRvN_{mobile,server}_seal_det variants). An explicit
   // cfg->is_seal = 1 forces the mode on (e.g. when a user renames a
@@ -354,6 +347,18 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
     if (err && elen) std::snprintf(err, elen, "model path resolution failed");
     return st;
   }
+
+  // Resolve rec_batch AFTER configs load (the hint lives in the rec
+  // model config). Priority: cfg->rec_batch > rec_batch_hint > 16.
+  // M3-PERF4 made 16 the default (width-neutral vs 8; dense e2e -15%
+  // on v6_tiny). M3-PERF5: measured exceptions where 8 wins on CUDA —
+  // v6_medium dense6 w1 1.08 fps @8 vs 0.87 @16, v6_small 1.54 vs 0.94
+  // — the [16,3,48,320] session resize + activation memory outweigh
+  // GEMM batching for those rec graphs. The hint lets those model
+  // configs opt down without changing the ABI default.
+  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch
+             : (rec_cfg.rec.rec_batch_hint > 0 ? rec_cfg.rec.rec_batch_hint : 16);
+  if (rec_batch < 1) rec_batch = 1;
 
   // Build a SessionConfig from the public cfg.
   SessionConfig sc;
