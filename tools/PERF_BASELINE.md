@@ -337,3 +337,44 @@ The 15 FPS single-image target from round 1 is now effectively met at the
 batch level: zh dir @w4 = 15.9 FPS CUDA tiny (vs 9.45 single-image);
 warm det_run 1.2 ms means the batch pipeline is postprocess-bound, which
 is exactly what workers parallelize.
+
+## Round 3 (M3-PERF4)
+
+Scope: post-batch bottleneck (CPU post), rec GEMM batching, first-image
+warmup, warp sampler A/B. All approximations gated on line-exactness
+(en/08 dense 283 + zh/04 + ja/01 60 + zh/03 + en/03).
+
+### Kept
+
+| change | effect | exactness |
+|---|---|---|
+| 4a bbox polygon rasterization (box_score_fast) | db_post 26.2→19.9ms dense (-24%) | bit-exact (text+poly+score) |
+| 4b default rec_batch 8→16 | rec_run 21.9→11.3ms, rec_prep 43→26ms, dense warm e2e 320→255ms | line-identical (batch_w is always 320: floored at 6.67 ratio and capped) |
+| 4c create-time warmup (cfg.warmup, CLI default on) | first-image det_run 13.2→1.5ms, e2e 104→81ms (zh/04); create +46ms once | output-neutral (CUDA+CPU) |
+
+Combined interleaved batch A/B (host load ~30-40 during measurement;
+deltas valid, absolutes depressed): dense6 w4 1.85→2.75 FPS (+49%),
+zh dir w4 9.33→10.02 FPS (+7%, decode+serial dominated).
+
+Key mechanism discovered (4b): rec batch_w is floored (320/48) and
+capped (320) for every chunk, so chunk size is width-neutral — only the
+session batch dim N changes. The M2-NUM narrow-width regression cannot
+trigger via chunk size. batch=32 regresses (bigger per-run session
+resize outweighs GEMM efficiency).
+
+### A/B'd out (reverted with evidence)
+
+| hypothesis | evidence | verdict |
+|---|---|---|
+| CCL row-skip + fused pixel count (P1+P2) | db_post 26.6 vs 27.3ms — noise | no win; CCL is branch-predictable already |
+| warp bicubic→bilinear (PPOCR_WARP_BILINEAR) | text-identical on all 5 gates(!) but crop_warp 31.1→30.4ms dense (noise); rec inputs not bit-exact | rejected: no speed win for a semantic change |
+| clipper/unclip batching | unclip measured 1.4-1.5ms of 20ms db_post (stage-timing probe) | not a hotspot; skipped |
+
+db_post internal composition (en/08, 384 comps, stage probe): ccl 5.8,
+flatten 3.2, score-fill 6.1 (→ 1.x after 4a), trace 0.55, unclip 1.4,
+binarize 0.9, seeds 1.0, glue ~2.7ms.
+
+Note on decode timing: all numbers above use stb_image decode. The m1
+libjpeg-turbo decoder (ws/m2-final-diag, pending merge) will shift
+decode_ms down ~10ms/image; batch throughput will improve further, and
+that change is CER-gated separately by m1.

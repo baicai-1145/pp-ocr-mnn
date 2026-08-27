@@ -231,6 +231,82 @@ std::vector<uint8_t> fill_polygon_mask(const std::vector<PointF>& poly_in, int W
   return mask;
 }
 
+// M3-PERF4: bbox-restricted rasterization, bit-exact with
+// fill_polygon_mask restricted to the polygon's clipped-vertex bbox:
+// identical integer polygon (same lround + clip), identical scanline
+// crossings (same even-odd test and lround(xi)), identical span writes
+// (memset of [xa, xb] inclusive) — only the buffer is bw x bh instead
+// of W x H, and spans are offset by (x0, y0). The caller iterates the
+// same bbox rows/columns, so scored pixels and accumulation order are
+// unchanged. This avoids a full W*H zero-init per candidate (the
+// dominant cost of box_score_fast on dense maps: 384 candidates x 1.2MB).
+struct FilledPolyBBox {
+  std::vector<uint8_t> mask;  // bw x bh, row-major
+  int x0 = 0, y0 = 0, bw = 0, bh = 0;
+};
+
+static FilledPolyBBox fill_polygon_mask_bbox(const std::vector<PointF>& poly_in,
+                                             int W, int H) {
+  FilledPolyBBox fp;
+  if (poly_in.size() < 3) return fp;
+  std::vector<std::pair<int, int>> p;
+  p.reserve(poly_in.size() + 1);
+  int pxmin = W, pxmax = 0, pymin = H, pymax = 0;
+  for (const auto& pt : poly_in) {
+    int x = static_cast<int>(std::lround(pt.x));
+    int y = static_cast<int>(std::lround(pt.y));
+    if (x < 0) x = 0;
+    if (x > W - 1) x = W - 1;
+    if (y < 0) y = 0;
+    if (y > H - 1) y = H - 1;
+    p.emplace_back(x, y);
+    if (x < pxmin) pxmin = x;
+    if (x > pxmax) pxmax = x;
+    if (y < pymin) pymin = y;
+    if (y > pymax) pymax = y;
+  }
+  // Remove consecutive duplicates.
+  std::vector<std::pair<int, int>> p2;
+  p2.reserve(p.size() + 1);
+  for (size_t i = 0; i < p.size(); ++i) {
+    size_t j = (i + 1) % p.size();
+    if (p[i].first == p[j].first && p[i].second == p[j].second) continue;
+    p2.push_back(p[i]);
+  }
+  if (p2.size() < 3) return fp;
+  p2.push_back(p2.front());
+  fp.x0 = pxmin;
+  fp.y0 = pymin;
+  fp.bw = pxmax - pxmin + 1;
+  fp.bh = pymax - pymin + 1;
+  if (fp.bw <= 0 || fp.bh <= 0) { fp.bw = fp.bh = 0; return fp; }
+  fp.mask.assign(static_cast<size_t>(fp.bw) * fp.bh, 0);
+  for (int y = pymin; y <= pymax; ++y) {
+    std::vector<int> xs;
+    for (size_t i = 0; i + 1 < p2.size(); ++i) {
+      int y1 = p2[i].second, y2 = p2[i + 1].second;
+      int x1 = p2[i].first, x2 = p2[i + 1].first;
+      if ((y1 <= y && y2 > y) || (y2 <= y && y1 > y)) {
+        double xi = x1 + (static_cast<double>(y - y1) / (y2 - y1)) * (x2 - x1);
+        xs.push_back(static_cast<int>(std::lround(xi)));
+      }
+    }
+    if (xs.size() < 2) continue;
+    std::sort(xs.begin(), xs.end());
+    const int row = y - fp.y0;
+    uint8_t* rowp = fp.mask.data() + static_cast<size_t>(row) * fp.bw;
+    for (size_t k = 0; k + 1 < xs.size(); k += 2) {
+      int xa = xs[k];
+      int xb = xs[k + 1];
+      if (xa < 0) xa = 0;
+      if (xb > W - 1) xb = W - 1;
+      if (xa > xb) continue;
+      std::memset(rowp + (xa - fp.x0), 1, xb - xa + 1);
+    }
+  }
+  return fp;
+}
+
 }  // namespace
 
 std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
@@ -406,8 +482,14 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     std::vector<PointF> sorted_box4(box4, box4 + 4);
 
     // box_score_fast: mean of pred inside the polygon.
-    auto poly_mask = fill_polygon_mask(sorted_box4, W, H);
-    // Bounding box of the polygon.
+    // M3-PERF4: rasterize into the polygon bbox (bit-exact; see
+    // fill_polygon_mask_bbox). The outer bbox loop bounds below are the
+    // polygon's floor()-bbox as before; the mask covers the (smaller)
+    // lround()-clipped bbox, and reads outside it are zero, matching the
+    // old full-image mask semantics exactly.
+    const FilledPolyBBox fp = fill_polygon_mask_bbox(sorted_box4, W, H);
+    if (fp.bw <= 0 || fp.bh <= 0) continue;
+    // Bounding box of the polygon (floor, as before).
     int xmin = W - 1, xmax = 0, ymin = H - 1, ymax = 0;
     for (const auto& p : sorted_box4) {
       int xi = static_cast<int>(std::floor(p.x));
@@ -425,10 +507,14 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     double sum_prob = 0.0;
     int sum_count = 0;
     for (int yy = ymin; yy <= ymax; ++yy) {
-      const uint8_t* mrow = poly_mask.data() + yy * W;
+      const int my = yy - fp.y0;
+      const uint8_t* mrow =
+          (my >= 0 && my < fp.bh) ? fp.mask.data() + static_cast<size_t>(my) * fp.bw
+                                  : nullptr;
       const float* prow = prob + yy * W;
       for (int xx = xmin; xx <= xmax; ++xx) {
-        if (mrow[xx]) {
+        const int mx = xx - fp.x0;
+        if (mrow && mx >= 0 && mx < fp.bw && mrow[mx]) {
           sum_prob += prow[xx];
           ++sum_count;
         }

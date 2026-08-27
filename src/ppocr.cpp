@@ -120,10 +120,15 @@ struct Engine {
   // Cached rec batch size (1..N). The default rec_batch=0 in the C
   // ABI means "8", per ppocr.h. We resolve it once at create() so
   // run_full() doesn't repeat the math.
-  int rec_batch = 8;
+  int rec_batch = 16;
 
   // Helpers
   ppocr_status load_submodels(const ppocr_config* cfg, char* err, size_t elen);
+  // M3-PERF4: one dummy inference per loaded model (det 640x640, rec
+  // 1x3x48x320, cls 1x3x80x160) to absorb the one-time backend init
+  // (cutlass param selection + workspace allocation on CUDA) at create
+  // time instead of on the first real image. Outputs are discarded.
+  void warmup();
 };
 
 // ---- helpers -------------------------------------------------------------
@@ -235,8 +240,11 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
                                              : std::string("PP-OCRv6_tiny_rec");
   const std::string cls_name = cfg->cls_name ? cfg->cls_name : std::string();
 
-  // Resolve rec_batch early. The C ABI contract says 0 → 8.
-  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 8;
+  // Resolve rec_batch early. The C ABI default 0 → 16 (M3-PERF4:
+  // width-neutral vs 8 because batch_w is always floored/capped to the
+  // 320 rec shape, so chunk size only changes the session batch dim N;
+  // dense e2e -15% at 16, rec_run 21.9→11.3ms. 32 regresses).
+  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 16;
   if (rec_batch < 1) rec_batch = 1;
 
   // M4-SEAL: auto-detect seal mode from the det model name (any of the
@@ -378,6 +386,24 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
     }
   }
   return PPOCR_OK;
+}
+
+void Engine::warmup() {
+  auto run_dummy = [this](MnnSession* s, const std::vector<int>& dims) {
+    if (!s) return;
+    try {
+      const size_t n = static_cast<size_t>(dims[0]) * dims[1] * dims[2] * dims[3];
+      std::vector<float> zeros(n, 0.f);
+      s->set_input_float("x", dims, zeros.data());
+      (void)s->run();
+    } catch (...) {
+      // Warmup is best-effort: a failure here doesn't invalidate the
+      // engine; the first real inference will surface real errors.
+    }
+  };
+  run_dummy(det.get(), {1, 3, 640, 640});
+  run_dummy(rec.get(), {1, 3, 48, 320});
+  run_dummy(cls.get(), {1, 3, 80, 160});
 }
 
 // ---- det / rec helpers ---------------------------------------------------
@@ -1210,6 +1236,11 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
       // Best-effort error string: we don't always have a useful message.
     }
     return st;
+  }
+  // M3-PERF4: opt-in warmup (cfg->warmup == 1). The CLI passes 1 by
+  // default; plain C users keep the zero-init cold-start behavior.
+  if (e->cfg_shadow.warmup) {
+    e->warmup();
   }
   if (e->want_profile) {
     e->create_ms_stored = std::chrono::duration<float, std::milli>(
