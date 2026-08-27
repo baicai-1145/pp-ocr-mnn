@@ -108,6 +108,18 @@ void MnnSession::load(const std::string& model_path,
   // backendConfig is a borrowed pointer that must outlive the
   // session — stack-allocating it segfaults in
   // CUDARuntimeCreator::onCreate.)
+  // M3-PERF5 A/B: PPOCR_MNN_SESSION_MODE env (release|debug, default release
+  // semantics only if set; unset = MNN defaults, no behavior change).
+  const char* smode = getenv("PPOCR_MNN_SESSION_MODE");
+  if (smode && strstr(smode, "debug")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Debug);
+  } else if (smode && strstr(smode, "release")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Release);
+  } else if (smode && strstr(smode, "backend_auto")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Backend_Auto);
+  } else if (smode && strstr(smode, "mem_collect")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Memory_Collect);
+  }
   impl_->session = impl_->interp->createSession(sc);
   if (!impl_->session) {
     throw std::runtime_error("MnnSession: createSession failed");

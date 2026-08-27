@@ -378,3 +378,61 @@ Note on decode timing: all numbers above use stb_image decode. The m1
 libjpeg-turbo decoder (ws/m2-final-diag, pending merge) will shift
 decode_ms down ~10ms/image; batch throughput will improve further, and
 that change is CER-gated separately by m1.
+
+## Round 4 (M3-PERF5)
+
+### 1. libjpeg-turbo decode (cherry-picked m1's m2-decode-align, 4569d92)
+
+- **Decode-level parity: PASS** — all 272 corpus jpgs bit-exact vs
+  cv2.imread (FNV-1a over BGR bytes; decode parity harness rebuilt on
+  this branch, matches m1's result).
+- decode_ms: zh/04 13.4→4.6, en/08 19.4→7.4 (interleaved 3-rep medians).
+- **Output surface changes** (as expected — decode bytes change det
+  inputs): en/08 171/283 lines shift; 5-gate line-exactness vs the stb
+  era FAILS by construction.
+- **CER vs paddle baselines (v6_tiny, zh/en/ja × 10 imgs, score.py
+  semantics, same driver/backend)**: zh 0.0615→0.0573 (better), ja
+  0.2893→0.2617 (better), en 0.0355→0.1240 (worse). The en regression
+  is ONE image (en/03): the 1-px det box shift (700→701, 717→718) flips
+  the single low-margin char 'S'→'AS' — CER 0.000→1.000 on a 1-char
+  reference. Decode parity does NOT buy box parity (MNN-vs-paddle det
+  kernel diffs still shift boxes). Note all cells remain above the
+  0.05 gate in BOTH decoders (M2 milestone still open); libjpeg moves
+  zh/ja toward baseline.
+- Verdict: **kept on the branch as the m1-merge preview** — it is the
+  decode the baselines were generated with; final call belongs to m1's
+  merge review (the CER effect is mixed but decode-parity is principled).
+
+### 2. zh per-stage analysis (warm batch profile)
+
+e2e 59ms mean: decode 20.1%, det_prep 18.4%, db_post 14.3%, crop 11.1%,
+ctc 6.1%, rec_run 1.9%, det_run 4.8% (warm). decode >15% confirmed the
+libjpeg lever. Remaining serial list (post-warm): det_prep (~5.7ms calm,
+float-bilinear resize, PERF2-optimized, reference-matching — not worth
+touching), glue (~40ms e2e minus stages: build_lines, JSON, Image
+copies). **Sparse-image rec batching: already adaptive** — chunk loop
+runs the last chunk at N=actual (2 boxes → 1 batch of N=2, rec_run
+0.6ms); no padding waste exists, nothing to do.
+
+### 3. medium/server tier
+
+- **The "medium 5.42 FPS" premise was stale**: with PERF4 warmup,
+  medium's det_run is 1.4ms warm (the old 25ms was first-run cost).
+  v6_medium single-image e2e 79ms (12.7 FPS) on zh/03.
+- **MNN session modes: no effect** (Debug/Release/Backend_Auto/
+  Memory_Collect via PPOCR_MNN_SESSION_MODE, medium warm det/rec
+  1.4/1.1ms in all modes).
+- **rec batch optimum is per-model** (dense6 CUDA w1, 2+ reps):
+  v6_medium 8 (1.08 vs 0.87 fps @16), v6_small 8 (1.54/1.21 vs
+  0.94/0.97), v5_server 8 (0.99/0.93 vs 0.76/0.85), v4_server tie
+  (1.17/1.16), v6_tiny + v4_mobile 16 (PERF4). Not a size story (46MB
+  v4_server ties; 20MB v6_small prefers 8) — per-graph. Implemented as
+  **RecConfig.rec_batch_hint** (config-driven per-model default;
+  resolution cfg->rec_batch > hint > 16; moved resolution after config
+  load so the hint is visible). Hints set: v6_medium/small, v5_server
+  rec = 8. Outputs line-identical (width-neutral chunking). Medium
+  dense default 0.93 vs forced-16 0.79 fps under same load (+18%).
+  convert_models.py should regenerate shipped configs with the hints.
+
+Post-round state (load ~29, w4 batch): zh 15.3 FPS, dense6 4.49 FPS
+(v6_tiny, libjpeg + batch16). test_post 20/20, ctest 2/2.
