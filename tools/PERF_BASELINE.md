@@ -184,3 +184,81 @@ LD_LIBRARY_PATH=third_party/MNN/build_cuda:/usr/lib/x86_64-linux-gnu \
   --model-dir /root/pp-ocr-mnn/models --backend cuda --threads 4 \
   --profile --json /tmp/out.json
 ```
+
+## Round 1 (M3-PERF2) — bit-exact CPU/CUDA speedups + A/B'd-out items
+
+Working rule for this round: **every kept change is bit-exact** (char+poly
+identical on zh/03, zh/04, en/03, en/08 — the last being the 302-box dense
+image) or explicitly reverted. Timing A/B under identical host load
+(interleaved runs; the box runs co-tenant workloads at load ~39, so
+sequential A/Bs mis-attribute load spikes).
+
+### Kept (commits 9377079..1fdd434 on ws/m3-perf)
+
+| change | effect |
+|---|---|
+| 2a. resize/normalize hoisting (preprocess.cpp): per-column fx/x0/dx + per-row fy/dy out of the bilinear inner loop; 256-entry LUT for (v*scale-mean)/std — same double ops, same order | det_prep 8.3→5.7 ms (zh/03); det_prep share 3.8→~2% cpu t4, 15.3→~5% cuda |
+| 2b. parallel ctc_decode across the rec batch (min(n, hw, 8) threads; rows independent) | en/08 CUDA ctc 236→110 ms; typical ctc share 13→~5% |
+| 2c. db_post O(n²) eliminations: per-pixel heap vector → 8-slot stack array; O(labels) std::find per pixel → O(1) root_to_idx; per-component full-map find_first_boundary → one row-major sweep | en/08 db_post 207→27 ms (-87%); zh/03 21.6→~14 ms |
+| 2d. parallel crop warp + rec prep (per-box/per-crop independent work over ≤8 threads) | en/08 CUDA crop_warp 27→10 ms, e2e 441→402 ms |
+
+### A/B'd out (reverted, with evidence)
+
+| item | verdict | evidence |
+|---|---|---|
+| rec width bucketing {128,224,320} (hyp. 1) | **REVERT — output changes** | en/08: 70/302 lines differ; en/03 'S'→garbage — the exact M2-NUM narrow-width regression. paddlex pads to 320 for accuracy, not just batching. conv border effects at shorter widths shift logits. |
+| CUDA Precision_Low fp16 (hyp. 2) | **REVERT — slower AND wrong** | det 21.8 vs 16.9 ms; text 'QUEEN VICTORIA ST'→'QUE!ICOIAS' on zh/03. Precision_High correct but slower (27.0 ms). (Also: ScheduleConfig::backendConfig is a borrowed pointer — stack-allocating it segfaults CUDARuntimeCreator::onCreate.) fp16 needs a cudnn-enabled MNN build; this .so links cublas only. |
+| db_post 2×2 max-pool before post (hyp. 4) | **REVERT — no win** | Output bit-identical (0 px drift, en/08+zh/03) but db_post only 215→204 ms on the dense case, ~0 typical: cost is in CCL/unclip, not the bitmap scan. Superseded by 2c. |
+| threads=0 (auto) CPU default (item 3) | **NO CHANGE — same speed** | Full-sweep A/B: v6_tiny 537.5 vs t4 544.8; v4_mobile 563.8 vs 560.6; v6_medium 2492.8 vs 2558.8 ms (±1-3%, within noise). The single-image "177 vs 217 ms" that motivated it was turbo-clock noise. MNN treats 0 as 1 thread in CPURuntime but Schedule's AUTO path gives equivalent throughput to t4 on this EPYC. |
+| libjpeg-turbo decode (stretch) | **REVERT — not char-exact** | decode 18→7.4 ms (real win) but IDCT rounding differs from stb: zh/03 2 low-conf FP lines shift ('医方形'→'组为E', score 0.55/0.32); en/08 240/302 lines differ (dense tiny-text FPs flip). Real text lines identical everywhere, but the round's bit-exact bar fails. Revisit if a future round accepts "CER-equal on real text". |
+
+### Round-1 matrix (same protocol as the baseline; filled from perf_round1_final.json)
+
+| cell | baseline e2e | round-1 e2e | Δ | baseline FPS | round-1 FPS |
+|---|---|---|---|---|---|
+| v6_tiny/cpu/t1 | 1158.1 | 1134.0 | -2.1% | 0.86 | 0.88 |
+| v6_tiny/cpu/t4 | 544.8 | 541.3 | -0.6% | 1.84 | 1.85 |
+| v6_tiny/cpu/t8 | 594.5 | 516.8 | -13.1% | 1.68 | 1.94 |
+| **v6_tiny/cuda/t4** | 133.4 | **105.9** | **-20.6%** | 7.50 | **9.45** |
+| v6_medium/cpu/t1 | 6986.6 | 7008.6 | +0.3% | 0.14 | 0.14 |
+| v6_medium/cpu/t4 | 2558.8 | 2469.2 | -3.5% | 0.39 | 0.40 |
+| v6_medium/cpu/t8 | 2076.6 | 1878.9 | -9.5% | 0.48 | 0.53 |
+| **v6_medium/cuda/t4** | 239.4 | **184.4** | **-23.0%** | 4.18 | **5.42** |
+| v4_mobile/cpu/t1 | 1148.0 | 1111.8 | -3.2% | 0.87 | 0.90 |
+| v4_mobile/cpu/t4 | 560.6 | 517.5 | -7.7% | 1.78 | 1.93 |
+| v4_mobile/cpu/t8 | 612.0 | 532.8 | -12.9% | 1.63 | 1.88 |
+| **v4_mobile/cuda/t4** | 169.5 | **126.3** | **-25.5%** | 5.90 | **7.92** |
+
+db_post column: 27-38 → 11.6-14.8 ms across all cells (the 2c fix).
+per-image medians: v6_tiny/cuda 104 → 85 ms; v4_mobile/cuda 124 → 94 ms.
+
+### Headline vs targets
+
+- Target "CUDA tiny 7.5→15+ FPS": NOT met this round — see | cell | baseline e2e | round-1 e2e | Δ | baseline FPS | round-1 FPS |
+|---|---|---|---|---|---|
+| v6_tiny/cpu/t1 | 1158.1 | 1134.0 | -2.1% | 0.86 | 0.88 |
+| v6_tiny/cpu/t4 | 544.8 | 541.3 | -0.6% | 1.84 | 1.85 |
+| v6_tiny/cpu/t8 | 594.5 | 516.8 | -13.1% | 1.68 | 1.94 |
+| **v6_tiny/cuda/t4** | 133.4 | **105.9** | **-20.6%** | 7.50 | **9.45** |
+| v6_medium/cpu/t1 | 6986.6 | 7008.6 | +0.3% | 0.14 | 0.14 |
+| v6_medium/cpu/t4 | 2558.8 | 2469.2 | -3.5% | 0.39 | 0.40 |
+| v6_medium/cpu/t8 | 2076.6 | 1878.9 | -9.5% | 0.48 | 0.53 |
+| **v6_medium/cuda/t4** | 239.4 | **184.4** | **-23.0%** | 4.18 | **5.42** |
+| v4_mobile/cpu/t1 | 1148.0 | 1111.8 | -3.2% | 0.87 | 0.90 |
+| v4_mobile/cpu/t4 | 560.6 | 517.5 | -7.7% | 1.78 | 1.93 |
+| v4_mobile/cpu/t8 | 612.0 | 532.8 | -12.9% | 1.63 | 1.88 |
+| **v4_mobile/cuda/t4** | 169.5 | **126.3** | **-25.5%** | 5.90 | **7.92** |
+
+db_post column: 27-38 → 11.6-14.8 ms across all cells (the 2c fix).
+per-image medians: v6_tiny/cuda 104 → 85 ms; v4_mobile/cuda 124 → 94 ms..
+  What's left after round 1 on the CUDA path: det_run (fp32 cutlass convs;
+  fp16 broken per above), decode (stb scalar; turbo rejected on exactness),
+  and pipeline overlap (CPU post of image N ∥ GPU run of N+1 — a
+  structural change for PERF3). 15 FPS needs ~67 ms; current typical-image
+  CUDA tiny e2e ≈ 80-90 ms single-threaded pipeline.
+- Target "CPU t4 545→450 ms": NOT met — 541.3 ms (-0.6%, noise). The CPU t4 path is ~85%
+network forward (det_run 272 + rec_run 200 = 472 of 541 ms) which
+bit-exact host-side work cannot touch; the post fixes did help t8
+(-13.1%, where the host work was a larger share). Next CPU lever is
+conv-kernel level (MNN build flags A/B — hyp. 5, needs a variant
+rebuild + numerics gate) or det input size (hyp. 3, CER-gated)..
