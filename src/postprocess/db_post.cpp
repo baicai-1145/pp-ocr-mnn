@@ -16,6 +16,7 @@
 #include "ppocr/postprocess/db_post.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -172,60 +173,167 @@ float polygon_perimeter(const std::vector<PointF>& p) {
 }
 
 // --- fillPoly: rasterize a polygon into a mask ------------------------------
-// Standard scanline fill. Returns a mask of size WxH (row-major, 0/1).
+// Bit-exact port of the PaddleX box_score_fast rasterization:
+//   cv2.fillPoly(mask, box.astype(np.int32), 1)
+// Callers pass vertices already truncated to int (numpy astype semantics).
+// Reproduces OpenCV's CollectPolyEdges (LINE_8 outline stroke + 16.16
+// fixed-point fill edges) and FillEdgeCollection (even-odd span drawing),
+// modules/imgproc/src/drawing.cpp @ 4.x, INCLUDING the pathological
+// mutation of the tmp sentinel (x=0,dx=0) when it is drawn as an endpoint.
+namespace {
+struct CvEdge { int y0, y1; int64_t x, dx; };
+
+// cv::LineIterator connectivity=8, leftToRight=false.
+void bres_line(std::vector<uint8_t>& m, int W, int H,
+               int x1, int y1, int x2, int y2) {
+  if (x1 < 0 || y1 < 0 || x1 >= W || y1 >= H) return;
+  if (x2 < 0 || y2 < 0 || x2 >= W || y2 >= H) return;
+  int d_x = 1, d_y = 1;
+  int dx = x2 - x1, dy = y2 - y1;
+  if (dx < 0) { dx = -dx; d_x = -1; }
+  if (dy < 0) { dy = -dy; d_y = -1; }
+  bool vert = dy > dx;
+  if (vert) { std::swap(dx, dy); std::swap(d_x, d_y); }
+  int err = dx - dy - dy;
+  int plusDelta = dx + dx;
+  int minusDelta = -(dy + dy);
+  int minusShift = d_x, plusShift = 0;
+  int minusStep = 0, plusStep = d_y;
+  if (vert) {
+    std::swap(plusStep, plusShift);
+    std::swap(minusStep, minusShift);
+  }
+  int px = x1, py = y1;
+  for (int i = 0; i <= dx; ++i) {
+    m[static_cast<size_t>(py) * W + px] = 1;
+    int mk = err < 0 ? -1 : 0;
+    err += minusDelta + (plusDelta & mk);
+    px += minusShift + (plusShift & mk);
+    py += minusStep + (plusStep & mk);
+  }
+}
+}  // namespace
+
 std::vector<uint8_t> fill_polygon_mask(const std::vector<PointF>& poly_in, int W,
                                       int H) {
   std::vector<uint8_t> mask(W * H, 0);
   if (poly_in.size() < 3) return mask;
-  // Build a closed integer polygon. Clip to image bounds.
-  std::vector<std::pair<int, int>> p;
-  p.reserve(poly_in.size() + 1);
-  for (const auto& pt : poly_in) {
-    int x = static_cast<int>(std::lround(pt.x));
-    int y = static_cast<int>(std::lround(pt.y));
-    if (x < 0) x = 0;
-    if (x > W - 1) x = W - 1;
-    if (y < 0) y = 0;
-    if (y > H - 1) y = H - 1;
-    p.emplace_back(x, y);
+  const int n = static_cast<int>(poly_in.size());
+  auto clamp_x = [&](int64_t v) { return std::min(std::max(v, (int64_t)0), (int64_t)(W - 1)); };
+  auto clamp_y = [&](int64_t v) { return std::min(std::max(v, (int64_t)0), (int64_t)(H - 1)); };
+  std::vector<int> vx(n), vy(n);          // rounded pixel coords (stroke uses these)
+  std::vector<int64_t> vfx(n);            // <<16 fixed point for fill edges
+  for (int i = 0; i < n; ++i) {
+    vx[i] = static_cast<int>(clamp_x(static_cast<int64_t>(poly_in[i].x)));
+    vy[i] = static_cast<int>(clamp_y(static_cast<int64_t>(poly_in[i].y)));
+    vfx[i] = vx[i] << 16;
   }
-  // Remove consecutive duplicates.
-  std::vector<std::pair<int, int>> p2;
-  p2.reserve(p.size() + 1);
-  for (size_t i = 0; i < p.size(); ++i) {
-    size_t j = (i + 1) % p.size();
-    if (p[i].first == p[j].first && p[i].second == p[j].second) continue;
-    p2.push_back(p[i]);
+  // ---- CollectPolyEdges ----
+  std::vector<CvEdge> edges;
+  edges.reserve(n);
+  for (int i = 0; i < n; ++i) {
+    const int j = (i + n - 1) % n;
+    bres_line(mask, W, H, vx[j], vy[j], vx[i], vy[i]);      // LINE_8 stroke
+    if (vy[j] == vy[i]) continue;                            // horizontal edge: no fill
+    CvEdge e;
+    const int64_t num = vfx[i] - vfx[j];                     // p1cx - p0cx
+    e.dx = num / (vy[i] - vy[j]);                            // C++ trunc-toward-zero div
+    if (vy[j] < vy[i]) { e.y0 = vy[j]; e.y1 = vy[i]; e.x = vfx[j]; }
+    else               { e.y0 = vy[i]; e.y1 = vy[j]; e.x = vfx[i]; }
+    edges.push_back(e);
   }
-  if (p2.size() < 3) return mask;
-  p2.push_back(p2.front());
-  int ymin = H, ymax = -1;
-  for (const auto& q : p2) {
-    if (q.second < ymin) ymin = q.second;
-    if (q.second > ymax) ymax = q.second;
-  }
-  if (ymin < 0) ymin = 0;
-  if (ymax > H - 1) ymax = H - 1;
-  for (int y = ymin; y <= ymax; ++y) {
-    std::vector<int> xs;
-    for (size_t i = 0; i + 1 < p2.size(); ++i) {
-      int y1 = p2[i].second, y2 = p2[i + 1].second;
-      int x1 = p2[i].first, x2 = p2[i + 1].first;
-      if ((y1 <= y && y2 > y) || (y2 <= y && y1 > y)) {
-        double xi = x1 + (static_cast<double>(y - y1) / (y2 - y1)) * (x2 - x1);
-        xs.push_back(static_cast<int>(std::lround(xi)));
+  if (edges.empty()) return mask;
+  std::sort(edges.begin(), edges.end(), [](const CvEdge& a, const CvEdge& b) {
+    if (a.y0 != b.y0) return a.y0 < b.y0;
+    if (a.x != b.x) return a.x < b.x;
+    return a.dx < b.dx;
+  });
+  const int total = static_cast<int>(edges.size());
+  int y_max_v = INT_MIN;
+  for (const auto& e : edges) y_max_v = std::max(y_max_v, e.y1);
+  if (y_max_v < 0) return mask;
+  y_max_v = std::min(y_max_v, H);
+  constexpr int64_t kDelta = ((int64_t)1 << 16) - 1;
+
+  // ---- FillEdgeCollection ----
+  // Active list: nodes indexed 1:1 by edge index (node never outlives its
+  // edge), kept as an explicit singly linked list through node_next[].
+  // kSent (-2) is the 'tmp' head sentinel; per the C++ original it is a
+  // real PolyEdge{x=0,dx=0} that gets mutated in draw steps, so we track
+  // sent_x/sent_dx separately.
+  constexpr int kSent = -2;
+  std::vector<int> node_next(total, -1);
+  int tmp_next = -1;
+  int64_t sent_x = 0, sent_dx = 0;
+  int ei = 0;
+  for (int y = edges.front().y0; y < y_max_v; ++y) {
+    bool clipline = y < 0;
+    int draw = 0;
+    int prelast = kSent;
+    int last = tmp_next;
+    while (last != -1 || (ei < total && edges[ei].y0 == y)) {
+      if (last != -1 && edges[last].y1 == y) {
+        // exclude edge
+        if (prelast == kSent) tmp_next = node_next[last];
+        else                  node_next[prelast] = node_next[last];
+        last = node_next[last];
+        continue;
       }
+      int keep_prelast = prelast;
+      if (last != -1 && (edges[ei].y0 > y || edges[last].x < edges[ei].x)) {
+        prelast = last;
+        last = node_next[last];
+      } else if (ei < total) {
+        int nn = ei++;
+        if (prelast == kSent) tmp_next = nn;
+        else                  node_next[prelast] = nn;
+        node_next[nn] = last;
+        prelast = nn;
+      } else {
+        break;
+      }
+      if (draw) {
+        if (!clipline) {
+          int64_t xa = keep_prelast == kSent ? sent_x : edges[keep_prelast].x;
+          int64_t xb = prelast == kSent ? sent_x : edges[prelast].x;
+          int x1, x2;
+          if (xa > xb) { x1 = (int)((xb + kDelta) >> 16); x2 = (int)(xa >> 16); }
+          else         { x1 = (int)((xa + kDelta) >> 16); x2 = (int)(xb >> 16); }
+          if (x1 < W && x2 >= 0) {
+            if (x1 < 0) x1 = 0;
+            if (x2 >= W) x2 = W - 1;
+            uint8_t* row = mask.data() + static_cast<size_t>(y) * W;
+            std::memset(row + x1, 1, static_cast<size_t>(x2 - x1 + 1));
+          }
+        }
+        if (keep_prelast != kSent) edges[keep_prelast].x += edges[keep_prelast].dx;
+        else                       sent_x += sent_dx;
+        if (prelast != kSent)      edges[prelast].x += edges[prelast].dx;
+        else                       sent_x += sent_dx;
+      }
+      draw ^= 1;
     }
-    if (xs.size() < 2) continue;
-    std::sort(xs.begin(), xs.end());
-    for (size_t k = 0; k + 1 < xs.size(); k += 2) {
-      int xa = xs[k];
-      int xb = xs[k + 1];
-      if (xa < 0) xa = 0;
-      if (xb > W - 1) xb = W - 1;
-      if (xa > xb) continue;
-      uint8_t* row = mask.data() + y * W;
-      std::memset(row + xa, 1, xb - xa + 1);
+    // bubble pass keeping active list ascending in x
+    bool inverted = true;
+    while (inverted) {
+      inverted = false;
+      int pl = kSent;
+      int l = tmp_next;
+      while (l != -1) {
+        int t = node_next[l];
+        if (t != -1 && edges[l].x > edges[t].x) {
+          inverted = true;
+          int ln = node_next[t];
+          if (pl == kSent) tmp_next = t;
+          else             node_next[pl] = t;
+          node_next[t] = l;
+          node_next[l] = ln;
+          pl = t;
+        } else {
+          pl = l;
+        }
+        l = t;
+      }
     }
   }
   return mask;
@@ -442,20 +550,33 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     float sside = std::min({w1, w2, h1, h2});
     if (sside < static_cast<float>(cfg.min_size + 2)) continue;
 
-    // Map bitmap coords -> original image coords. Paddle: x = round(bx / W *
-    // dest_w); y = round(by / H * dest_h). ratio_w = dest_w / W, ratio_h =
-    // dest_h / H, so equivalently bx * ratio_w, by * ratio_h.
+    // Map bitmap coords -> original image coords, VERBATIM Paddle:
+    //   boxes[:, 0] = (boxes[:, 0] * (dst_w / W)).round()  [clip 0..dst_w-1]
+    //   where the division happens first in float64, and np.round is
+    //   half-to-EVEN. Matching this exactly removes a systematic
+    //   +/-1px discrepancy on some boxes (half-away rounding + float32
+    //   premultiply vs float64 divide-then-round-even).
     DetBox db;
     for (int k = 0; k < 4; ++k) {
-      float ox = final_box[k].x * ratio_w;
-      float oy = final_box[k].y * ratio_h;
-      // Clip to [0, src].
-      if (ox < 0.0f) ox = 0.0f;
-      if (oy < 0.0f) oy = 0.0f;
-      if (ox > src_w - 1) ox = static_cast<float>(src_w - 1);
-      if (oy > src_h - 1) oy = static_cast<float>(src_h - 1);
-      db.poly[k * 2 + 0] = std::round(ox);
-      db.poly[k * 2 + 1] = std::round(oy);
+      auto map_axis = [&](double bxy, int bitmap_len,
+                          int dst_len) -> double {
+        double scaled = bxy * dst_len / bitmap_len;
+        // np.round: round-half-to-even on .5 boundaries
+        double fl = std::floor(scaled);
+        double frac = scaled - fl;
+        double r;
+        if (frac > 0.5)
+          r = fl + 1.0;
+        else if (frac < 0.5)
+          r = fl;
+        else
+          r = (std::fmod(fl, 2.0) == 0.0) ? fl : fl + 1.0;
+        return std::min(std::max(r, 0.0), static_cast<double>(dst_len - 1));
+      };
+      db.poly[k * 2 + 0] = static_cast<float>(
+          map_axis(static_cast<double>(final_box[k].x), prob_w, src_w));
+      db.poly[k * 2 + 1] = static_cast<float>(
+          map_axis(static_cast<double>(final_box[k].y), prob_h, src_h));
     }
     db.score = score;
     out.push_back(db);

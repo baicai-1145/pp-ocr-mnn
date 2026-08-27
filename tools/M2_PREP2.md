@@ -69,6 +69,59 @@ Table A (hybrid-paddle baseline vs legacy PaddleX baseline) dropped to
 zh 0.0167 — det boxes now align much better between reference systems;
 but Table B (our CLI vs new baseline) barely moved.
 
+## DB-post same-prob A/B (added after decision-maker audit)
+
+The bit-exact attribution above had one uncontrolled variable: the
+baseline generator's Python DB post (cv2.findContours+pyclipper) had
+never been compared against our C++ db_post ON THE SAME PROB MAP
+(the ja/05 decisive experiment used C++ db_post on both sides).
+
+Setup: paddle-direct prob maps for zh 03..09/zh_01..03 + ja 00..02
+(13 imgs, 865 boxes total), both postprocessors on identical maps,
+per-box greedy matching.
+
+Findings, in order of discovery:
+1. **DET ratio direction bug (fixed, commit d0e5d4f-series).** prep_det
+   stores ratio=resize/src (PaddleX convention), db_postprocess expects
+   src/prob; the call site propagated the former. Any non-identity det
+   resize got systematically mis-scaled boxes (zh_04 vertical ~x0.956).
+   Now computed explicitly as src/probW, src/probH at the call site.
+2. **fill_polygon_mask rewritten as a mechanical port of OpenCV's
+   fillPoly** (CollectPolyEdges LINE_8 Bresenham outline stroke + 16.16
+   fixed-point FillEdgeCollection even-odd spans, including the tmp-
+   sentinel mutation quirk and trunc-toward-zero dx division). Vertex
+   input semantics: numpy astype(np.int32) truncation, exactly what
+   box_score_fast feeds. Verified in a Python prototype to reproduce
+   cv2.fillPoly masks for 232/231+ boxes with residual single-pixel
+   corner diffs from OpenCV's own out-of-bounds read UB.
+3. **Tail mapping made verbatim Paddle**: boxes_scaled =
+   bitmap_xy * dst/bitmap in float64 THEN np.round (half-to-even) +
+   clip to [0,dst-1]; replaced float32-premultiplied half-away rounding.
+
+Result after fixes: every PAIRED box matches coordinates bit-exactly
+(maxPolyErr=0.0000) and scores to 5e-7..2e-3. End-to-end pilot MLC
+(baseline vs our CLI) improved decisively:
+
+| lang | before | after |
+|---|---|---|
+| zh | 0.102 | **0.062** |
+| en | 0.076 | 0.111* |
+| ja | 0.456 | **0.153** |
+
+(*en regressed; driven by dense-img frame-count drift en/01 4v3,
+en/04 11v7, en/06 3v2 - see item 4.)
+
+4. Remaining mechanism (CONFIRMED, not yet closed): the generator's
+   funnel is cv2.findContours(RETR_LIST, CHAIN_APPROX_SIMPLE) - all
+   borders INCLUDING HOLE borders are independent candidates - while
+   our connectivity pass traces only external borders. Hole-contours
+   survive sside/box_thresh filters as extra real-text detections
+   (en_04: py keeps 11 of 55 raw contours, we emit 7; paired-box score
+   differences at this stage are already at bit level 8.9e-08). The
+   proper fix is a Suzuki-Abe RETR_LIST border tracer in db_post.cpp;
+   prototype exists (tools/cvfill/suzuki prototypes), port deferred so
+   the finale is not blocked.
+
 ## Attribution experiment: bit-exact vs ±1LSB end-to-end
 
 Question: does the resize SIMD tail-band ±1LSB residue drive the pilot
@@ -116,6 +169,15 @@ a physical floor between two official-quality kernels, corroborated by
 the ref-vs-ref calibration (paddle.inference vs PaddleX already exceed
 the gate on ja: MLC 0.179). Recorded as FINAL for the whitepaper;
 no further prep-side work can move it.
+
+UPDATE (post DB-A/B): items 1-3 of the DB-post section above moved ja
+from 0.456 → 0.153 and zh 0.102 → 0.062 WITHOUT any kernel-side change,
+proving a large share of the previously "kernel-noise" gap was in fact
+prep-layer divergence. The bit-exact-inputs conclusion is superseded:
+Group A results must be re-measured after the RETR_LIST hole-contour
+closure; until then the pilot band attribution stands at
+"kernel noise + remaining DB-border-tracer divergence", with the DB
+component dominant on dense scripts.
 
 ## Conclusion
 
