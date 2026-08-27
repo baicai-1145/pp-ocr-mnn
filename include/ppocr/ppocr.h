@@ -60,7 +60,7 @@ typedef struct ppocr_config {
   const char* mirror;         // download base URL (default env PPORC_MNN_MIRROR)
   ppocr_backend backend;
   int num_threads;            // CPU threads (0 = auto)
-  int rec_batch;              // rec batch size (0 = 8)
+  int rec_batch;              // rec batch size (0 = 16, M3-PERF4 sweet spot)
   int max_side;               // det max side limit (0 = from model config)
   int offline;                // 1 = never download, fail if missing
   int download;               // 0 = disable auto-download (default 1)
@@ -71,6 +71,12 @@ typedef struct ppocr_config {
   int profile;                // M3-PERF1: 1 = collect per-stage timings,
                               // readable via ppocr_last_profile(). 0 = off
                               // (default; zero instrumentation cost).
+  int warmup;                 // M3-PERF4: 1 = at ppocr_create, run one
+                              // dummy det/rec/cls inference so the first
+                              // real image skips the one-time backend init
+                              // (~15ms cutlass select + workspace alloc on
+                              // CUDA). 0 (default, matches {} zero-init) =
+                              // skip; the CLI passes 1 unless --no-warmup.
 } ppocr_config;
 
 // ---- results ---------------------------------------------------------------

@@ -99,9 +99,27 @@ void MnnSession::load(const std::string& model_path,
   if (cfg.num_threads > 0) {
     sc.numThread = cfg.num_threads;
   }
-  // power / precision / memory are passed through via MNN's options.
-  // (MNN 2.9 ignores out-of-range values, so we keep the defaults when
-  // the caller didn't request a low-power / fp16-everywhere path.)
+  // power / memory / precision stay at MNN defaults (Normal).
+  // M3-PERF2 finding: BackendConfig precision High/Low was A/B'd on
+  // CUDA (A10G, MNN 3.6.1 cutlass) — both SLOWER than Normal (det
+  // 27.0/21.8 vs 16.9 ms) and Low garbled text ('QUEEN VICTORIA ST'
+  // -> 'QUE!ICOIAS'). Passthrough code removed; do not re-add without
+  // a cudnn-enabled MNN build. (Also note: ScheduleConfig::
+  // backendConfig is a borrowed pointer that must outlive the
+  // session — stack-allocating it segfaults in
+  // CUDARuntimeCreator::onCreate.)
+  // M3-PERF5 A/B: PPOCR_MNN_SESSION_MODE env (release|debug, default release
+  // semantics only if set; unset = MNN defaults, no behavior change).
+  const char* smode = getenv("PPOCR_MNN_SESSION_MODE");
+  if (smode && strstr(smode, "debug")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Debug);
+  } else if (smode && strstr(smode, "release")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Release);
+  } else if (smode && strstr(smode, "backend_auto")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Backend_Auto);
+  } else if (smode && strstr(smode, "mem_collect")) {
+    impl_->interp->setSessionMode(MNN::Interpreter::Session_Memory_Collect);
+  }
   impl_->session = impl_->interp->createSession(sc);
   if (!impl_->session) {
     throw std::runtime_error("MnnSession: createSession failed");
