@@ -22,6 +22,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -51,6 +55,7 @@ struct Args {
   std::string batch_dir;         // --batch-dir DIR: process all images in DIR
   int workers = 2;               // --workers N: engine-per-worker (default 2)
   int warmup = 1;                // M3-PERF4: dummy inference at create
+  int pin_offset = 0;            // M3-PERF6: cores per worker for --batch-dir
 };
 
 void usage() {
@@ -59,7 +64,8 @@ void usage() {
     "          [--model-dir DIR] [--backend auto|cpu|cuda|opencl|vulkan]\n"
     "          [--threads N] [--batch N] [--det-only] [--json OUT] [--time]\n"
     "          [--profile]  # M3-PERF1: add per-stage ms to the JSON output\n"
-    "          [--batch-dir DIR] [--workers N]  # M3-PERF3: engine-per-worker batch mode\n");
+    "          [--batch-dir DIR] [--workers N]  # M3-PERF3: engine-per-worker batch mode\n"
+    "          [--pin-offset N]  # M3-PERF6: pin each worker to N CPUs (taskset-style)\n");
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -87,6 +93,7 @@ bool parse_args(int argc, char** argv, Args& a) {
   else if (k == "--batch-dir")     { auto v = need("--batch-dir");     if (!v) return false; a.batch_dir = v; }
   else if (k == "--workers")       { auto v = need("--workers");       if (!v) return false; a.workers = std::atoi(v); }
   else if (k == "--no-warmup")     { a.warmup = 0; }
+    else if (k == "--pin-offset")   { auto v = need("--pin-offset");   if (!v) return false; a.pin_offset = std::atoi(v); }
     else if (k == "-h" || k == "--help") { a.help = 1; return true; }
     else {
       std::fprintf(stderr, "unknown flag: %s\n", k.c_str());
@@ -273,7 +280,24 @@ int run_batch(const Args& a) {
   }
   std::atomic<size_t> next{0};
   std::atomic<int> failures{0};
-  auto worker_main = [&](int) {
+  auto worker_main = [&](int wid) {
+    // M3-PERF6: --pin-offset N — pin this worker to N consecutive CPUs
+    // starting at (wid*N) % ncpu (taskset semantics, no exec). Keeps
+    // batch workers on disjoint core sets. 0 = off (default).
+    if (a.pin_offset > 0) {
+      const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
+      if (ncpu > 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        const int base = (wid * a.pin_offset) % ncpu;
+        for (int i = 0; i < a.pin_offset; ++i) {
+          CPU_SET((base + i) % ncpu, &set);
+        }
+        if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+          // non-fatal: best-effort pinning
+        }
+      }
+    }
     ppocr_engine* eng = make_engine();
     if (!eng) { failures.fetch_add(1); return; }
     // Per-worker string scratch: write_result needs FILE*; use open_memstream.
