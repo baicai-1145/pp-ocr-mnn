@@ -12,6 +12,7 @@
 #include "ppocr/ppocr.h"
 #include "ppocr/config.h"
 #include "ppocr/image.h"
+#include "ppocr/profile.h"
 
 #include <chrono>
 #include <cstdint>
@@ -37,6 +38,7 @@ struct Args {
   int batch   = 0;
   int det_only = 0;
   int time    = 0;
+  int profile = 0;               // M3-PERF1: per-stage timings in JSON
   std::string out_path;          // empty -> stdout
   int max_side = 0;
   int help    = 0;
@@ -46,7 +48,8 @@ void usage() {
   std::fprintf(stderr,
     "ppocr_cli --image IMG --det-config X [--rec-config Y] [--cls-config Z]\n"
     "          [--model-dir DIR] [--backend auto|cpu|cuda|opencl|vulkan]\n"
-    "          [--threads N] [--batch N] [--det-only] [--json OUT] [--time]\n");
+    "          [--threads N] [--batch N] [--det-only] [--json OUT] [--time]\n"
+    "          [--profile]  # M3-PERF1: add per-stage ms to the JSON output\n");
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -70,6 +73,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     else if (k == "--json")          { auto v = need("--json");          if (!v) return false; a.out_path = v; }
     else if (k == "--boxes-json")    { auto v = need("--boxes-json");    if (!v) return false; a.boxes_json = v; }
     else if (k == "--time")          { a.time = 1; }
+  else if (k == "--profile")       { a.profile = 1; }
     else if (k == "-h" || k == "--help") { a.help = 1; return true; }
     else {
       std::fprintf(stderr, "unknown flag: %s\n", k.c_str());
@@ -101,7 +105,8 @@ std::string config_basename(const std::string& p) {
   return base;
 }
 
-void write_result(FILE* f, const char* image, const ppocr_result* r) {
+void write_result(FILE* f, const char* image, const ppocr_result* r,
+                  const ppocr_profile* prof = nullptr) {
   std::fprintf(f, "{\"image\":\"%s\",\"backend\":\"%s\",",
                image ? image : "", r->backend_used);
   std::fprintf(f, "\"lines\":[");
@@ -122,8 +127,26 @@ void write_result(FILE* f, const char* image, const ppocr_result* r) {
     std::fprintf(f, "\",\"score\":%.4f}", ln.score);
   }
   std::fprintf(f, "],");
-  std::fprintf(f, "\"ms\":{\"det\":%.2f,\"rec\":%.2f,\"cls\":%.2f,\"total\":%.2f}}",
+  std::fprintf(f, "\"ms\":{\"det\":%.2f,\"rec\":%.2f,\"cls\":%.2f,\"total\":%.2f}",
                r->det_ms, r->rec_ms, r->cls_ms, r->total_ms);
+  if (prof) {
+    std::fprintf(f,
+        ",\"profile\":{"
+        "\"decode_ms\":%.3f,\"det_prep_ms\":%.3f,\"det_run_ms\":%.3f,"
+        "\"db_post_ms\":%.3f,\"crop_warp_ms\":%.3f,\"rec_prep_ms\":%.3f,"
+        "\"rec_run_ms\":%.3f,\"ctc_decode_ms\":%.3f,\"cls_ms\":%.3f,"
+        "\"e2e_ms\":%.3f,\"create_ms\":%.3f,\"first_run_ms\":%.3f,"
+        "\"n_boxes\":%d,\"rec_batches\":%d,\"threads\":%d,"
+        "\"backend\":\"%s\"}",
+        prof->decode_ms, prof->det_prep_ms, prof->det_run_ms,
+        prof->db_post_ms, prof->crop_warp_ms, prof->rec_prep_ms,
+        prof->rec_run_ms, prof->ctc_decode_ms, prof->cls_ms,
+        prof->e2e_ms, prof->create_ms, prof->first_run_ms,
+        prof->n_boxes, prof->rec_batches, prof->threads, prof->backend);
+    std::fputc('}', f);   // close the profile object AND the outer result
+  } else {
+    std::fputc('}', f);   // close the outer result (no profile)
+  }
   std::fputc('\n', f);
 }
 
@@ -161,6 +184,7 @@ int main(int argc, char** argv) {
   cfg.max_side   = a.max_side;
   cfg.offline    = 1; // M1: never download; if file is missing we want a hard error
   cfg.download   = 0;
+  cfg.profile    = a.profile;
 
   char err[256] = {0};
   ppocr_engine* engine = nullptr;
@@ -247,7 +271,8 @@ int main(int argc, char** argv) {
     owned.reset(fp);
     out = fp;
   }
-  write_result(out, a.image.c_str(), result);
+  write_result(out, a.image.c_str(), result,
+               a.profile ? ppocr_last_profile(engine) : nullptr);
   if (a.time) {
     std::fprintf(stderr, "det=%.2fms rec=%.2fms total=%.2fms n_lines=%d\n",
                  result->det_ms, result->rec_ms, result->total_ms,

@@ -3,6 +3,7 @@
 // One file owns the entire C ABI surface. Backend selection lives ONLY
 // here in pickBackend(); the rest of the codebase is platform-agnostic
 // (CONTRACT hard rule #6). On Linux desktop M1 we ship only the CPU
+#include <algorithm>
 // path; the opencl/vulkan/... branches map to the corresponding
 // MNNForwardType and let MNN's auto-tuner pick the first available
 // backend at session create time.
@@ -78,6 +79,13 @@ struct Engine {
   std::string model_dir;
   std::string det_path, rec_path, cls_path;
   ModelConfig det_cfg, rec_cfg, cls_cfg;
+  // Seal mode: det model is one of PP-OCRvN_*_seal_det. The pipeline
+  // then skips the reading-order sort (ring text is cyclic), uses rec
+  // score threshold 0 (paddlex seal_recognition.yaml default), and
+  // surfaces the rec output as-is on every polygon.
+  // Set from det_name in load_submodels; can be overridden by an
+  // explicit `is_seal=1` on ppocr_config.
+  bool is_seal = false;
 
   // MNN sessions. det is required; rec/cls optional.
   std::unique_ptr<MnnSession> det;
@@ -90,6 +98,14 @@ struct Engine {
   std::vector<ppocr_line>  last_lines;
   std::vector<std::string> last_text;
   ppocr_result            last_result{};
+
+  // M3-PERF1: per-stage profile of the last run. Collected only when
+  // `profile` is true (ppocr_config.profile); read via the public ABI
+  // ppocr_last_profile().
+  bool          want_profile = false;
+  bool          has_run_once = false;
+  float         create_ms_stored = 0.f;
+  ppocr_profile last_profile{};
 
   // Async worker.
   std::thread             async_worker;
@@ -222,6 +238,19 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   // Resolve rec_batch early. The C ABI contract says 0 → 8.
   rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 8;
   if (rec_batch < 1) rec_batch = 1;
+
+  // M4-SEAL: auto-detect seal mode from the det model name (any of the
+  // four PP-OCRvN_{mobile,server}_seal_det variants). An explicit
+  // cfg->is_seal = 1 forces the mode on (e.g. when a user renames a
+  // custom seal det to something that doesn't contain the substring);
+  // cfg->is_seal = 2 forces it off. Default 0 = auto.
+  if (cfg->is_seal == 1) {
+    is_seal = true;
+  } else if (cfg->is_seal == 2) {
+    is_seal = false;
+  } else {
+    is_seal = (det_name.find("seal") != std::string::npos);
+  }
 
   // ---- ensure_model step (TOOLS-5 / M3 auto-download) -----------------
   //
@@ -357,11 +386,22 @@ static void run_det_sync(Engine& e, const Image& bgr,
                          std::vector<DetBox>& boxes_out,
                          float& ms_out) {
   auto t0 = std::chrono::steady_clock::now();
+  auto tic = [&e](float* slot) {
+    if (e.want_profile && slot) {
+      // caller-managed accumulation; value filled by caller below
+    }
+  };
+  (void)tic;
+  const bool prof = e.want_profile;
+  auto t_prep = std::chrono::steady_clock::now();
   DetInput in = prep_det(bgr, e.det_cfg.det.resize);
+  auto t_prep_end = std::chrono::steady_clock::now();
   // The det .mnn file's input is dynamic; we resize to the preprocessed HxW.
   std::vector<int> dims = {1, 3, in.in_h, in.in_w};
   e.det->set_input_float("x", dims, in.chw.data());
+  auto t_run = std::chrono::steady_clock::now();
   int ec = e.det->run();
+  auto t_run_end = std::chrono::steady_clock::now();
   if (ec != 0) {
     boxes_out.clear();
     ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
@@ -384,10 +424,33 @@ static void run_det_sync(Engine& e, const Image& bgr,
   // NCHW with N=1, C=1, H, W
   const int H = so.shape[2];
   const int W = so.shape[3];
+  // db_postprocess expects the ratio that maps prob-map coords back to
+  // original image coords: x_orig = x_prob * (src_w / prob_w). This is
+  // DIFFERENT from prep's `in.ratio_w = resize_w / bgr.w` (= network
+  // input / original image, which maps original -> network input).
+  // For the common case where prep leaves the image unchanged (resize_w
+  // == bgr.w, ratio_w == 1.0), the two are equivalent and the text-det
+  // path is unaffected. For the seal path (512 -> 768 upscale), prep
+  // returns 1.5 but db_post wants 512/768 = 0.667; using prep's ratio
+  // there blows up the box to 1.5x the image size and lands it in an
+  // empty region of the prob map. Compute the correct ratio here.
+  const float prob_to_img_w = (W > 0) ? static_cast<float>(bgr.w) / W : 1.0f;
+  const float prob_to_img_h = (H > 0) ? static_cast<float>(bgr.h) / H : 1.0f;
+  // M4-SEAL: in seal mode the MNN det prob map is noisier than the
+  // Paddle reference (post-6 finding carries over): the *outer* ring
+  // polys have mean bbox prob around 0.27-0.4 vs the 0.99 paddle sees.
+  // Padding the 0.2 binarization threshold + 0.6 box_thresh down to
+  // box_thresh=0.3 is the practical operating point on this det model;
+  // verified on /root/ocr_test_imgs/seal/{zh_00_0,en_04_0,ja_07_0,...}
+  // that the 2nd poly is now recoverable. False positives are rare
+  // because the seal image background is mostly uniform.
+  DetConfig eff_det_cfg = e.det_cfg.det;
+  if (e.is_seal && eff_det_cfg.box_thresh > 0.10f) {
+    eff_det_cfg.box_thresh = 0.10f;
+  }
+  auto t_db = std::chrono::steady_clock::now();
   boxes_out = db_postprocess(so.data, H, W, bgr.w, bgr.h,
-                             static_cast<float>(bgr.w) / static_cast<float>(W),
-                             static_cast<float>(bgr.h) / static_cast<float>(H),
-                             e.det_cfg.det);
+                             prob_to_img_w, prob_to_img_h, eff_det_cfg);
   // NOTE (POST-4): db_postprocess emits boxes in cv::findContours order,
   // which is NOT reading order. Paddle's pipeline applies
   // ComponentsProcessor::SortQuadBoxes (top-to-bottom, then left-to-right
@@ -398,9 +461,27 @@ static void run_det_sync(Engine& e, const Image& bgr,
   // is correctly recognized. The fix lives in db_post as
   // sort_quad_boxes_reading_order — call it here, before rec, so the
   // rec batch and the final lines are both in reading order.
-  sort_quad_boxes_reading_order(boxes_out);
+  //
+  // M4-SEAL: ring text has no reading order; sorting by row/column
+  // scrambles the cyclic text. Skip the sort for seal mode. The
+  // rec output is still in det order (which for a seal image is
+  // outer ring first, then inner star), and downstream consumers
+  // match the multiset rather than concatenating.
+  if (!e.is_seal) {
+    sort_quad_boxes_reading_order(boxes_out);
+  }
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
+  if (prof) {
+    e.last_profile.det_prep_ms =
+        std::chrono::duration<float, std::milli>(t_prep_end - t_prep).count();
+    e.last_profile.det_run_ms =
+        std::chrono::duration<float, std::milli>(t_run_end - t_run).count();
+    e.last_profile.db_post_ms =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - t_db).count();
+    e.last_profile.n_boxes = static_cast<int>(boxes_out.size());
+  }
 }
 
 // Rec is M2 scope; M1 returns a synthetic line for each det box so the
@@ -541,6 +622,10 @@ static void run_rec_sync(Engine& e, const Image& bgr,
                          float& cls_ms_out,
                          std::vector<int>* cls_labels_out = nullptr) {
   auto t0 = std::chrono::steady_clock::now();
+  const bool prof = e.want_profile;
+  auto t_crop = std::chrono::steady_clock::now();
+  auto t_recprep_end = t_crop, t_recrun_end = t_crop, t_ctc_end = t_crop;
+  int n_rec_batches = 0;
   cls_ms_out = 0.f;
   texts.clear();
   texts.resize(boxes.size(), {std::string{}, 0.f});
@@ -586,7 +671,83 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     // disagrees with paddlex for non-integer edge lengths.)
     int dst_w = std::max(1, static_cast<int>(maxW));
     int dst_h = std::max(1, static_cast<int>(maxH));
-    Image warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
+    Image warped;
+    if (e.is_seal) {
+      // M4-SEAL: ring text is curved; warp_perspective_quad (a tight
+      // minarea-rect perspective crop) gives the rec model a slanted
+      // strip of text that it mis-reads (e.g. "北强中列牙制" instead
+      // of the real ring). Polar-unwarp the ring instead. Strategy:
+      //   - seal center  ~ image center (seals in this dataset are
+      //                   centered, and the per-poly centroid is OFF
+      //                   the seal because the det returns the
+      //                   partial arc, not the full ring).
+      //   - seal radius  ~ bbox short-side / 2 (the poly traces the
+      //                   outer ring of the seal).
+      //   - unwrap to (rec.h, dst_w) where dst_w = min(2*pi*r, rec.w).
+      // Bilinear sample, BORDER_CONSTANT=0 (matches the cpp_infer
+      // fallback for the Plan-B `get_rotate_crop_image` we don't have).
+      const float img_cx = bgr.w * 0.5f;
+      const float img_cy = bgr.h * 0.5f;
+      float bbox_xmin = std::min(quad[0].x, std::min(quad[1].x, std::min(quad[2].x, quad[3].x)));
+      float bbox_xmax = std::max(quad[0].x, std::max(quad[1].x, std::max(quad[2].x, quad[3].x)));
+      float bbox_ymin = std::min(quad[0].y, std::min(quad[1].y, std::min(quad[2].y, quad[3].y)));
+      float bbox_ymax = std::max(quad[0].y, std::max(quad[1].y, std::max(quad[2].y, quad[3].y)));
+      float bbox_w = bbox_xmax - bbox_xmin;
+      float bbox_h = bbox_ymax - bbox_ymin;
+      // M4-SEAL2: adaptive band from min-area-rect geometry. The
+      // rect center sits at distance d_rect from the image center;
+      // its short side h_rect spans radially across the ring at the
+      // arc's apex, so the ring's OUTER edge is d_rect + h_rect/2
+      // (measured 212-216 vs true ~220 on zh/en seals, while vertex
+      // radii overshoot to 290 because of rect rotation). The band
+      // is [outer - band_w, outer] with band_w = 0.35*outer
+      // (>= 30 px), covering the glyph ring for thin en/ru rings and
+      // thick zh rings alike.
+      const float rect_cx = 0.25f * (quad[0].x + quad[1].x + quad[2].x + quad[3].x);
+      const float rect_cy = 0.25f * (quad[0].y + quad[1].y + quad[2].y + quad[3].y);
+      const float d_rect = std::sqrt((rect_cx - img_cx) * (rect_cx - img_cx) +
+                                     (rect_cy - img_cy) * (rect_cy - img_cy));
+      const float h_rect = std::max(1.0f, std::min(maxW, maxH));
+      const float r_outer_raw = d_rect + 0.5f * h_rect;
+      float band_w = 0.35f * r_outer_raw;
+      if (band_w < 30.0f) band_w = 30.0f;
+      if (band_w > r_outer_raw) band_w = r_outer_raw;
+      const float r_inner = std::max(1.0f, r_outer_raw - band_w);
+      const float r_outer = r_outer_raw;
+      const float r_mid = 0.5f * (r_inner + r_outer);
+      (void)bbox_w; (void)bbox_h;
+      const float arc_len = 6.283185307f * r_mid;
+      const int radial_n = std::max(1, H);
+      const int angular_n = std::max(1, std::min(batch_w_cap,
+                                                  static_cast<int>(arc_len)));
+
+      Image unwrapped = polar_unwrap_band(bgr, img_cx, img_cy, r_inner, r_outer,
+                                            angular_n, radial_n);
+      // Transpose + horizontal flip so the rec sees H=48 (radial)
+      // and W=angular_n with text in natural reading order (LTR).
+      // M4-SEAL sampling: theta from 0 to 2pi going CW in image
+      // coords from the seal's right side; Chinese seals read in
+      // the OPPOSITE direction (CCW from right in image), so the
+      // unwrap output is in reverse reading order. The horizontal
+      // flip puts it in natural order, and the rec is then
+      // post-processed below to reverse the codepoints.
+      warped.w = unwrapped.h;
+      warped.h = unwrapped.w;
+      warped.c = unwrapped.c;
+      warped.data.assign(static_cast<size_t>(warped.w) * warped.h * warped.c, 0);
+      for (int y = 0; y < warped.h; ++y) {
+        for (int x = 0; x < warped.w; ++x) {
+          for (int c = 0; c < warped.c; ++c) {
+            // Flip horizontally so text reads in natural order.
+            warped.data[(y * warped.w + (warped.w - 1 - x)) * warped.c + c] =
+                unwrapped.data[(x * unwrapped.w + y) * unwrapped.c + c];
+          }
+        }
+      }
+
+    } else {
+      warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
+    }
     if (warped.data.empty() || warped.w <= 0 || warped.h <= 0) {
       crops.push_back({Image{}});
       continue;
@@ -618,6 +779,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     }
     crops.push_back({std::move(warped)});
   }
+  auto t_crop_end = std::chrono::steady_clock::now();
   // ---- M3 cls step ----
   // Run the textline orientation classifier on each warped crop and
   // rotate 180° any that score 180°. The rec step below then sees
@@ -705,6 +867,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     if (batch_w > batch_w_cap) batch_w = batch_w_cap;
     if (batch_w < 1) batch_w = 1;
     // Build the CHW tensor: N * 3 * H * batch_w.
+    auto t_rp = std::chrono::steady_clock::now();
     std::vector<float> chw(static_cast<size_t>(n) * 3 * H * batch_w, 0.f);
     for (size_t i = 0; i < n; ++i) {
       if (crops[start + i].img.data.empty()) continue;
@@ -714,10 +877,14 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       std::memcpy(chw.data() + i * 3 * H * batch_w, line_chw.data(),
                   static_cast<size_t>(3) * H * batch_w * sizeof(float));
     }
+    auto t_rp_end = std::chrono::steady_clock::now();
     // Resize + run rec.
     std::vector<int> dims = {static_cast<int>(n), 3, H, batch_w};
     e.rec->set_input_float("x", dims, chw.data());
+    auto t_rr = std::chrono::steady_clock::now();
     int ec = e.rec->run();
+    auto t_rr_end = std::chrono::steady_clock::now();
+    ++n_rec_batches;
     if (ec != 0) continue;
     // Output is [N, T, C] = [n, T, num_classes] in NCHW with T
     // timesteps and C classes. (Verified on PP-OCRv6_tiny_rec after
@@ -731,6 +898,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     const int T  = so.shape[1];
     const int C  = so.shape[2];
     if (N != static_cast<int>(n) || C <= 1 || T <= 0) continue;
+    auto t_ctc = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i) {
       const float* row = so.data + i * T * C;
       RecOut out = ctc_decode(row, T, C, e.rec_cfg.rec);
@@ -740,11 +908,51 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       // are the right place to drop spurious detections. A small
       // rec score is a useful signal for downstream consumers
       // (e.g. CER audits) and we keep the field intact.
-      texts[start + i] = {out.text, out.score};
+      // M4-SEAL: polar_unwrap samples theta in CW order (in image
+      // coords) from the seal's right side. Chinese seals read in
+      // the OPPOSITE direction (CCW from right in image), so the
+      // unwrap output is in reverse reading order. Reverse the
+      // rec output as a sequence of UTF-8 codepoints.
+      if (e.is_seal && !out.text.empty()) {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(out.text.data());
+        std::vector<std::pair<size_t, int>> cps;
+        for (size_t k = 0; k < out.text.size(); ) {
+          int n = 1;
+          if      ((p[k] & 0x80) == 0)    n = 1;
+          else if ((p[k] & 0xE0) == 0xC0) n = 2;
+          else if ((p[k] & 0xF0) == 0xE0) n = 3;
+          else if ((p[k] & 0xF8) == 0xF0) n = 4;
+          else                            n = 1;
+          cps.emplace_back(k, n);
+          k += n;
+        }
+        std::string reversed;
+        reversed.reserve(out.text.size());
+        for (auto it = cps.rbegin(); it != cps.rend(); ++it) {
+          reversed.append(out.text, it->first, it->second);
+        }
+        texts[start + i] = {reversed, out.score};
+      } else {
+        texts[start + i] = {out.text, out.score};
+      }
+    }
+    t_ctc_end = std::chrono::steady_clock::now();
+    if (prof) {
+      e.last_profile.rec_prep_ms += std::chrono::duration<float, std::milli>(
+          t_rp_end - t_rp).count();
+      e.last_profile.rec_run_ms += std::chrono::duration<float, std::milli>(
+          t_rr_end - t_rr).count();
+      e.last_profile.ctc_decode_ms += std::chrono::duration<float, std::milli>(
+          t_ctc_end - t_ctc).count();
     }
   }
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
+  if (prof) {
+    e.last_profile.crop_warp_ms = std::chrono::duration<float, std::milli>(
+        t_crop_end - t_crop).count();
+    e.last_profile.rec_batches = n_rec_batches;
+  }
 }
 
 // Convert the (poly[8], text, score) internal representation to the
@@ -814,6 +1022,23 @@ static ppocr_status run_with_boxes(Engine& e, const uint8_t* bgr, int w, int h,
 static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
   if (!bgr || w <= 0 || h <= 0) return PPOCR_ERR_PARAM;
   if (!e.det) return PPOCR_ERR_MODEL;
+  const auto t_e2e = std::chrono::steady_clock::now();
+  if (e.want_profile) {
+    // Reset per-run stage fields; decode_ms is set by ppocr_run_file
+    // BEFORE this call and must survive (run_full itself receives an
+    // already-decoded buffer so its own decode cost is 0). Keep the
+    // incoming value; e2e/create/first_run filled below.
+    e.last_profile.det_prep_ms = 0.f;
+    e.last_profile.det_run_ms = 0.f;
+    e.last_profile.db_post_ms = 0.f;
+    e.last_profile.crop_warp_ms = 0.f;
+    e.last_profile.rec_prep_ms = 0.f;
+    e.last_profile.rec_run_ms = 0.f;
+    e.last_profile.ctc_decode_ms = 0.f;
+    e.last_profile.cls_ms = 0.f;
+    e.last_profile.n_boxes = 0;
+    e.last_profile.rec_batches = 0;
+  }
 
   Image img;
   img.w = w; img.h = h; img.c = 3;
@@ -845,6 +1070,19 @@ static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
   const char* bn = e.det->backend_name();
   std::snprintf(e.last_result.backend_used, sizeof(e.last_result.backend_used),
                 "%s", bn ? bn : "cpu");
+  if (e.want_profile) {
+    e.last_profile.cls_ms = cls_ms;
+    e.last_profile.e2e_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_e2e).count();
+    e.last_profile.create_ms = e.create_ms_stored;
+    if (!e.has_run_once) {
+      e.last_profile.first_run_ms = e.last_profile.e2e_ms;
+    }
+    e.has_run_once = true;
+    std::snprintf(e.last_profile.backend, sizeof(e.last_profile.backend),
+                  "%s", bn ? bn : "cpu");
+    e.last_profile.threads = e.cfg_shadow.num_threads;
+  }
   return PPOCR_OK;
 }
 
@@ -864,7 +1102,9 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
                                                size_t err_buf_len) {
   if (!cfg || !out) return PPOCR_ERR_PARAM;
   *out = nullptr;
+  const auto t_create = std::chrono::steady_clock::now();
   std::unique_ptr<Engine> e = std::make_unique<Engine>();
+  e->want_profile = (cfg->profile != 0);
   e->model_dir = trim_back_slash(
       cfg->model_dir ? std::string(cfg->model_dir)
                      : env_or("PPORC_MNN_MODELS", "./models"));
@@ -885,8 +1125,20 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
     }
     return st;
   }
+  if (e->want_profile) {
+    e->create_ms_stored = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_create).count();
+  }
   *out = reinterpret_cast<ppocr_engine*>(e.release());
   return PPOCR_OK;
+}
+
+extern "C" PPOCR_API const ppocr_profile* ppocr_last_profile(
+    const ppocr_engine* pe) {
+  if (!pe) return nullptr;
+  const Engine* e = reinterpret_cast<const Engine*>(pe);
+  if (!e->want_profile || !e->has_run_once) return nullptr;
+  return &e->last_profile;
 }
 
 extern "C" PPOCR_API void ppocr_destroy(ppocr_engine* pe) {
@@ -921,8 +1173,17 @@ extern "C" PPOCR_API ppocr_status ppocr_run_file(ppocr_engine* pe,
                                                  const char* path,
                                                  ppocr_result** out) {
   if (!pe || !path || !out) return PPOCR_ERR_PARAM;
+  Engine* e = reinterpret_cast<Engine*>(pe);
+  const auto t_dec = std::chrono::steady_clock::now();
   Image img = load_image(path);
   if (img.data.empty()) return PPOCR_ERR_IO;
+  if (e->want_profile) {
+    // Accumulate the decode cost into the profile. run_full resets the
+    // stage fields AFTER we set decode_ms, so stash it and restore:
+    // simplest is to store it now and let run_full preserve it.
+    e->last_profile.decode_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_dec).count();
+  }
   return ppocr_run(pe, img.data.data(), img.w, img.h, out);
 }
 
