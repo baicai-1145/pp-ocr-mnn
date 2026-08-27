@@ -22,6 +22,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -51,6 +55,7 @@ struct Args {
   std::string batch_dir;         // --batch-dir DIR: process all images in DIR
   int workers = 2;               // --workers N: engine-per-worker (default 2)
   int warmup = 1;                // M3-PERF4: dummy inference at create
+  int pin_offset = 0;            // M3-PERF6: cores per worker for --batch-dir
 };
 
 void usage() {
@@ -59,7 +64,8 @@ void usage() {
     "          [--model-dir DIR] [--backend auto|cpu|cuda|opencl|vulkan]\n"
     "          [--threads N] [--batch N] [--det-only] [--json OUT] [--time]\n"
     "          [--profile]  # M3-PERF1: add per-stage ms to the JSON output\n"
-    "          [--batch-dir DIR] [--workers N]  # M3-PERF3: engine-per-worker batch mode\n");
+    "          [--batch-dir DIR] [--workers N]  # M3-PERF3: engine-per-worker batch mode\n"
+    "          [--pin-offset N]  # M3-PERF6: pin each worker to N CPUs (taskset-style)\n");
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -87,6 +93,7 @@ bool parse_args(int argc, char** argv, Args& a) {
   else if (k == "--batch-dir")     { auto v = need("--batch-dir");     if (!v) return false; a.batch_dir = v; }
   else if (k == "--workers")       { auto v = need("--workers");       if (!v) return false; a.workers = std::atoi(v); }
   else if (k == "--no-warmup")     { a.warmup = 0; }
+    else if (k == "--pin-offset")   { auto v = need("--pin-offset");   if (!v) return false; a.pin_offset = std::atoi(v); }
     else if (k == "-h" || k == "--help") { a.help = 1; return true; }
     else {
       std::fprintf(stderr, "unknown flag: %s\n", k.c_str());
@@ -120,30 +127,45 @@ std::string config_basename(const std::string& p) {
 
 void write_result(FILE* f, const char* image, const ppocr_result* r,
                   const ppocr_profile* prof = nullptr) {
-  std::fprintf(f, "{\"image\":\"%s\",\"backend\":\"%s\",",
-               image ? image : "", r->backend_used);
-  std::fprintf(f, "\"lines\":[");
+  // M3-PERF6: assemble the JSON into one string and fwrite once.
+  // Byte-identical to the previous per-token fprintf/fputc version
+  // (same formats, same order) but avoids thousands of locked stdio
+  // calls on dense outputs (283 lines x per-char fputc).
+  std::string buf;
+  buf.reserve(256 + static_cast<size_t>(r->n_lines) * 96);
+  char num[64];
+  buf += "{\"image\":\"";
+  buf += image ? image : "";
+  buf += "\",\"backend\":\"";
+  buf += r->backend_used;
+  buf += "\",\"lines\":[";
   for (int i = 0; i < r->n_lines; ++i) {
     const ppocr_line& ln = r->lines[i];
-    if (i) std::fputc(',', f);
-    std::fprintf(f, "{\"poly\":[");
+    if (i) buf += ',';
+    buf += "{\"poly\":[";
     for (int k = 0; k < 8; ++k) {
-      if (k) std::fputc(',', f);
-      std::fprintf(f, "%d", ln.poly[k]);
+      if (k) buf += ',';
+      std::snprintf(num, sizeof(num), "%d", ln.poly[k]);
+      buf += num;
     }
-    std::fprintf(f, "],\"text\":\"");
+    buf += "],\"text\":\"";
     // Escape JSON string minimally: " and \.
     for (const char* p = ln.text ? ln.text : ""; *p; ++p) {
-      if (*p == '"' || *p == '\\') std::fputc('\\', f);
-      std::fputc(*p, f);
+      if (*p == '"' || *p == '\\') buf += '\\';
+      buf += *p;
     }
-    std::fprintf(f, "\",\"score\":%.4f}", ln.score);
+    std::snprintf(num, sizeof(num), "\",\"score\":%.4f}", ln.score);
+    buf += num;
   }
-  std::fprintf(f, "],");
-  std::fprintf(f, "\"ms\":{\"det\":%.2f,\"rec\":%.2f,\"cls\":%.2f,\"total\":%.2f}",
-               r->det_ms, r->rec_ms, r->cls_ms, r->total_ms);
+  buf += "],";
+  std::snprintf(num, sizeof(num),
+                "\"ms\":{\"det\":%.2f,\"rec\":%.2f,\"cls\":%.2f,\"total\":%.2f}",
+                r->det_ms, r->rec_ms, r->cls_ms, r->total_ms);
+  buf += num;
   if (prof) {
-    std::fprintf(f,
+    // Profile JSON grows past `num`, so format through a bigger scratch.
+    char pbuf[1024];
+    std::snprintf(pbuf, sizeof(pbuf),
         ",\"profile\":{"
         "\"decode_ms\":%.3f,\"det_prep_ms\":%.3f,\"det_run_ms\":%.3f,"
         "\"db_post_ms\":%.3f,\"crop_warp_ms\":%.3f,\"rec_prep_ms\":%.3f,"
@@ -156,11 +178,13 @@ void write_result(FILE* f, const char* image, const ppocr_result* r,
         prof->rec_run_ms, prof->ctc_decode_ms, prof->cls_ms,
         prof->e2e_ms, prof->create_ms, prof->first_run_ms,
         prof->n_boxes, prof->rec_batches, prof->threads, prof->backend);
-    std::fputc('}', f);   // close the profile object AND the outer result
+    buf += pbuf;
+    buf += '}';   // close the profile object AND the outer result
   } else {
-    std::fputc('}', f);   // close the outer result (no profile)
+    buf += '}';   // close the outer result (no profile)
   }
-  std::fputc('\n', f);
+  buf += '\n';
+  std::fwrite(buf.data(), 1, buf.size(), f);
 }
 
 } // namespace
@@ -256,7 +280,24 @@ int run_batch(const Args& a) {
   }
   std::atomic<size_t> next{0};
   std::atomic<int> failures{0};
-  auto worker_main = [&](int) {
+  auto worker_main = [&](int wid) {
+    // M3-PERF6: --pin-offset N — pin this worker to N consecutive CPUs
+    // starting at (wid*N) % ncpu (taskset semantics, no exec). Keeps
+    // batch workers on disjoint core sets. 0 = off (default).
+    if (a.pin_offset > 0) {
+      const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
+      if (ncpu > 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        const int base = (wid * a.pin_offset) % ncpu;
+        for (int i = 0; i < a.pin_offset; ++i) {
+          CPU_SET((base + i) % ncpu, &set);
+        }
+        if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+          // non-fatal: best-effort pinning
+        }
+      }
+    }
     ppocr_engine* eng = make_engine();
     if (!eng) { failures.fetch_add(1); return; }
     // Per-worker string scratch: write_result needs FILE*; use open_memstream.

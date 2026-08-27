@@ -383,7 +383,7 @@ Image warp_perspective_quad(const Image& src, const PointF quad_in[4],
         // Pass ch_stride = src.c so the sampler indexes
         // (xs[i] * src.c + ch) per row, matching HWC layout.
         drow[i * src.c + ch] = sample_bicubic_replicate_plane(
-            src.data.data() + ch, src.w, src.h, sstride, src.c,
+            src.bytes() + ch, src.w, src.h, sstride, src.c,
             static_cast<float>(sx), static_cast<float>(sy));
       }
     }
@@ -423,10 +423,10 @@ Image polar_unwrap(const Image& src, float cx, float cy, float r_max,
       const int iy1 = (iy + 1 < H) ? iy + 1 : iy;
       const float dx = sx - static_cast<float>(ix);
       const float dy = sy - static_cast<float>(iy);
-      const uint8_t* p00 = src.data.data() + (static_cast<size_t>(iy)  * W + ix)  * C;
-      const uint8_t* p01 = src.data.data() + (static_cast<size_t>(iy)  * W + ix1) * C;
-      const uint8_t* p10 = src.data.data() + (static_cast<size_t>(iy1) * W + ix)  * C;
-      const uint8_t* p11 = src.data.data() + (static_cast<size_t>(iy1) * W + ix1) * C;
+      const uint8_t* p00 = src.bytes() + (static_cast<size_t>(iy)  * W + ix)  * C;
+      const uint8_t* p01 = src.bytes() + (static_cast<size_t>(iy)  * W + ix1) * C;
+      const uint8_t* p10 = src.bytes() + (static_cast<size_t>(iy1) * W + ix)  * C;
+      const uint8_t* p11 = src.bytes() + (static_cast<size_t>(iy1) * W + ix1) * C;
       const float w00 = (1.0f - dx) * (1.0f - dy);
       const float w01 = dx * (1.0f - dy);
       const float w10 = (1.0f - dx) * dy;
@@ -476,10 +476,10 @@ Image polar_unwrap_band(const Image& src, float cx, float cy,
       const int iy1 = (iy + 1 < H) ? iy + 1 : iy;
       const float dx = sx - static_cast<float>(ix);
       const float dy = sy - static_cast<float>(iy);
-      const uint8_t* p00 = src.data.data() + (static_cast<size_t>(iy)  * W + ix)  * C;
-      const uint8_t* p01 = src.data.data() + (static_cast<size_t>(iy)  * W + ix1) * C;
-      const uint8_t* p10 = src.data.data() + (static_cast<size_t>(iy1) * W + ix)  * C;
-      const uint8_t* p11 = src.data.data() + (static_cast<size_t>(iy1) * W + ix1) * C;
+      const uint8_t* p00 = src.bytes() + (static_cast<size_t>(iy)  * W + ix)  * C;
+      const uint8_t* p01 = src.bytes() + (static_cast<size_t>(iy)  * W + ix1) * C;
+      const uint8_t* p10 = src.bytes() + (static_cast<size_t>(iy1) * W + ix)  * C;
+      const uint8_t* p11 = src.bytes() + (static_cast<size_t>(iy1) * W + ix1) * C;
       const float w00 = (1.0f - dx) * (1.0f - dy);
       const float w01 = dx * (1.0f - dy);
       const float w10 = (1.0f - dx) * dy;

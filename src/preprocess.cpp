@@ -83,6 +83,73 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
   }
 }
 
+// M3-PERF6: fused resize + normalize. Produces EXACTLY the same bytes
+// as resize_bilinear_bgr followed by hwc_bgr_to_chw_float: the double
+// expression, lround rounding and [0,255] clamp are identical, and the
+// normalized value is lut[c][iv] — the same table entry the two-pass
+// version computes from the same iv. Saves one whole-image intermediate
+// buffer (write + read of dst_w*dst_h*3 bytes).
+void resize_bilinear_bgr_to_chw(const uint8_t* src, int src_w, int src_h,
+                                float* dst, int dst_w, int dst_h,
+                                float scale, const float* mean_bgr,
+                                const float* std_bgr) {
+  if (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) return;
+  float lut[3][256];
+  for (int ch = 0; ch < 3; ++ch) {
+    for (int v = 0; v < 256; ++v) {
+      lut[ch][v] = (static_cast<float>(v) * scale - mean_bgr[ch]) / std_bgr[ch];
+    }
+  }
+  const double sx = static_cast<double>(src_w) / dst_w;
+  const double sy = static_cast<double>(src_h) / dst_h;
+  std::vector<int>   x0v(dst_w);
+  std::vector<double> dxv(dst_w), gx1v(dst_w);
+  for (int x = 0; x < dst_w; ++x) {
+    const double fx = (x + 0.5) * sx - 0.5;
+    int x0 = static_cast<int>(std::floor(fx));
+    if (x0 < 0) x0 = 0;
+    if (x0 >= src_w - 1) x0 = src_w - 2;
+    dxv[x] = fx - x0;
+    gx1v[x] = 1 - dxv[x];
+    x0v[x] = x0;
+  }
+  const size_t plane = static_cast<size_t>(dst_w) * dst_h;
+  for (int y = 0; y < dst_h; ++y) {
+    const double fy = (y + 0.5) * sy - 0.5;
+    int y0 = static_cast<int>(std::floor(fy));
+    if (y0 < 0) y0 = 0;
+    if (y0 >= src_h - 1) y0 = src_h - 2;
+    const double dy = fy - y0;
+    const double gy1 = 1 - dy;
+    const uint8_t* row0 = src + static_cast<size_t>(y0) * src_w * 3;
+    const uint8_t* row1 = src + static_cast<size_t>(y0 + 1) * src_w * 3;
+    float* db = dst + 0 * plane + static_cast<size_t>(y) * dst_w;
+    float* dg = dst + 1 * plane + static_cast<size_t>(y) * dst_w;
+    float* dr = dst + 2 * plane + static_cast<size_t>(y) * dst_w;
+    for (int x = 0; x < dst_w; ++x) {
+      const int x0 = x0v[x];
+      const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 3;
+      const uint8_t* p01 = p00 + 3;
+      const uint8_t* p10 = row1 + static_cast<size_t>(x0) * 3;
+      const uint8_t* p11 = p10 + 3;
+      const double dx = dxv[x];
+      const double gx1 = gx1v[x];
+      const double v0 = gy1 * (gx1 * p00[0] + dx * p01[0]) + dy * (gx1 * p10[0] + dx * p11[0]);
+      const double v1 = gy1 * (gx1 * p00[1] + dx * p01[1]) + dy * (gx1 * p10[1] + dx * p11[1]);
+      const double v2 = gy1 * (gx1 * p00[2] + dx * p01[2]) + dy * (gx1 * p10[2] + dx * p11[2]);
+      int i0 = static_cast<int>(std::lround(v0));
+      int i1 = static_cast<int>(std::lround(v1));
+      int i2 = static_cast<int>(std::lround(v2));
+      if (i0 < 0) i0 = 0; else if (i0 > 255) i0 = 255;
+      if (i1 < 0) i1 = 0; else if (i1 > 255) i1 = 255;
+      if (i2 < 0) i2 = 0; else if (i2 > 255) i2 = 255;
+      db[x] = lut[0][i0];
+      dg[x] = lut[1][i1];
+      dr[x] = lut[2][i2];
+    }
+  }
+}
+
 // Snap an integer to the nearest multiple of `m` using banker's
 // rounding (half-to-even), exactly like Python's built-in `round()`.
 // PaddleOCR's `DetResizeForTest` is implemented in NumPy and uses
@@ -252,15 +319,16 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
     if (resize_w < stride) resize_w = stride;
   }
 
-  std::vector<uint8_t> resized;
+  std::vector<uint8_t> resized;  // only used on the NoResize passthrough
+  const uint8_t* resized_src = nullptr;
   if (resize_w == bgr.w && resize_h == bgr.h) {
-    // NoResize: avoid the bilinear copy and reuse the source buffer.
-    resized.assign(bgr.data.begin(), bgr.data.end());
-  } else {
-    resized.assign(static_cast<size_t>(resize_w) * resize_h * 3, 0);
-    resize_bilinear_bgr(bgr.data.data(), bgr.w, bgr.h,
-                        resized.data(), resize_w, resize_h);
+    // NoResize: skip the bilinear copy AND the intermediate buffer —
+    // convert straight from the source bytes (view-safe: bytes()
+    // resolves the non-owning pointer). Same input bytes into the same
+    // hwc_bgr_to_chw_float ⇒ bit-identical output.
+    resized_src = bgr.bytes();
   }
+  // (resize branch moved into the fused call below)
 
   DetInput out;
   out.in_w = resize_w;
@@ -278,8 +346,18 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   // apply cfg.det.thresh-mean / std per channel position.
   const float mean[3] = {0.485f, 0.456f, 0.406f};
   const float std [3] = {0.229f, 0.224f, 0.225f};
-  hwc_bgr_to_chw_float(resized.data(), resize_w, resize_h,
-                       out.chw.data(), 1.f / 255.f, mean, std);
+  if (resized_src == nullptr) {
+    // Resizing path: fused bilinear+normalize straight into CHW floats
+    // (bit-exact with the two-pass version: same double expression,
+    // lround rounding, clamp and LUT — minus the whole-image
+    // intermediate buffer).
+    resize_bilinear_bgr_to_chw(bgr.bytes(), bgr.w, bgr.h,
+                               out.chw.data(), resize_w, resize_h,
+                               1.f / 255.f, mean, std);
+  } else {
+    hwc_bgr_to_chw_float(resized_src, resize_w, resize_h,
+                         out.chw.data(), 1.f / 255.f, mean, std);
+  }
   return out;
 }
 
@@ -310,7 +388,7 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w,
     // The first `w` columns of each row get the resized pixels; the rest
     // stay zero (matches the zero-padded CHW tensor in resize_norm_img).
     tmp.assign(static_cast<size_t>(w) * img_h * 3, 0);
-    resize_bilinear_bgr(line_bgr.data.data(), line_bgr.w, line_bgr.h,
+    resize_bilinear_bgr(line_bgr.bytes(), line_bgr.w, line_bgr.h,
                         tmp.data(), w, img_h);
     for (int y = 0; y < img_h; ++y) {
       std::memcpy(resized.data() + static_cast<size_t>(y) * batch_w * 3,

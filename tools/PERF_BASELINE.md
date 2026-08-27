@@ -1,3 +1,27 @@
+# PP-OCR MNN Performance Baseline
+
+## Executive summary (M3-PERF1..6, v6_tiny / CUDA t4 / A10G unless noted)
+
+| round | headline | measurement context |
+|---|---|---|
+| 0 baseline | single-img CUDA **7.50 FPS** (133 ms) | calm load, 20 imgs x 8 warm |
+| 1 (PERF2) | single-img CUDA **9.45 FPS** (+26%); db_post 207->27 ms | same protocol; bit-exact |
+| 2 (PERF3) | batch zh w4 **15.9 FPS** (+53% vs w1); dense w4 +74%; warm det_run 17->1.2 ms discovery | calm load |
+| 3 (PERF4) | dense w4 **+49%** (1.85->2.75); first-image 104->81 ms (warmup); rec batch 16 | load 30-40, interleaved |
+| 4 (PERF5) | decode 13.4->4.6 ms (libjpeg, 272/272 cv2-parity); medium dense **+24%** (batch hint 8) | load ~29 |
+| 5 (PERF6) | e2e -7~-10% (zero-copy view + fused det prep); zh w4 **+25%** with --pin-offset 2 | load ~28, interleaved |
+
+Cumulative: single-image 133 -> ~64-81 ms; batch zh (w4) 7.5-equivalent
+-> 13.4-15.9 FPS depending on co-tenant load; dense en/08-class workloads
+~2.6-4.5 FPS w4. All changes line/bit-exact gated (only libjpeg decode
+changes bytes, gated separately by decode parity + CER). CPU t4 path:
+545 -> ~517 ms across rounds (forward-bound; host-side levers mostly
+GPU-batch-irrelevant there).
+
+Caveat: this host runs co-tenant workloads (load 28-42 during rounds
+3-6); absolute FPS between rounds is NOT directly comparable — trust
+the interleaved same-load deltas quoted above.
+
 # M3-PERF1: Inference Profiling Baseline
 
 ## TL;DR
@@ -436,3 +460,39 @@ runs the last chunk at N=actual (2 boxes → 1 batch of N=2, rec_run
 
 Post-round state (load ~29, w4 batch): zh 15.3 FPS, dense6 4.49 FPS
 (v6_tiny, libjpeg + batch16). test_post 20/20, ctest 2/2.
+
+## Round 5 (M3-PERF6, closing round)
+
+### 1. Glue reduction (all bit-exact / structure-identical gated)
+
+| change | A/B (interleaved) | verdict |
+|---|---|---|
+| 6a zero-copy input view (Image.ext; run_full wraps caller buffer; NoResize intermediate copy dropped) | zh/04 87.5→81.0 (-7%), en/08 430.5→385.6 (-10%) | KEPT |
+| 6b buffered JSON (one fwrite; was per-token fprintf + per-char fputc) | structure-identical (numbers-only diff), lines identical | KEPT |
+| build_lines lazy strings | inspected: already minimal (one string move-in per line, required by C ABI lifetime) | no-op |
+
+Bring-up found + fixed an en/08-only segfault: the NoResize branch
+copied from the view's empty vector (native-res images only) — caught
+by the 5-gate run before commit.
+
+### 2. det_prep same-numbers-fewer-instructions
+
+Fused bilinear-resize + normalize into one pass
+(`resize_bilinear_bgr_to_chw`): identical double expression, lround,
+clamp and LUT entry — minus the whole-image intermediate HWC buffer.
+det_prep 6.0→4.2 ms (-30%, zh/03 resize path). 5-gate bit-exact.
+
+### 3. Batch worker pinning
+
+`--pin-offset N`: worker w → N consecutive CPUs at (w*N) % ncpu
+(sched_setaffinity). A/B 5 reps (load ~28, 14 cpus):
+zh w4 10.76→13.42 FPS (+25%); dense6 2.60→2.83 (+9%). pin3
+oversubscribes (4x3 cpus vs MNN t4 intra-op pool): dense6 regresses —
+recommend pin2 for w4 on this box.
+
+### Final state
+
+Single-image warm zh/03: e2e 64 ms (was 133 at round 0 baseline
+protocol; different load conditions — see summary caveat). All rounds'
+outputs bit-exact except the documented libjpeg decode surface
+(decoder-matched to the baseline generator, CER-gated).
