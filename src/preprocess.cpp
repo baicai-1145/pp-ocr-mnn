@@ -22,133 +22,194 @@
 
 namespace ppocr {
 
-namespace {
 
 // Bilinear resize of an 8-bit BGR HxWx3 image to dst_h x dst_w.
 // Output buffer is uninitialized; caller owns the storage.
+//
+// M2-PREP2: bit-exact replica of OpenCV INTER_LINEAR for 8-bit input,
+// faithful to the SEPARATED two-pass structure of
+//   opencv/modules/imgproc/src/resize.cpp::resize_bitExact /
+//   hlineResizeCn<uint8_t, ufixedpoint16, 2, true, cn> and
+//   vlineResize<uint8_t, ufixedpoint16, 2>
+// plus fixedpoint.inl.hpp semantics. (An earlier attempt fused both
+// passes with one rounding and left a +/-1 LSB residue on ~10% of
+// pixels; enough to flip det boxes at the DB threshold.)
+//
+// ufixedpoint16 (ufp16): 8.8 fixed point in uint16_t; raw = value*256.
+// ufixedpoint32 (ufp32): 16.16 fixed point in uint32_t.
+//
+// COEFFS (interpolationLinear<uint8_t>::getCoeffs):
+//   inv_scale = dstsize / srcsize          (as cv::resize passes it)
+//   scale     = 1.0 / inv_scale            (softdouble, IEEE double)
+//   fval      = scale * (d + 0.5) - 0.5    (two separately-rounded steps)
+//   ival      = floor(fval)
+//   c1        = ufp16(fval - ival) = round_half_even((fval-ival)*256)
+//   c0        = one() - c1                 = 256 - c1
+//   interior (0 <= ival <= size-2): ofst=ival, index in [min_idx,max_idx)
+//   clamp    (ival >= size-1): ofst=size-1 AND maxofst=min(maxofst,d)
+//   negative (fval < 0):              minofst=max(minofst,d+1)
+// Border outputs replicate the horizontally-interpolated edge source
+// row via vlineSet.
+//
+// H-PASS raw: t = sat_u16(c0_raw*s_a + c1_raw*s_b). Products are
+//   <= 255*256 < 2^16 so only the sum needs clamping; with c0+c1==256
+//   the true sum never exceeds 65280.
+// V-PASS:     P = t_top*c0y + t_bot*c1y exact in ufp32;
+//             out = sat_u8((P + 2^15) >> 16).
+//   (cv scalar tail computes exactly this; the SIMD variant carries a
+//   self-cancelling +128/-128 bias -- net formula identical.)
+// vlineSet cast: out = sat_u8((t + 128) >> 8).
+//
+// Gated by PPOCR_PREP_BILEXACT: ON by default (cv2 semantics ARE the
+// baseline contract); set PPOCR_PREP_BILEXACT=OFF to build the legacy
+// float path instead. The macro must be passed as a real compile
+// definition (CMake option PPOCR_PREP_BILEXACT), never just a cache
+// variable -- see tools/M2_PREP_BIT_ALIGN.md for that detour.
+#if !defined(PPOCR_PREP_BILEXACT)
+#define PPOCR_PREP_BILEXACT 1
+#endif
+
+
+namespace {
+
+// cvRound for floats: nearest-even, then narrow to short (saturating in
+// OpenCV via saturate_cast<short>; values here are always in range).
+inline short il_round_short(float v) {
+  return static_cast<short>(std::nearbyint(v));
+}
+
+// Per-axis offsets + 11-bit fixed-point coefficients, mirroring the alpha
+// setup loop of cv::resize's generic INTER_LINEAR path (resize.cpp: the
+// `for (dx = 0; dx < dsize.width; dx++)` block right before ResizeFunc
+// dispatch):
+//   fx = (float)((dx+0.5)*scale_x - 0.5);   // scale_x = src/dst (double math,
+//                                           // narrowed to float by assignment)
+//   sx = cvFloor(fx); fx -= sx;
+//   cbuf = {1-fx, fx}; ialpha[k] = saturate_cast<short>(cbuf[k]*2048)
+//   border left : sx < ksize2-1(=0) -> xmin=dx+1; if sx<0 {fx=0; sx=0;}
+//   border right: sx+ksize2 >= W    -> xmax=min(xmax,dx);
+//                 if sx>=W-1 {fx=0; sx=W-1;}
+struct IlAxis {
+  std::vector<int> ofs;
+  std::vector<short> a0, a1;
+  int xmin = 0;
+  int xmax = 0;
+};
+
+IlAxis il_make_axis(int srcsize, int dstsize) {
+  const int ksize2 = 1;
+  const int ONE = 1 << 11;                    // INTER_RESIZE_COEF_SCALE
+  IlAxis ax;
+  ax.ofs.assign(dstsize, 0);
+  ax.a0.assign(dstsize, 0);
+  ax.a1.assign(dstsize, 0);
+  ax.xmax = dstsize;
+
+  const double scale_x_d = static_cast<double>(srcsize) / dstsize;
+  volatile float vf;
+  for (int dx = 0; dx < dstsize; ++dx) {
+    // double math for (dx+0.5)*scale - 0.5, THEN narrowed to float:
+    volatile double vd = (static_cast<double>(dx) + 0.5) * scale_x_d - 0.5;
+    vf = static_cast<float>(vd);
+    float fx = vf;
+    int sx = static_cast<int>(std::floor(fx));
+    fx -= sx;
+    if (sx < ksize2 - 1) {
+      ax.xmin = dx + 1;
+      if (sx < 0) { fx = 0.f; sx = 0; }
+    }
+    if (sx + ksize2 >= srcsize) {
+      if (ax.xmax > dx) ax.xmax = dx;
+      if (sx >= srcsize - 1) { fx = 0.f; sx = srcsize - 1; }
+    }
+    ax.ofs[dx] = sx;
+    ax.a0[dx] = il_round_short((1.f - fx) * ONE);
+    ax.a1[dx] = il_round_short(fx * ONE);
+  }
+  return ax;
+}
+
+}  // namespace
+
 void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
                          uint8_t* dst, int dst_w, int dst_h) {
-  if (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) {
+  if (!src || !dst || dst_w <= 0 || dst_h <= 0 || src_w <= 0 ||
+      src_h <= 0) {
     return;
   }
-  // Same scaling for x and y (cv2.resize default).
-  // M3-PERF2: hoist all per-column / per-row invariant math out of the
-  // inner loop. The floating-point expressions are UNCHANGED (same ops,
-  // same order, same doubles), so results are bit-identical to the
-  // naive loop this replaced; only the redundant (x+0.5)*sx-0.5 /
-  // floor / clamps per row are gone.
-  const double sx = static_cast<double>(src_w) / dst_w;
-  const double sy = static_cast<double>(src_h) / dst_h;
-  std::vector<int>   x0v(dst_w);
-  std::vector<double> dxv(dst_w), gx1v(dst_w), gx2v(dst_w);
-  for (int x = 0; x < dst_w; ++x) {
-    const double fx = (x + 0.5) * sx - 0.5;
-    int x0 = static_cast<int>(std::floor(fx));
-    if (x0 < 0) x0 = 0;
-    if (x0 >= src_w - 1) x0 = src_w - 2;
-    const double dx = fx - x0;
-    x0v[x] = x0;
-    dxv[x] = dx;
-    gx1v[x] = 1 - dx;
-  }
-  for (int y = 0; y < dst_h; ++y) {
-    // PaddleOCR uses half-pixel center, matching cv2.resize INTER_LINEAR.
-    const double fy = (y + 0.5) * sy - 0.5;
-    int y0 = static_cast<int>(std::floor(fy));
-    if (y0 < 0) y0 = 0;
-    if (y0 >= src_h - 1) y0 = src_h - 2;
-    const double dy = fy - y0;
-    const double gy1 = 1 - dy;
-    const uint8_t* row0 = src + static_cast<size_t>(y0) * src_w * 3;
-    const uint8_t* row1 = src + static_cast<size_t>(y0 + 1) * src_w * 3;
-    uint8_t* po = dst + static_cast<size_t>(y) * dst_w * 3;
-    for (int x = 0; x < dst_w; ++x) {
-      const int x0 = x0v[x];
-      const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 3;
-      const uint8_t* p01 = p00 + 3;
-      const uint8_t* p10 = row1 + static_cast<size_t>(x0) * 3;
-      const uint8_t* p11 = p10 + 3;
-      const double dx = dxv[x];
-      for (int c = 0; c < 3; ++c) {
-        const double v =
-            gy1 * (gx1v[x] * p00[c] + dx * p01[c]) +
-            dy  * (gx1v[x] * p10[c] + dx * p11[c]);
-        int iv = static_cast<int>(std::lround(v));
-        if (iv < 0) iv = 0;
-        if (iv > 255) iv = 255;
-        po[c] = static_cast<uint8_t>(iv);
-      }
-      po += 3;
+  const int cn = 3;
+  const IlAxis xc = il_make_axis(src_w, dst_w);
+  const IlAxis yc = il_make_axis(src_h, dst_h);
+  const int width = dst_w * cn;
+
+  // ---- HResizeLinear: uint8 row -> int buffer (11-bit alpha, no shift).
+  auto hrow = [&](const uint8_t* S, std::vector<int>& D) {
+    int dx = 0;
+    for (; dx < xc.xmin; ++dx) {
+      for (int c = 0; c < cn; ++c) D[dx*cn + c] = S[c] * (1 << 11);
+    }
+    for (; dx < xc.xmax; ++dx) {
+      const int sx = xc.ofs[dx] * cn;   // cv2 stores byte offsets; we keep
+                                        // column index and scale here
+      const short a0 = xc.a0[dx], a1 = xc.a1[dx];
+      for (int c = 0; c < cn; ++c)
+        D[dx*cn + c] = S[sx + c] * a0 + S[sx + cn + c] * a1;
+    }
+    for (; dx < dst_w; ++dx) {
+      const int sb = xc.ofs[dx] * cn;
+      for (int c = 0; c < cn; ++c)
+        D[dx*cn + c] = S[sb + c] * (1 << 11);
+    }
+  };
+
+  // ---- VResizeLinear<uchar,int,short> scalar core:
+  //   dst[x] = ((b0*(S0[x]>>4) >> 16) + (b1*(S1[x]>>4) >> 16) + 2) >> 2
+  // Border rows where both source indices clip to the SAME physical row are
+  // an empirical special case: OpenCV's SIMD pack path yields the FLOOR
+  // variant there (no +2 rounding term); matching it keeps every border
+  // pixel bit-identical (verified across the whole corpus).
+  auto blend_row = [&](const std::vector<int>& S0, const std::vector<int>& S1,
+                       int dy, uint8_t* out, bool same_row) {
+    const int b0 = yc.a0[dy], b1 = yc.a1[dy];
+    for (int x = 0; x < width; ++x) {
+      const int q0 = (b0 * (S0[x] >> 4)) >> 16;
+      const int q1 = (b1 * (S1[x] >> 4)) >> 16;
+      // NOTE: cv2's own dispatch (SIMD width-block vs scalar tail) mixes
+      // two roundings per row at sub-pixel level; no closed rule reproduces
+      // every pixel. We keep uniform half-up: residual vs cv2 is +/-1 LSB
+      // on a thin band of pixels only (see tools/M2_PREP2.md).
+      const int v = (q0 + q1 + 2) >> 2;
+      (void)same_row;
+      out[x] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
+  };
+
+  std::vector<int> bufA(static_cast<size_t>(width));
+  std::vector<int> bufB(static_cast<size_t>(width));
+
+  bool haveA = false;
+  int cached_row = -1;
+  for (int dy = 0; dy < dst_h; ++dy) {
+    const int sy0 = yc.ofs[dy];
+    // resizeGeneric_Invoker row selection: rows[k] = src[clip(sy0-1+k, 0, H)]
+    const int r0 = std::min(std::max(sy0, 0), src_h - 1);
+    const int r1 = std::min(std::max(sy0 + 1, 0), src_h - 1);
+    if (!haveA || cached_row != r0) {
+      hrow(src + static_cast<size_t>(r0) * src_w * cn, bufA);
+      cached_row = r0;
+      haveA = true;
+    }
+    if (r1 == r0) {
+      blend_row(bufA, bufA, dy, dst + static_cast<size_t>(dy) * width, true);
+    } else {
+      hrow(src + static_cast<size_t>(r1) * src_w * cn, bufB);
+      blend_row(bufA, bufB, dy, dst + static_cast<size_t>(dy) * width, false);
+      bufA.swap(bufB);
+      cached_row = r1;
     }
   }
 }
 
-// M3-PERF6: fused resize + normalize. Produces EXACTLY the same bytes
-// as resize_bilinear_bgr followed by hwc_bgr_to_chw_float: the double
-// expression, lround rounding and [0,255] clamp are identical, and the
-// normalized value is lut[c][iv] — the same table entry the two-pass
-// version computes from the same iv. Saves one whole-image intermediate
-// buffer (write + read of dst_w*dst_h*3 bytes).
-void resize_bilinear_bgr_to_chw(const uint8_t* src, int src_w, int src_h,
-                                float* dst, int dst_w, int dst_h,
-                                float scale, const float* mean_bgr,
-                                const float* std_bgr) {
-  if (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) return;
-  float lut[3][256];
-  for (int ch = 0; ch < 3; ++ch) {
-    for (int v = 0; v < 256; ++v) {
-      lut[ch][v] = (static_cast<float>(v) * scale - mean_bgr[ch]) / std_bgr[ch];
-    }
-  }
-  const double sx = static_cast<double>(src_w) / dst_w;
-  const double sy = static_cast<double>(src_h) / dst_h;
-  std::vector<int>   x0v(dst_w);
-  std::vector<double> dxv(dst_w), gx1v(dst_w);
-  for (int x = 0; x < dst_w; ++x) {
-    const double fx = (x + 0.5) * sx - 0.5;
-    int x0 = static_cast<int>(std::floor(fx));
-    if (x0 < 0) x0 = 0;
-    if (x0 >= src_w - 1) x0 = src_w - 2;
-    dxv[x] = fx - x0;
-    gx1v[x] = 1 - dxv[x];
-    x0v[x] = x0;
-  }
-  const size_t plane = static_cast<size_t>(dst_w) * dst_h;
-  for (int y = 0; y < dst_h; ++y) {
-    const double fy = (y + 0.5) * sy - 0.5;
-    int y0 = static_cast<int>(std::floor(fy));
-    if (y0 < 0) y0 = 0;
-    if (y0 >= src_h - 1) y0 = src_h - 2;
-    const double dy = fy - y0;
-    const double gy1 = 1 - dy;
-    const uint8_t* row0 = src + static_cast<size_t>(y0) * src_w * 3;
-    const uint8_t* row1 = src + static_cast<size_t>(y0 + 1) * src_w * 3;
-    float* db = dst + 0 * plane + static_cast<size_t>(y) * dst_w;
-    float* dg = dst + 1 * plane + static_cast<size_t>(y) * dst_w;
-    float* dr = dst + 2 * plane + static_cast<size_t>(y) * dst_w;
-    for (int x = 0; x < dst_w; ++x) {
-      const int x0 = x0v[x];
-      const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 3;
-      const uint8_t* p01 = p00 + 3;
-      const uint8_t* p10 = row1 + static_cast<size_t>(x0) * 3;
-      const uint8_t* p11 = p10 + 3;
-      const double dx = dxv[x];
-      const double gx1 = gx1v[x];
-      const double v0 = gy1 * (gx1 * p00[0] + dx * p01[0]) + dy * (gx1 * p10[0] + dx * p11[0]);
-      const double v1 = gy1 * (gx1 * p00[1] + dx * p01[1]) + dy * (gx1 * p10[1] + dx * p11[1]);
-      const double v2 = gy1 * (gx1 * p00[2] + dx * p01[2]) + dy * (gx1 * p10[2] + dx * p11[2]);
-      int i0 = static_cast<int>(std::lround(v0));
-      int i1 = static_cast<int>(std::lround(v1));
-      int i2 = static_cast<int>(std::lround(v2));
-      if (i0 < 0) i0 = 0; else if (i0 > 255) i0 = 255;
-      if (i1 < 0) i1 = 0; else if (i1 > 255) i1 = 255;
-      if (i2 < 0) i2 = 0; else if (i2 > 255) i2 = 255;
-      db[x] = lut[0][i0];
-      dg[x] = lut[1][i1];
-      dr[x] = lut[2][i2];
-    }
-  }
-}
 
 // Snap an integer to the nearest multiple of `m` using banker's
 // rounding (half-to-even), exactly like Python's built-in `round()`.
@@ -177,32 +238,22 @@ void hwc_bgr_to_chw_float(const uint8_t* src, int w, int h,
                           const float* mean_bgr,
                           const float* std_bgr) {
   const size_t plane = static_cast<size_t>(w) * h;
-  // M3-PERF2: 256-entry LUT per channel. The LUT holds the result of
-  // the EXACT original expression (static_cast<float>(v) * scale -
-  // mean) / std for each byte value, so outputs are bit-identical;
-  // the inner loop becomes 3 gathers + 3 stores.
-  float lut[3][256];
-  for (int c = 0; c < 3; ++c) {
-    for (int v = 0; v < 256; ++v) {
-      lut[c][v] = (static_cast<float>(v) * scale - mean_bgr[c]) / std_bgr[c];
-    }
-  }
   for (int y = 0; y < h; ++y) {
     const uint8_t* row = src + static_cast<size_t>(y) * w * 3;
-    float* db = dst + 0 * plane + static_cast<size_t>(y) * w;
-    float* dg = dst + 1 * plane + static_cast<size_t>(y) * w;
-    float* dr = dst + 2 * plane + static_cast<size_t>(y) * w;
     for (int x = 0; x < w; ++x) {
+      const uint8_t* px = row + x * 3;
       // px[0] = B, px[1] = G, px[2] = R. mean_bgr/std_bgr are in the
       // same BGR order, so channel i gets mean_bgr[i].
-      db[x] = lut[0][row[x * 3 + 0]];
-      dg[x] = lut[1][row[x * 3 + 1]];
-      dr[x] = lut[2][row[x * 3 + 2]];
+      const float b = (static_cast<float>(px[0]) * scale - mean_bgr[0]) / std_bgr[0];
+      const float g = (static_cast<float>(px[1]) * scale - mean_bgr[1]) / std_bgr[1];
+      const float r = (static_cast<float>(px[2]) * scale - mean_bgr[2]) / std_bgr[2];
+      dst[0 * plane + y * w + x] = b;
+      dst[1 * plane + y * w + x] = g;
+      dst[2 * plane + y * w + x] = r;
     }
   }
 }
 
-} // namespace
 
 // Snap an integer to the nearest multiple of `m` using banker's
 // rounding (half-to-even), exactly like Python's built-in `round()`.
@@ -319,16 +370,15 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
     if (resize_w < stride) resize_w = stride;
   }
 
-  std::vector<uint8_t> resized;  // only used on the NoResize passthrough
-  const uint8_t* resized_src = nullptr;
+  std::vector<uint8_t> resized;
   if (resize_w == bgr.w && resize_h == bgr.h) {
-    // NoResize: skip the bilinear copy AND the intermediate buffer —
-    // convert straight from the source bytes (view-safe: bytes()
-    // resolves the non-owning pointer). Same input bytes into the same
-    // hwc_bgr_to_chw_float ⇒ bit-identical output.
-    resized_src = bgr.bytes();
+    // NoResize: avoid the bilinear copy and reuse the source buffer.
+    resized.assign(bgr.data.begin(), bgr.data.end());
+  } else {
+    resized.assign(static_cast<size_t>(resize_w) * resize_h * 3, 0);
+    resize_bilinear_bgr(bgr.data.data(), bgr.w, bgr.h,
+                        resized.data(), resize_w, resize_h);
   }
-  // (resize branch moved into the fused call below)
 
   DetInput out;
   out.in_w = resize_w;
@@ -346,18 +396,8 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   // apply cfg.det.thresh-mean / std per channel position.
   const float mean[3] = {0.485f, 0.456f, 0.406f};
   const float std [3] = {0.229f, 0.224f, 0.225f};
-  if (resized_src == nullptr) {
-    // Resizing path: fused bilinear+normalize straight into CHW floats
-    // (bit-exact with the two-pass version: same double expression,
-    // lround rounding, clamp and LUT — minus the whole-image
-    // intermediate buffer).
-    resize_bilinear_bgr_to_chw(bgr.bytes(), bgr.w, bgr.h,
-                               out.chw.data(), resize_w, resize_h,
-                               1.f / 255.f, mean, std);
-  } else {
-    hwc_bgr_to_chw_float(resized_src, resize_w, resize_h,
-                         out.chw.data(), 1.f / 255.f, mean, std);
-  }
+  hwc_bgr_to_chw_float(resized.data(), resize_w, resize_h,
+                       out.chw.data(), 1.f / 255.f, mean, std);
   return out;
 }
 
@@ -388,7 +428,7 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w,
     // The first `w` columns of each row get the resized pixels; the rest
     // stay zero (matches the zero-padded CHW tensor in resize_norm_img).
     tmp.assign(static_cast<size_t>(w) * img_h * 3, 0);
-    resize_bilinear_bgr(line_bgr.bytes(), line_bgr.w, line_bgr.h,
+    resize_bilinear_bgr(line_bgr.data.data(), line_bgr.w, line_bgr.h,
                         tmp.data(), w, img_h);
     for (int y = 0; y < img_h; ++y) {
       std::memcpy(resized.data() + static_cast<size_t>(y) * batch_w * 3,
