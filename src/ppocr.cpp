@@ -99,6 +99,14 @@ struct Engine {
   std::vector<std::string> last_text;
   ppocr_result            last_result{};
 
+  // M3-PERF1: per-stage profile of the last run. Collected only when
+  // `profile` is true (ppocr_config.profile); read via the public ABI
+  // ppocr_last_profile().
+  bool          want_profile = false;
+  bool          has_run_once = false;
+  float         create_ms_stored = 0.f;
+  ppocr_profile last_profile{};
+
   // Async worker.
   std::thread             async_worker;
   std::mutex              async_mu;
@@ -378,11 +386,22 @@ static void run_det_sync(Engine& e, const Image& bgr,
                          std::vector<DetBox>& boxes_out,
                          float& ms_out) {
   auto t0 = std::chrono::steady_clock::now();
+  auto tic = [&e](float* slot) {
+    if (e.want_profile && slot) {
+      // caller-managed accumulation; value filled by caller below
+    }
+  };
+  (void)tic;
+  const bool prof = e.want_profile;
+  auto t_prep = std::chrono::steady_clock::now();
   DetInput in = prep_det(bgr, e.det_cfg.det.resize);
+  auto t_prep_end = std::chrono::steady_clock::now();
   // The det .mnn file's input is dynamic; we resize to the preprocessed HxW.
   std::vector<int> dims = {1, 3, in.in_h, in.in_w};
   e.det->set_input_float("x", dims, in.chw.data());
+  auto t_run = std::chrono::steady_clock::now();
   int ec = e.det->run();
+  auto t_run_end = std::chrono::steady_clock::now();
   if (ec != 0) {
     boxes_out.clear();
     ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
@@ -429,6 +448,7 @@ static void run_det_sync(Engine& e, const Image& bgr,
   if (e.is_seal && eff_det_cfg.box_thresh > 0.10f) {
     eff_det_cfg.box_thresh = 0.10f;
   }
+  auto t_db = std::chrono::steady_clock::now();
   boxes_out = db_postprocess(so.data, H, W, bgr.w, bgr.h,
                              prob_to_img_w, prob_to_img_h, eff_det_cfg);
   // NOTE (POST-4): db_postprocess emits boxes in cv::findContours order,
@@ -452,6 +472,16 @@ static void run_det_sync(Engine& e, const Image& bgr,
   }
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
+  if (prof) {
+    e.last_profile.det_prep_ms =
+        std::chrono::duration<float, std::milli>(t_prep_end - t_prep).count();
+    e.last_profile.det_run_ms =
+        std::chrono::duration<float, std::milli>(t_run_end - t_run).count();
+    e.last_profile.db_post_ms =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - t_db).count();
+    e.last_profile.n_boxes = static_cast<int>(boxes_out.size());
+  }
 }
 
 // Rec is M2 scope; M1 returns a synthetic line for each det box so the
@@ -592,6 +622,10 @@ static void run_rec_sync(Engine& e, const Image& bgr,
                          float& cls_ms_out,
                          std::vector<int>* cls_labels_out = nullptr) {
   auto t0 = std::chrono::steady_clock::now();
+  const bool prof = e.want_profile;
+  auto t_crop = std::chrono::steady_clock::now();
+  auto t_recprep_end = t_crop, t_recrun_end = t_crop, t_ctc_end = t_crop;
+  int n_rec_batches = 0;
   cls_ms_out = 0.f;
   texts.clear();
   texts.resize(boxes.size(), {std::string{}, 0.f});
@@ -745,6 +779,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     }
     crops.push_back({std::move(warped)});
   }
+  auto t_crop_end = std::chrono::steady_clock::now();
   // ---- M3 cls step ----
   // Run the textline orientation classifier on each warped crop and
   // rotate 180° any that score 180°. The rec step below then sees
@@ -832,6 +867,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     if (batch_w > batch_w_cap) batch_w = batch_w_cap;
     if (batch_w < 1) batch_w = 1;
     // Build the CHW tensor: N * 3 * H * batch_w.
+    auto t_rp = std::chrono::steady_clock::now();
     std::vector<float> chw(static_cast<size_t>(n) * 3 * H * batch_w, 0.f);
     for (size_t i = 0; i < n; ++i) {
       if (crops[start + i].img.data.empty()) continue;
@@ -841,10 +877,14 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       std::memcpy(chw.data() + i * 3 * H * batch_w, line_chw.data(),
                   static_cast<size_t>(3) * H * batch_w * sizeof(float));
     }
+    auto t_rp_end = std::chrono::steady_clock::now();
     // Resize + run rec.
     std::vector<int> dims = {static_cast<int>(n), 3, H, batch_w};
     e.rec->set_input_float("x", dims, chw.data());
+    auto t_rr = std::chrono::steady_clock::now();
     int ec = e.rec->run();
+    auto t_rr_end = std::chrono::steady_clock::now();
+    ++n_rec_batches;
     if (ec != 0) continue;
     // Output is [N, T, C] = [n, T, num_classes] in NCHW with T
     // timesteps and C classes. (Verified on PP-OCRv6_tiny_rec after
@@ -858,6 +898,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     const int T  = so.shape[1];
     const int C  = so.shape[2];
     if (N != static_cast<int>(n) || C <= 1 || T <= 0) continue;
+    auto t_ctc = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i) {
       const float* row = so.data + i * T * C;
       RecOut out = ctc_decode(row, T, C, e.rec_cfg.rec);
@@ -895,9 +936,23 @@ static void run_rec_sync(Engine& e, const Image& bgr,
         texts[start + i] = {out.text, out.score};
       }
     }
+    t_ctc_end = std::chrono::steady_clock::now();
+    if (prof) {
+      e.last_profile.rec_prep_ms += std::chrono::duration<float, std::milli>(
+          t_rp_end - t_rp).count();
+      e.last_profile.rec_run_ms += std::chrono::duration<float, std::milli>(
+          t_rr_end - t_rr).count();
+      e.last_profile.ctc_decode_ms += std::chrono::duration<float, std::milli>(
+          t_ctc_end - t_ctc).count();
+    }
   }
   ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count());
+  if (prof) {
+    e.last_profile.crop_warp_ms = std::chrono::duration<float, std::milli>(
+        t_crop_end - t_crop).count();
+    e.last_profile.rec_batches = n_rec_batches;
+  }
 }
 
 // Convert the (poly[8], text, score) internal representation to the
@@ -967,6 +1022,23 @@ static ppocr_status run_with_boxes(Engine& e, const uint8_t* bgr, int w, int h,
 static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
   if (!bgr || w <= 0 || h <= 0) return PPOCR_ERR_PARAM;
   if (!e.det) return PPOCR_ERR_MODEL;
+  const auto t_e2e = std::chrono::steady_clock::now();
+  if (e.want_profile) {
+    // Reset per-run stage fields; decode_ms is set by ppocr_run_file
+    // BEFORE this call and must survive (run_full itself receives an
+    // already-decoded buffer so its own decode cost is 0). Keep the
+    // incoming value; e2e/create/first_run filled below.
+    e.last_profile.det_prep_ms = 0.f;
+    e.last_profile.det_run_ms = 0.f;
+    e.last_profile.db_post_ms = 0.f;
+    e.last_profile.crop_warp_ms = 0.f;
+    e.last_profile.rec_prep_ms = 0.f;
+    e.last_profile.rec_run_ms = 0.f;
+    e.last_profile.ctc_decode_ms = 0.f;
+    e.last_profile.cls_ms = 0.f;
+    e.last_profile.n_boxes = 0;
+    e.last_profile.rec_batches = 0;
+  }
 
   Image img;
   img.w = w; img.h = h; img.c = 3;
@@ -998,6 +1070,19 @@ static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
   const char* bn = e.det->backend_name();
   std::snprintf(e.last_result.backend_used, sizeof(e.last_result.backend_used),
                 "%s", bn ? bn : "cpu");
+  if (e.want_profile) {
+    e.last_profile.cls_ms = cls_ms;
+    e.last_profile.e2e_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_e2e).count();
+    e.last_profile.create_ms = e.create_ms_stored;
+    if (!e.has_run_once) {
+      e.last_profile.first_run_ms = e.last_profile.e2e_ms;
+    }
+    e.has_run_once = true;
+    std::snprintf(e.last_profile.backend, sizeof(e.last_profile.backend),
+                  "%s", bn ? bn : "cpu");
+    e.last_profile.threads = e.cfg_shadow.num_threads;
+  }
   return PPOCR_OK;
 }
 
@@ -1017,7 +1102,9 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
                                                size_t err_buf_len) {
   if (!cfg || !out) return PPOCR_ERR_PARAM;
   *out = nullptr;
+  const auto t_create = std::chrono::steady_clock::now();
   std::unique_ptr<Engine> e = std::make_unique<Engine>();
+  e->want_profile = (cfg->profile != 0);
   e->model_dir = trim_back_slash(
       cfg->model_dir ? std::string(cfg->model_dir)
                      : env_or("PPORC_MNN_MODELS", "./models"));
@@ -1038,8 +1125,20 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
     }
     return st;
   }
+  if (e->want_profile) {
+    e->create_ms_stored = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_create).count();
+  }
   *out = reinterpret_cast<ppocr_engine*>(e.release());
   return PPOCR_OK;
+}
+
+extern "C" PPOCR_API const ppocr_profile* ppocr_last_profile(
+    const ppocr_engine* pe) {
+  if (!pe) return nullptr;
+  const Engine* e = reinterpret_cast<const Engine*>(pe);
+  if (!e->want_profile || !e->has_run_once) return nullptr;
+  return &e->last_profile;
 }
 
 extern "C" PPOCR_API void ppocr_destroy(ppocr_engine* pe) {
@@ -1074,8 +1173,17 @@ extern "C" PPOCR_API ppocr_status ppocr_run_file(ppocr_engine* pe,
                                                  const char* path,
                                                  ppocr_result** out) {
   if (!pe || !path || !out) return PPOCR_ERR_PARAM;
+  Engine* e = reinterpret_cast<Engine*>(pe);
+  const auto t_dec = std::chrono::steady_clock::now();
   Image img = load_image(path);
   if (img.data.empty()) return PPOCR_ERR_IO;
+  if (e->want_profile) {
+    // Accumulate the decode cost into the profile. run_full resets the
+    // stage fields AFTER we set decode_ms, so stash it and restore:
+    // simplest is to store it now and let run_full preserve it.
+    e->last_profile.decode_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_dec).count();
+  }
   return ppocr_run(pe, img.data.data(), img.w, img.h, out);
 }
 

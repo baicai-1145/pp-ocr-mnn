@@ -37,6 +37,8 @@ struct MnnSessionImpl {
   std::vector<std::vector<int>> output_dims;
   std::vector<std::string>      output_names;
   std::vector<const float*>     output_hosts;
+  // Host snapshot of the last device output (non-CPU backends). Owned.
+  float* device_out_cache = nullptr;
 };
 
 namespace {
@@ -77,7 +79,10 @@ __attribute__((used)) static const char* mnn_backend_label(MNNForwardType t) {
 } // namespace
 
 MnnSession::MnnSession() : impl_(new MnnSessionImpl) {}
-MnnSession::~MnnSession() { delete impl_; }
+MnnSession::~MnnSession() {
+  delete[] impl_->device_out_cache;
+  delete impl_;
+}
 
 MnnSession::MnnSession(MnnSession&& other) noexcept = default;
 MnnSession& MnnSession::operator=(MnnSession&& other) noexcept = default;
@@ -152,6 +157,10 @@ float* MnnSession::input_host(const std::string& name) {
   if (!impl_->interp) return nullptr;
   MNN::Tensor* t = impl_->interp->getSessionInput(impl_->session,
                                                     name.c_str());
+  // MNN 3.6.1: for non-CPU backends the session input tensor lives on
+  // the device (host == nullptr). set_input_float detects this and uses
+  // the copyFromHostTensor path; input_host returning null is expected
+  // there and no longer an error.
   return t ? t->host<float>() : nullptr;
 }
 
@@ -168,16 +177,33 @@ void MnnSession::set_input_float(const std::string& name,
   if (!data) throw std::runtime_error("MnnSession: null input data");
   MnnSession::resize_input(name, dims);
   float* dst = MnnSession::input_host(name);
-  if (!dst) {
-    throw std::runtime_error("MnnSession: input host null after resize (dims=" +
-                             std::to_string(dims[0]) + "x" +
-                             std::to_string(dims[1]) + "x" +
-                             std::to_string(dims[2]) + "x" +
-                             std::to_string(dims[3]) + ")");
-  }
   size_t n = 1;
   for (int d : dims) n *= static_cast<size_t>(d > 0 ? d : 1);
-  std::memcpy(dst, data, n * sizeof(float));
+  if (dst) {
+    // CPU backend (or device backend with host-mapped memory): the
+    // fast path — write the host pointer directly.
+    std::memcpy(dst, data, n * sizeof(float));
+    return;
+  }
+  // MNN 3.6.1, non-CPU backend: the session input tensor lives on the
+  // device (host == nullptr). Stage through a host tensor so the
+  // backend's onCopyBuffer (CUDA / Vulkan / OpenCL) does the transfer
+  // (same fix as the m3-cuda gate driver).
+  MNN::Tensor* dev = impl_->interp->getSessionInput(impl_->session,
+                                                      name.c_str());
+  if (!dev) throw std::runtime_error("MnnSession: no input named " + name);
+  MNN::Tensor* host_tensor = MNN::Tensor::create(
+      dev->shape(), halide_type_of<float>(), nullptr, MNN::Tensor::CAFFE);
+  if (!host_tensor || !host_tensor->host<float>()) {
+    delete host_tensor;
+    throw std::runtime_error("MnnSession: host staging tensor alloc failed");
+  }
+  std::memcpy(host_tensor->host<float>(), data, n * sizeof(float));
+  if (!dev->copyFromHostTensor(host_tensor)) {
+    delete host_tensor;
+    throw std::runtime_error("MnnSession: copyFromHostTensor failed");
+  }
+  delete host_tensor;
 }
 
 int MnnSession::run() {
@@ -205,11 +231,30 @@ SessionOutput MnnSession::output(const std::string& name) const {
   SessionOutput so;
   if (!impl_->interp) return so;
   for (size_t i = 0; i < impl_->output_names.size(); ++i) {
-    if (impl_->output_names[i] == name) {
-      so.data = impl_->output_hosts[i];
-      so.shape = impl_->output_dims[i];
-      return so;
-    }
+    if (impl_->output_names[i] != name) continue;
+    so.shape = impl_->output_dims[i];
+    so.data = impl_->output_hosts[i];
+    if (so.data) return so;
+    // MNN 3.6.1, non-CPU backend: the output tensor lives on the
+    // device. Snapshot it into a caller-lifetime host buffer (the
+    // MnnSession owns it until the next output() call — fine for the
+    // single-threaded run-then-decode flow of the engine).
+    MNN::Tensor* dev = impl_->interp->getSessionOutput(
+        impl_->session, name.c_str());
+    if (!dev) return so;
+    MNN::Tensor* host_out =
+        MNN::Tensor::createHostTensorFromDevice(dev, false);
+    if (!host_out) return so;
+    if (!dev->copyToHostTensor(host_out)) { delete host_out; return so; }
+    // Cache the buffer; freed on the next output() call or destruction.
+    delete[] impl_->device_out_cache;
+    const size_t total = host_out->size() / sizeof(float);
+    impl_->device_out_cache = new float[total];
+    std::memcpy(impl_->device_out_cache, host_out->host<float>(),
+                host_out->size());
+    so.data = impl_->device_out_cache;
+    delete host_out;
+    return so;
   }
   return so;
 }
