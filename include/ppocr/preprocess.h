@@ -35,6 +35,13 @@ struct DetInput {
 // scale 1/255, BGR channel order. Output is CHW float32.
 DetInput prep_det(const Image& bgr, const DetResizeConfig& rc);
 
+// Bit-exact OpenCV INTER_LINEAR for 8-bit 3-channel buffers (see
+// src/preprocess.cpp for the full algorithm note). Exposed so test/verify
+// tooling can compare our kernel against cv2.resize bit-for-bit without
+// going through the whole det pipeline.
+void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
+                         uint8_t* dst, int dst_w, int dst_h);
+
 // One rec line:
 //   1. Resize keep-ratio so h = img_h (= 48), w' = round(h * src_w / src_h).
 //   2. If w' > batch_w, downscale so w' == batch_w (no further crop).
