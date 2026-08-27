@@ -120,7 +120,7 @@ struct Engine {
   // Cached rec batch size (1..N). The default rec_batch=0 in the C
   // ABI means "8", per ppocr.h. We resolve it once at create() so
   // run_full() doesn't repeat the math.
-  int rec_batch = 8;
+  int rec_batch = 16;
 
   // Helpers
   ppocr_status load_submodels(const ppocr_config* cfg, char* err, size_t elen);
@@ -235,8 +235,11 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
                                              : std::string("PP-OCRv6_tiny_rec");
   const std::string cls_name = cfg->cls_name ? cfg->cls_name : std::string();
 
-  // Resolve rec_batch early. The C ABI contract says 0 → 8.
-  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 8;
+  // Resolve rec_batch early. The C ABI default 0 → 16 (M3-PERF4:
+  // width-neutral vs 8 because batch_w is always floored/capped to the
+  // 320 rec shape, so chunk size only changes the session batch dim N;
+  // dense e2e -15% at 16, rec_run 21.9→11.3ms. 32 regresses).
+  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 16;
   if (rec_batch < 1) rec_batch = 1;
 
   // M4-SEAL: auto-detect seal mode from the det model name (any of the
