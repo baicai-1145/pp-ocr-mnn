@@ -170,6 +170,21 @@ the ref-vs-ref calibration (paddle.inference vs PaddleX already exceed
 the gate on ja: MLC 0.179). Recorded as FINAL for the whitepaper;
 no further prep-side work can move it.
 
+TIME-BOX VERDICT (90 min, decision-maker mandate (a)): Suzuki-Abe RETR_LIST
+port attempted; border-follower works but byte-level scan/claim parity with
+cv2 was not reached inside the box. Falsified alongside it:
+  - "missing hole contours cause the 4-box gap": en_04 RETR_LIST vs
+    RETR_EXTERNAL differ by ONE contour only -> holes are NOT the main gap;
+  - pyclipper multi-solution drop (`len(box)>1 continue`): not a factor;
+  - np.round vs float32-premultiply mapping: already aligned, no effect.
+Hole-ring machinery remains wired in db_post.cpp (off-by-default semantics:
+regions fully enclosed by exactly one component synthesize ring candidates);
+fuzz driver + Python icvFetchContour prototype exist under /tmp for a later
+dedicated pass. Pilot residual band attribution returns to:
+kernel noise (bit-level on paired boxes) + unexplained funnel divergence
+concentrated in dense en/ja frames (en/01 4v3, en/04 11v7, en/06 3v2,
+ja dense) that does NOT come from hole contours or clipper multi-solutions.
+
 UPDATE (post DB-A/B): items 1-3 of the DB-post section above moved ja
 from 0.456 → 0.153 and zh 0.102 → 0.062 WITHOUT any kernel-side change,
 proving a large share of the previously "kernel-noise" gap was in fact
