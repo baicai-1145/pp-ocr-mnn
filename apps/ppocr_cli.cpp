@@ -161,12 +161,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Pre-compute basenames into owning std::strings so the c_str() views
-  // stay valid for the duration of ppocr_create (which copies them).
-  const std::string det_name = config_basename(a.det_config);
-  const std::string rec_name = (a.det_only || a.rec_config.empty())
+  // PERF5-urgent: in --boxes-json mode det is never used; skip its
+  // ensure (sha256 of up-to-95MB) and session load entirely.
+  const bool rec_only_mode = !a.boxes_json.empty();
+  const std::string det_name = rec_only_mode
                                    ? std::string{}
-                                   : config_basename(a.rec_config);
+                                   : config_basename(a.det_config);
+  // --boxes-json requires only rec; keep arg validation above unchanged.
+  const std::string rec_name = (!a.rec_config.empty())
+                                   ? config_basename(a.rec_config)
+                                   : std::string{};
   const std::string cls_name = a.cls_config.empty()
                                    ? std::string{}
                                    : config_basename(a.cls_config);
