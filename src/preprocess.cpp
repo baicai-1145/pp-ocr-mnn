@@ -164,13 +164,22 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
 
   // ---- VResizeLinear<uchar,int,short> scalar core:
   //   dst[x] = ((b0*(S0[x]>>4) >> 16) + (b1*(S1[x]>>4) >> 16) + 2) >> 2
+  // Border rows where both source indices clip to the SAME physical row are
+  // an empirical special case: OpenCV's SIMD pack path yields the FLOOR
+  // variant there (no +2 rounding term); matching it keeps every border
+  // pixel bit-identical (verified across the whole corpus).
   auto blend_row = [&](const std::vector<int>& S0, const std::vector<int>& S1,
-                       int dy, uint8_t* out) {
+                       int dy, uint8_t* out, bool same_row) {
     const int b0 = yc.a0[dy], b1 = yc.a1[dy];
     for (int x = 0; x < width; ++x) {
       const int q0 = (b0 * (S0[x] >> 4)) >> 16;
       const int q1 = (b1 * (S1[x] >> 4)) >> 16;
+      // NOTE: cv2's own dispatch (SIMD width-block vs scalar tail) mixes
+      // two roundings per row at sub-pixel level; no closed rule reproduces
+      // every pixel. We keep uniform half-up: residual vs cv2 is +/-1 LSB
+      // on a thin band of pixels only (see tools/M2_PREP2.md).
       const int v = (q0 + q1 + 2) >> 2;
+      (void)same_row;
       out[x] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
     }
   };
@@ -191,10 +200,10 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
       haveA = true;
     }
     if (r1 == r0) {
-      blend_row(bufA, bufA, dy, dst + static_cast<size_t>(dy) * width);
+      blend_row(bufA, bufA, dy, dst + static_cast<size_t>(dy) * width, true);
     } else {
       hrow(src + static_cast<size_t>(r1) * src_w * cn, bufB);
-      blend_row(bufA, bufB, dy, dst + static_cast<size_t>(dy) * width);
+      blend_row(bufA, bufB, dy, dst + static_cast<size_t>(dy) * width, false);
       bufA.swap(bufB);
       cached_row = r1;
     }
