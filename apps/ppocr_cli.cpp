@@ -255,7 +255,6 @@ int run_batch(const Args& a) {
     cfg.num_threads = a.threads;
     cfg.rec_batch  = a.batch;
   cfg.warmup     = a.warmup;
-    cfg.warmup     = a.warmup;
     cfg.max_side   = a.max_side;
     cfg.offline    = 1;
     cfg.download   = 0;
