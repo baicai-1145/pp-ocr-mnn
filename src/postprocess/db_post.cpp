@@ -335,9 +335,17 @@ std::vector<uint8_t> fill_polygon_mask(const std::vector<PointF>& poly_in, int W
     if (a.x != b.x) return a.x < b.x;
     return a.dx < b.dx;
   });
-  const int total = static_cast<int>(edges.size());
+  // OpenCV appends a {y0=INT_MAX} sentinel AFTER sorting: the scan loop's
+  // advance condition reads e->y0 for the NEXT un-inserted edge even when
+  // i == total, relying on the sentinel to make (e->y0 > y) true. Without
+  // it we would read past the array (UB) and the fill stops after row 0 —
+  // this was the en/01,04,06 box-count bug (only contour pixels scored).
+  CvEdge sentinel{};
+  sentinel.y0 = INT_MAX;
+  edges.push_back(sentinel);
+  const int total = static_cast<int>(edges.size()) - 1;  // real edge count
   int y_max_v = INT_MIN;
-  for (const auto& e : edges) y_max_v = std::max(y_max_v, e.y1);
+  for (int k = 0; k < total; ++k) y_max_v = std::max(y_max_v, edges[k].y1);
   if (y_max_v < 0) return mask;
   y_max_v = std::min(y_max_v, H);
   constexpr int64_t kDelta = ((int64_t)1 << 16) - 1;
@@ -516,7 +524,7 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     // get_mini_boxes also returns the short side length for sside filter.
     std::vector<PointF> pts(boundary.begin(), boundary.end());
     PointF box4[4];
-    if (!min_area_rect(pts.data(), pts.size(), box4)) return false;
+    if (!min_area_rect(pts.data(), pts.size(), box4)) { return false; }
     sort_min_area_rect_points(box4);
     // Convert to flat poly (8 floats) for box_score_fast.
     std::vector<PointF> sorted_box4(box4, box4 + 4);
@@ -537,7 +545,7 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     if (ymin < 0) ymin = 0;
     if (xmax > W - 1) xmax = W - 1;
     if (ymax > H - 1) ymax = H - 1;
-    if (xmax < xmin || ymax < ymin) return false;
+    if (xmax < xmin || ymax < ymin) { return false; }
     double sum_prob = 0.0;
     int sum_count = 0;
     for (int yy = ymin; yy <= ymax; ++yy) {
@@ -550,13 +558,13 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
         }
       }
     }
-    if (sum_count == 0) return false;
+    if (sum_count == 0) { return false; }
     float score = static_cast<float>(sum_prob / sum_count);
-    if (cfg.box_thresh > score) return false;
+    if (cfg.box_thresh > score) { return false; }
 
     // Unclip: distance = area * unclip_ratio / perimeter.
     float area = polygon_area(sorted_box4);
-    if (area <= 0.0f) return false;
+    if (area <= 0.0f) { return false; }
     float perim_b = polygon_perimeter(sorted_box4);
     if (perim_b <= 0.0f) return false;
     float distance = area * cfg.unclip_ratio / perim_b;
@@ -586,18 +594,18 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     co.AddPath(path, ClipperLib::jtRound, ClipperLib::etClosedPolygon);
     ClipperLib::Paths solution;
     co.Execute(solution, distance);
-    if (solution.size() != 1) return false;  // Paddle: "if len(box) > 1: continue"
+    if (solution.size() != 1) { return false; }
 
     std::vector<PointF> expanded;
     expanded.reserve(solution[0].size());
     for (const auto& ip : solution[0]) {
       expanded.push_back({static_cast<float>(ip.X), static_cast<float>(ip.Y)});
     }
-    if (expanded.size() < 4) return false;
+    if (expanded.size() < 4) { return false; }
 
     // Re-mini-box and sort.
     PointF box2[4];
-    if (!min_area_rect(expanded.data(), expanded.size(), box2)) return false;
+    if (!min_area_rect(expanded.data(), expanded.size(), box2)) { return false; }
     sort_min_area_rect_points(box2);
     std::vector<PointF> final_box(box2, box2 + 4);
 
@@ -619,7 +627,7 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
                          (final_box[1].y - final_box[2].y) *
                              (final_box[1].y - final_box[2].y));
     float sside = std::min({w1, w2, h1, h2});
-    if (sside < static_cast<float>(cfg.min_size + 2)) return false;
+    if (sside < static_cast<float>(cfg.min_size + 2)) { return false; }
 
     // Map bitmap coords -> original image coords, VERBATIM Paddle:
     //   boxes[:, 0] = (boxes[:, 0] * (dst_w / W)).round()  [clip 0..dst_w-1]

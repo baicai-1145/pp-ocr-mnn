@@ -170,6 +170,33 @@ the ref-vs-ref calibration (paddle.inference vs PaddleX already exceed
 the gate on ja: MLC 0.179). Recorded as FINAL for the whitepaper;
 no further prep-side work can move it.
 
+FUNNEL FORENSIC CLOSURE (30-min box, decision-maker mandate): the
+"unexplained funnel divergence" IS explained, and it was a REAL bug —
+our fill_polygon_mask was missing OpenCV's post-sort {y0=INT_MAX}
+sentinel edge (FillEdgeCollection reads edges[i].y0 for the NEXT
+un-inserted edge even at i==total; without the sentinel that is an
+OOB read and the fill stops after row 0). Symptoms: box_score_fast
+averaged CONTOUR-ONLY pixels (268) instead of the filled mask (2415),
+so wide flat miniboxes whose outline grazed low-prob regions scored
+below box_thresh 0.6 and were dropped (en/01 4v3, en/04 11v7, en/06
+3v2 — all four lost boxes were 0.89-0.93-score text lines in py).
+Kernel-noise attribution for these was WRONG; bitmap flips at >0.3
+between MNN and paddle prob are exactly ZERO on all three frames
+(kernel |dP| max 7e-4 stays safely below the threshold margin).
+Fix: append sentinel after sort; count total excludes it. After fix:
+  - mask count 268 -> 2415 = cv2 bit-exact;
+  - A/B multiset over 16 dumped frames: 225/239 boxes coordinate-exact,
+    238/239 within +-3px (residual = unclip arc discretization), 239/239
+    counts; score delta <= 1.6e-2 worst-case (dense ja);
+  - pilot v4 dual-metric: zh 0.0108 / en 0.0037 / ja 0.0113 — ALL now
+    BELOW system A (PaddleX pipeline self-consistency: 0.0167/0.0146/
+    0.0920). The MNN pipeline is now closer to the canonical paddle
+    baseline than PaddleX itself, on all three pilot languages.
+Hypothesis ledger final state: hole contours (refuted, 1 contour max),
+clipper multi-solution (refuted), mapping rounding (refuted), kernel
+noise at threshold edge (refuted — zero bitmap flips), missing OpenCV
+sentinel (CONFIRMED, fixed). Commit follows.
+
 TIME-BOX VERDICT (90 min, decision-maker mandate (a)): Suzuki-Abe RETR_LIST
 port attempted; border-follower works but byte-level scan/claim parity with
 cv2 was not reached inside the box. Falsified alongside it:
