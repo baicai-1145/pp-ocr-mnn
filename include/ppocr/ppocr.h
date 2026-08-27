@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ppocr/profile.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -66,6 +68,9 @@ typedef struct ppocr_config {
                               // (skips reading-order sort; uses rec
                               // score threshold 0). Auto-detected from
                               // det_name containing "seal" when 0.
+  int profile;                // M3-PERF1: 1 = collect per-stage timings,
+                              // readable via ppocr_last_profile(). 0 = off
+                              // (default; zero instrumentation cost).
 } ppocr_config;
 
 // ---- results ---------------------------------------------------------------
@@ -84,6 +89,12 @@ typedef struct ppocr_result {
 } ppocr_result;
 
 typedef struct ppocr_engine ppocr_engine;
+
+// M3-PERF1: return a pointer to the per-stage profile of the most
+// recent run on this engine. Storage is owned by the engine and valid
+// until the next run/destroy. Returns NULL when config.profile was 0
+// at create time or the engine has not run yet.
+PPOCR_API const ppocr_profile* ppocr_last_profile(const ppocr_engine* e);
 
 // ---- lifecycle --------------------------------------------------------------
 PPOCR_API ppocr_status ppocr_version(int* major, int* minor, int* patch);
