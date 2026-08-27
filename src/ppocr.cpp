@@ -899,9 +899,40 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     const int C  = so.shape[2];
     if (N != static_cast<int>(n) || C <= 1 || T <= 0) continue;
     auto t_ctc = std::chrono::steady_clock::now();
+    // M3-PERF2: decode each batch element's (T,C) logits independently;
+    // rows are independent so a fan-out over std::thread is bit-exact.
+    // v6_medium's 18k-class dict makes single-threaded ctc ~21% of
+    // CUDA e2e; N/8-way fan-out cuts it to ~3%.
+    std::vector<RecOut> outs(n);
+    {
+      const int hw = static_cast<int>(std::thread::hardware_concurrency());
+      int nthreads = hw > 0 ? hw : 4;
+      nthreads = std::min(nthreads, static_cast<int>(n));
+      nthreads = std::min(nthreads, 8);
+      auto worker = [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+          const float* row = so.data + static_cast<size_t>(i) * T * C;
+          outs[static_cast<size_t>(i)] =
+              ctc_decode(row, T, C, e.rec_cfg.rec);
+        }
+      };
+      if (nthreads <= 1) {
+        worker(0, static_cast<int>(n));
+      } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        const int chunk = (static_cast<int>(n) + nthreads - 1) / nthreads;
+        for (int t = 0; t < nthreads; ++t) {
+          const int lo = t * chunk;
+          const int hi = std::min(static_cast<int>(n), lo + chunk);
+          if (lo >= hi) break;
+          pool.emplace_back(worker, lo, hi);
+        }
+        for (auto& th : pool) th.join();
+      }
+    }
     for (size_t i = 0; i < n; ++i) {
-      const float* row = so.data + i * T * C;
-      RecOut out = ctc_decode(row, T, C, e.rec_cfg.rec);
+      const RecOut& out = outs[i];
       // Note: ctc_decode returns the mean probability of the
       // emitted characters. We do NOT threshold text by rec score
       // here — the upstream `box_thresh` and `db_post` kMinSize
