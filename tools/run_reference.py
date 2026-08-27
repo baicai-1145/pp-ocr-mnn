@@ -291,9 +291,19 @@ def process_combo(combo: str, det: str, rec: str, *,
         rec_cfg = resolve_rec_config(rec, configs_dir)
     else:
         det_cfg, rec_cfg = resolve_configs(det, rec, configs_dir)
+    ref_root = Path("/root/ppocr_reference")
+    resume = os.environ.get("RUN_REFERENCE_RESUME", "0") == "1"
+    only_with_baseline = os.environ.get("RUN_REFERENCE_ONLY_BASELINE", "0") == "1"
     for lang in langs:
         img_dir = IMG_ROOT / lang
         if not img_dir.is_dir():
+            continue
+        if only_with_baseline and not _has_baseline(combo, lang, ref_root):
+            continue
+        if resume and _pred_done(results_dir, combo, lang):
+            out["langs"][lang] = {"count": -1, "ok": -1, "pred_path":
+                                  str(results_dir / combo / lang / "pred.json"),
+                                  "skipped": True}
             continue
         images = list_images(lang, rec_only=rec_only)
         if not images:
@@ -340,6 +350,30 @@ def process_combo(combo: str, det: str, rec: str, *,
         out["langs"][lang] = {"count": len(items), "ok": ok_count,
                               "pred_path": str(out_path)}
     return out
+
+
+def _has_baseline(combo: str, lang: str, ref_root: Path) -> bool:
+    """Cell has a v3-stamped baseline on disk (paddle-direct regen)."""
+    jf = ref_root / combo / lang / "ocr_results.json"
+    if not jf.exists():
+        return False
+    try:
+        recs = json.loads(jf.read_text(encoding="utf-8"))
+        return bool(recs) and all(r.get("gen", "").startswith("paddle-direct")
+                                  for r in recs)
+    except Exception:
+        return False
+
+
+def _pred_done(results_dir: Path, combo: str, lang: str) -> bool:
+    jf = results_dir / combo / lang / "pred.json"
+    if not jf.exists():
+        return False
+    try:
+        items = json.loads(jf.read_text(encoding="utf-8"))
+        return bool(items) and not any("error" in i for i in items)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------

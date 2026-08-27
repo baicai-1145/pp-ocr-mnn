@@ -258,9 +258,26 @@ else()
   target_link_libraries(ppocr_core PUBLIC MNN)
 endif()
 
+# ---- MNN CUDA companion lib (optional) ----------------------------------
+# MNN's Linux CUDA backend is a SHARED companion (libMNN_Cuda_Main.so) whose
+# implementation lives outside libMNN.a; the backend factory (Register.cpp
+# object) is inside libMNN.a. Linking the .so directly AND exporting dynamic
+# symbols lets its weak references into the statically-linked MNN core
+# resolve. Without this, --backend cuda silently falls back to CPU
+# ("Can't Find type=2 backend").
+set(_mnn_cuda_so "${PPOCR_MNN_ROOT}/build/source/backend/cuda/libMNN_Cuda_Main.so")
+
 # ---- CLI ----------------------------------------------------------------
 add_executable(ppocr_cli apps/ppocr_cli.cpp)
 target_link_libraries(ppocr_cli PRIVATE ppocr_core)
+if(EXISTS "${_mnn_cuda_so}")
+  message(STATUS "ppocr-mnn: linking MNN CUDA companion ${_mnn_cuda_so}")
+  # --no-as-needed MUST precede the .so on the link line; CMake places
+  # target_link_options AFTER libraries, so we wrap it into the link items
+  # themselves (policy CMP0099 / classic behaviour).
+  target_link_libraries(ppocr_cli PRIVATE
+    "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed" "-Wl,--export-dynamic")
+endif()
 
 # ---- tests --------------------------------------------------------------
 enable_testing()

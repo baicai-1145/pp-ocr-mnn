@@ -152,6 +152,18 @@ void write_result(FILE* f, const char* image, const ppocr_result* r,
 
 } // namespace
 
+// Force the linker to keep MNN's CUDA Register.o when linking libMNN.a
+// statically. Register.cpp self-registers via a global-initializer
+// (placeholder bool). Without a live reference the archive member is
+// dropped and --backend cuda falls back to CPU ("Can't Find type=2").
+// Platform-agnostic (rule 6): weak declaration, resolved only when the
+// CUDA companion is linked (see CMake _mnn_cuda_so block).
+#if defined(__ELF__)
+namespace MNN { namespace CUDA { extern bool placeholder; } }
+static volatile const bool* _mnn_cuda_force =
+    reinterpret_cast<const bool*>(&MNN::CUDA::placeholder);
+#endif
+
 int main(int argc, char** argv) {
   Args a;
   if (!parse_args(argc, argv, a) || a.help) { usage(); return a.help ? 0 : 1; }
