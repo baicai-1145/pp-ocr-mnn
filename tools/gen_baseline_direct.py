@@ -26,6 +26,7 @@ The tool writes /root/ppocr_reference/<combo>/<lang>/ocr_results.json
 """
 import os, sys, json, math, time, gc, glob, argparse, traceback, warnings, subprocess
 warnings.filterwarnings("ignore")
+USE_GPU = os.environ.get("GEN_BASELINE_GPU", "0") == "1"
 import numpy as np
 import cv2
 import paddle.inference as paddle_infer
@@ -159,12 +160,28 @@ def det_preprocess(raw, det_cfg):
     return chw, resize_h, resize_w
 
 
-def det_infer(det_name, chw, resize_h, resize_w):
+_PRED_CACHE = {}
+
+def _get_predictor(model_name):
+    """Worker-lifetime predictor cache: model load (the expensive op) happens
+    once per (model_name); Config creation is ~100x cheaper."""
+    if model_name in _PRED_CACHE:
+        return _PRED_CACHE[model_name]
     cfg = paddle_infer.Config(
-        os.path.join(MODEL_ROOT, det_name, "inference.json"),
-        os.path.join(MODEL_ROOT, det_name, "inference.pdiparams"))
-    cfg.disable_glog_info(); cfg.disable_gpu(); cfg.disable_mkldnn()
+        os.path.join(MODEL_ROOT, model_name, "inference.json"),
+        os.path.join(MODEL_ROOT, model_name, "inference.pdiparams"))
+    cfg.disable_glog_info()
+    if USE_GPU:
+        cfg.enable_use_gpu(100, 0)
+    else:
+        cfg.disable_gpu(); cfg.disable_mkldnn()
     pred = paddle_infer.create_predictor(cfg)
+    _PRED_CACHE[model_name] = pred
+    return pred
+
+
+def det_infer(det_name, chw, resize_h, resize_w):
+    pred = _get_predictor(det_name)
     inp = pred.get_input_handle(pred.get_input_names()[0])
     inp.reshape([1, 3, resize_h, resize_w])
     inp.copy_from_cpu(chw[np.newaxis, ...])
@@ -205,11 +222,7 @@ def rec_infer(rec_name, crop):
     resized -= 0.5; resized /= 0.5
     chw = np.zeros((imgC, imgH, batch_w), dtype=np.float32)
     chw[:, :, 0:resized_w] = resized
-    cfg = paddle_infer.Config(
-        os.path.join(MODEL_ROOT, rec_name, "inference.json"),
-        os.path.join(MODEL_ROOT, rec_name, "inference.pdiparams"))
-    cfg.disable_glog_info(); cfg.disable_gpu(); cfg.disable_mkldnn()
-    pred = paddle_infer.create_predictor(cfg)
+    pred = _get_predictor(rec_name)
     inp = pred.get_input_handle(pred.get_input_names()[0])
     inp.reshape([1, 3, 48, batch_w])
     inp.copy_from_cpu(chw[np.newaxis, ...])
@@ -337,6 +350,7 @@ def run_ocr_cell(det_name, rec_name, lang):
                 for i in range(len(rec_texts))
             ]
             out_records.append({
+                "gen": "paddle-direct-v3",
                 "image_path": img,
                 "text": "\n".join(rec_texts),
                 "rec_texts": rec_texts,
@@ -373,6 +387,7 @@ def run_strip_cell(rec_name, lang):
             raw = cv2.imread(img)
             text, score = rec_infer(rec_name, raw)
             out_records.append({
+                "gen": "paddle-direct-v3",
                 "image_path": img,
                 "rec_texts": [text],
                 "rec_scores": [score],
@@ -425,6 +440,8 @@ def main():
     ap.add_argument("--combo", default=None, help="only run this combo")
     ap.add_argument("--workers", type=int, default=1, help="parallel workers")
     ap.add_argument("--full", action="store_true", help="all 811 cells")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip cells whose ocr_results.json exists with current schema")
     args = ap.parse_args()
 
     if args.pilot:
@@ -441,6 +458,10 @@ def main():
         return 2
 
     tasks = build_plan(lang if False else None, only_combo, langs)
+    if args.skip_existing:
+        before = len(tasks)
+        tasks = [t for t in tasks if not cell_done(t)]
+        print(f"[skip-existing] {before - len(tasks)} cells skipped, {len(tasks)} to run", flush=True)
     if not tasks:
         print("no tasks", file=sys.stderr)
         return 0
@@ -456,6 +477,24 @@ def main():
             print(f"[{i}/{len(tasks)}] {worker(t)}", flush=True)
     print(f"[done] {time.time()-t0:.0f}s")
     return 0
+
+
+def cell_done(task):
+    """A cell is done if its ocr_results.json parses, has records, and every
+    record carries the current-schema marker (v3: 'gen' key + paddle-direct)."""
+    if task[0] == "strip":
+        rec, lang = task[1], task[2]
+        jf = os.path.join(REF_ROOT, "strip", f"{rec}__{lang}", "ocr_results.json")
+    else:
+        _, det, rec, lang = task
+        jf = os.path.join(REF_ROOT, f"{det}__{rec}", lang, "ocr_results.json")
+    if not os.path.exists(jf):
+        return False
+    try:
+        recs = json.load(open(jf, encoding="utf-8"))
+        return bool(recs) and all("gen" in r and r.get("gen","").startswith("paddle-direct") for r in recs)
+    except Exception:
+        return False
 
 
 def worker(task):
