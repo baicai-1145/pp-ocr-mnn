@@ -536,6 +536,12 @@ static void run_det_sync(Engine& e, const Image& bgr,
 // predicts 180°. PaddleOCR's PaddleClas::TextRecRotator does exactly
 // this (`cv::rotate(rotated_image, cv::ROTATE_180)`).
 static void rotate_180_inplace(Image& img) {
+  // M3-PERF6: if img is a non-owning view, materialize it first (this
+  // function mutates in place). Only hit on the cls-180 path.
+  if (img.ext && img.data.empty()) {
+    img.data.assign(img.ext, img.ext + static_cast<size_t>(img.w) * img.h * img.c);
+    img.ext = nullptr;
+  }
   if (img.data.empty() || img.w <= 0 || img.h <= 0) return;
   const int W = img.w;
   const int H = img.h;
@@ -1108,7 +1114,7 @@ static ppocr_status run_with_boxes(Engine& e, const uint8_t* bgr, int w, int h,
 
   Image img;
   img.w = w; img.h = h; img.c = 3;
-  img.data.assign(bgr, bgr + static_cast<size_t>(w) * h * 3);
+  img.ext = bgr;  // M3-PERF6: non-owning view
 
   std::vector<DetBox> boxes;
   boxes.reserve(static_cast<size_t>(n_polys));
@@ -1157,9 +1163,13 @@ static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
     e.last_profile.rec_batches = 0;
   }
 
+  // M3-PERF6: zero-copy view over the caller's buffer. All pipeline
+  // consumers of the input image are const readers (prep_det resize,
+  // warp sampler); the only mutator (cls rotate_180) materializes an
+  // owning copy first. This removes a full-image memcpy per run.
   Image img;
   img.w = w; img.h = h; img.c = 3;
-  img.data.assign(bgr, bgr + static_cast<size_t>(w) * h * 3);
+  img.ext = bgr;
 
   std::vector<DetBox> boxes;
   float det_ms = 0.f, rec_ms = 0.f, cls_ms = 0.f;

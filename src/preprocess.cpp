@@ -253,13 +253,18 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   }
 
   std::vector<uint8_t> resized;
+  const uint8_t* resized_src = nullptr;
   if (resize_w == bgr.w && resize_h == bgr.h) {
-    // NoResize: avoid the bilinear copy and reuse the source buffer.
-    resized.assign(bgr.data.begin(), bgr.data.end());
+    // NoResize: skip the bilinear copy AND the intermediate buffer —
+    // convert straight from the source bytes (view-safe: bytes()
+    // resolves the non-owning pointer). Same input bytes into the same
+    // hwc_bgr_to_chw_float ⇒ bit-identical output.
+    resized_src = bgr.bytes();
   } else {
     resized.assign(static_cast<size_t>(resize_w) * resize_h * 3, 0);
-    resize_bilinear_bgr(bgr.data.data(), bgr.w, bgr.h,
+    resize_bilinear_bgr(bgr.bytes(), bgr.w, bgr.h,
                         resized.data(), resize_w, resize_h);
+    resized_src = resized.data();
   }
 
   DetInput out;
@@ -278,7 +283,7 @@ DetInput prep_det(const Image& bgr, const DetResizeConfig& rc) {
   // apply cfg.det.thresh-mean / std per channel position.
   const float mean[3] = {0.485f, 0.456f, 0.406f};
   const float std [3] = {0.229f, 0.224f, 0.225f};
-  hwc_bgr_to_chw_float(resized.data(), resize_w, resize_h,
+  hwc_bgr_to_chw_float(resized_src, resize_w, resize_h,
                        out.chw.data(), 1.f / 255.f, mean, std);
   return out;
 }
@@ -310,7 +315,7 @@ std::vector<float> prep_rec_line(const Image& line_bgr, int img_h, int batch_w,
     // The first `w` columns of each row get the resized pixels; the rest
     // stay zero (matches the zero-padded CHW tensor in resize_norm_img).
     tmp.assign(static_cast<size_t>(w) * img_h * 3, 0);
-    resize_bilinear_bgr(line_bgr.data.data(), line_bgr.w, line_bgr.h,
+    resize_bilinear_bgr(line_bgr.bytes(), line_bgr.w, line_bgr.h,
                         tmp.data(), w, img_h);
     for (int y = 0; y < img_h; ++y) {
       std::memcpy(resized.data() + static_cast<size_t>(y) * batch_w * 3,
