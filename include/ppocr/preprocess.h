@@ -18,7 +18,10 @@ namespace ppocr {
 //   C = 3
 //   H = in_h
 //   W = in_w
-// ratio_w = src_w / in_w, ratio_h = src_h / in_h — callers use these to
+// NOTE on ratio semantics: prep_det() stores the PaddleX-convention
+// ratio (resize/src). The db_postprocess consumer expects the INVERSE
+// (src/prob); ppocr.cpp computes it explicitly at the call site.
+// Do NOT propagate prep's ratio into db_postprocess directly.
 // unmap polygons from network space back to original-image space.
 struct DetInput {
   int in_w = 0, in_h = 0;

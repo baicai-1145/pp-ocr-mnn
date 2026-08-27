@@ -385,7 +385,9 @@ static void run_det_sync(Engine& e, const Image& bgr,
   const int H = so.shape[2];
   const int W = so.shape[3];
   boxes_out = db_postprocess(so.data, H, W, bgr.w, bgr.h,
-                             in.ratio_w, in.ratio_h, e.det_cfg.det);
+                             static_cast<float>(bgr.w) / static_cast<float>(W),
+                             static_cast<float>(bgr.h) / static_cast<float>(H),
+                             e.det_cfg.det);
   // NOTE (POST-4): db_postprocess emits boxes in cv::findContours order,
   // which is NOT reading order. Paddle's pipeline applies
   // ComponentsProcessor::SortQuadBoxes (top-to-bottom, then left-to-right
