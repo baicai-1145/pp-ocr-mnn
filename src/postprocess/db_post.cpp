@@ -256,47 +256,72 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
   // First pass: assign provisional labels.
   std::vector<int> label(W * H, 0);
   int next_label = 1;
-  std::vector<int> nbr_offsets;
+  // M3-PERF2: neighbor offsets precomputed ONCE (dy*W+dx flat, as
+  // before). NOTE: the flat-offset arithmetic below is deliberately
+  // preserved bit-for-bit from the original code — off/W and off%W use
+  // C truncation semantics, which for dy=-1 folds those three
+  // "up-row" neighbors onto the SAME row (a latent quirk the M2
+  // matrix was validated against). "Fixing" it to true
+  // 8-connectivity changes the component merge order and shifts
+  // boxes on dense maps (en/08: 302 -> 301 lines) — do NOT change
+  // without re-running the full CER matrix.
+  int nbr_offsets[8];
+  int n_off = 0;
   for (int dy = -1; dy <= 1; ++dy) {
     for (int dx = -1; dx <= 1; ++dx) {
       if (dx == 0 && dy == 0) continue;
-      nbr_offsets.push_back(dy * W + dx);
+      nbr_offsets[n_off++] = dy * W + dx;
     }
   }
   for (int y = 0; y < H; ++y) {
     for (int x = 0; x < W; ++x) {
       if (!mask[y * W + x]) continue;
       int my = next_label++;
-      std::vector<int> neighbors;
-      for (int off : nbr_offsets) {
+      // M3-PERF2: fixed 8-slot stack array instead of a heap vector
+      // per pixel (this loop runs over every text pixel; the malloc
+      // churn was measurable on dense maps). Same semantics as the
+      // original: neighbors collected in the same offset order, min
+      // chosen with the same first-min tie-breaking.
+      int neighbors[8];
+      int n_nbr = 0;
+      for (int k = 0; k < n_off; ++k) {
+        const int off = nbr_offsets[k];
         int yy = y + off / W;
         int xx = x + off % W;
         if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
-        if (label[yy * W + xx] > 0) neighbors.push_back(label[yy * W + xx]);
+        const int l = label[yy * W + xx];
+        if (l > 0) neighbors[n_nbr++] = l;
       }
-      if (neighbors.empty()) {
+      if (n_nbr == 0) {
         label[y * W + x] = my;
       } else {
-        int min_lbl = *std::min_element(neighbors.begin(), neighbors.end());
+        int min_lbl = neighbors[0];
+        for (int k = 1; k < n_nbr; ++k) {
+          if (neighbors[k] < min_lbl) min_lbl = neighbors[k];
+        }
         label[y * W + x] = min_lbl;
-        for (int n : neighbors) uf.unite(min_lbl, n);
+        for (int k = 0; k < n_nbr; ++k) uf.unite(min_lbl, neighbors[k]);
       }
     }
   }
   // Second pass: flatten labels.
+  // M3-PERF2: root->component-index lookup was a linear std::find over
+  // comp_size per pixel (O(labels) per pixel, O(n^2) overall — the
+  // single hottest line on dense maps). Replace with a direct
+  // label-indexed vector built in the same order (first-seen root gets
+  // the next index), which preserves the EXACT same component ids.
   std::vector<int> comp(W * H, 0);
+  std::vector<int> root_to_idx(next_label, 0);  // labels are 1..next_label-1
   std::vector<int> comp_size;
   comp_size.push_back(0);  // index 0 unused
   for (int i = 0; i < W * H; ++i) {
     if (label[i] == 0) continue;
-    int root = uf.find(label[i]);
-    int idx;
-    auto it = std::find(comp_size.begin() + 1, comp_size.end(), root);
-    if (it == comp_size.end()) {
+    const int root = uf.find(label[i]);
+    int idx = root_to_idx[root];
+    if (idx == 0) {
       comp_size.push_back(root);
       idx = static_cast<int>(comp_size.size()) - 1;
-    } else {
-      idx = static_cast<int>(it - comp_size.begin());
+      root_to_idx[root] = idx;
     }
     comp[i] = idx;
   }
@@ -316,14 +341,52 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     return comp_pixel_count[a] > comp_pixel_count[b];
   });
 
+  // M3-PERF2: one row-major sweep collecting each component's first
+  // boundary pixel (same 4-neighbor border test as
+  // find_first_boundary). Replaces the per-component full-map scan
+  // (O(n_comp x W x H) — 95 ms of the 101 ms db_post on the 283-box
+  // en/08 map) with a single O(W x H) pass. The first boundary pixel
+  // found per label in row-major order is identical to what
+  // find_first_boundary returned, so seeds (and thus boundaries, boxes
+  // and scores) are bit-identical.
+  std::vector<int> first_bx(n_comp + 1, -1), first_by(n_comp + 1, -1);
+  {
+    int remaining = n_comp;
+    for (int y = 0; y < H && remaining > 0; ++y) {
+      const int rowoff = y * W;
+      for (int x = 0; x < W && remaining > 0; ++x) {
+        const int lbl = comp[rowoff + x];
+        if (lbl <= 0 || first_bx[lbl] >= 0) continue;
+        bool is_border = false;
+        if (x == 0 || x == W - 1 || y == 0 || y == H - 1) {
+          is_border = true;
+        } else {
+          if (comp[rowoff + x - 1] != lbl ||
+              comp[rowoff + x + 1] != lbl ||
+              comp[(y - 1) * W + x] != lbl ||
+              comp[(y + 1) * W + x] != lbl) {
+            is_border = true;
+          }
+        }
+        if (is_border) {
+          first_bx[lbl] = x;
+          first_by[lbl] = y;
+          --remaining;
+        }
+      }
+    }
+  }
+
   for (int ci = 0; ci < max_cand_n; ++ci) {
     int lbl = order[ci];
     if (comp_pixel_count[lbl] < 1) continue;
 
     int sx = -1, sy = -1;
-    if (!find_first_boundary(comp, W, H, lbl, &sx, &sy)) {
+    if (first_bx[lbl] < 0) {
       continue;
     }
+    sx = first_bx[lbl];
+    sy = first_by[lbl];
     std::vector<PointF> boundary = trace_boundary(comp, W, H, lbl, sx, sy);
     if (boundary.size() < 4) continue;
 

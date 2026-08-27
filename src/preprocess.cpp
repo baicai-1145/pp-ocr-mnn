@@ -32,8 +32,25 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
     return;
   }
   // Same scaling for x and y (cv2.resize default).
+  // M3-PERF2: hoist all per-column / per-row invariant math out of the
+  // inner loop. The floating-point expressions are UNCHANGED (same ops,
+  // same order, same doubles), so results are bit-identical to the
+  // naive loop this replaced; only the redundant (x+0.5)*sx-0.5 /
+  // floor / clamps per row are gone.
   const double sx = static_cast<double>(src_w) / dst_w;
   const double sy = static_cast<double>(src_h) / dst_h;
+  std::vector<int>   x0v(dst_w);
+  std::vector<double> dxv(dst_w), gx1v(dst_w), gx2v(dst_w);
+  for (int x = 0; x < dst_w; ++x) {
+    const double fx = (x + 0.5) * sx - 0.5;
+    int x0 = static_cast<int>(std::floor(fx));
+    if (x0 < 0) x0 = 0;
+    if (x0 >= src_w - 1) x0 = src_w - 2;
+    const double dx = fx - x0;
+    x0v[x] = x0;
+    dxv[x] = dx;
+    gx1v[x] = 1 - dx;
+  }
   for (int y = 0; y < dst_h; ++y) {
     // PaddleOCR uses half-pixel center, matching cv2.resize INTER_LINEAR.
     const double fy = (y + 0.5) * sy - 0.5;
@@ -41,26 +58,27 @@ void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
     if (y0 < 0) y0 = 0;
     if (y0 >= src_h - 1) y0 = src_h - 2;
     const double dy = fy - y0;
+    const double gy1 = 1 - dy;
+    const uint8_t* row0 = src + static_cast<size_t>(y0) * src_w * 3;
+    const uint8_t* row1 = src + static_cast<size_t>(y0 + 1) * src_w * 3;
+    uint8_t* po = dst + static_cast<size_t>(y) * dst_w * 3;
     for (int x = 0; x < dst_w; ++x) {
-      const double fx = (x + 0.5) * sx - 0.5;
-      int x0 = static_cast<int>(std::floor(fx));
-      if (x0 < 0) x0 = 0;
-      if (x0 >= src_w - 1) x0 = src_w - 2;
-      const double dx = fx - x0;
-      const uint8_t* p00 = src + (static_cast<size_t>(y0)     * src_w + x0)     * 3;
-      const uint8_t* p01 = src + (static_cast<size_t>(y0)     * src_w + x0 + 1) * 3;
-      const uint8_t* p10 = src + (static_cast<size_t>(y0 + 1) * src_w + x0)     * 3;
-      const uint8_t* p11 = src + (static_cast<size_t>(y0 + 1) * src_w + x0 + 1) * 3;
-      uint8_t* po = dst + (static_cast<size_t>(y) * dst_w + x) * 3;
+      const int x0 = x0v[x];
+      const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 3;
+      const uint8_t* p01 = p00 + 3;
+      const uint8_t* p10 = row1 + static_cast<size_t>(x0) * 3;
+      const uint8_t* p11 = p10 + 3;
+      const double dx = dxv[x];
       for (int c = 0; c < 3; ++c) {
         const double v =
-            (1 - dy) * ((1 - dx) * p00[c] + dx * p01[c]) +
-            dy       * ((1 - dx) * p10[c] + dx * p11[c]);
+            gy1 * (gx1v[x] * p00[c] + dx * p01[c]) +
+            dy  * (gx1v[x] * p10[c] + dx * p11[c]);
         int iv = static_cast<int>(std::lround(v));
         if (iv < 0) iv = 0;
         if (iv > 255) iv = 255;
         po[c] = static_cast<uint8_t>(iv);
       }
+      po += 3;
     }
   }
 }
@@ -92,18 +110,27 @@ void hwc_bgr_to_chw_float(const uint8_t* src, int w, int h,
                           const float* mean_bgr,
                           const float* std_bgr) {
   const size_t plane = static_cast<size_t>(w) * h;
+  // M3-PERF2: 256-entry LUT per channel. The LUT holds the result of
+  // the EXACT original expression (static_cast<float>(v) * scale -
+  // mean) / std for each byte value, so outputs are bit-identical;
+  // the inner loop becomes 3 gathers + 3 stores.
+  float lut[3][256];
+  for (int c = 0; c < 3; ++c) {
+    for (int v = 0; v < 256; ++v) {
+      lut[c][v] = (static_cast<float>(v) * scale - mean_bgr[c]) / std_bgr[c];
+    }
+  }
   for (int y = 0; y < h; ++y) {
     const uint8_t* row = src + static_cast<size_t>(y) * w * 3;
+    float* db = dst + 0 * plane + static_cast<size_t>(y) * w;
+    float* dg = dst + 1 * plane + static_cast<size_t>(y) * w;
+    float* dr = dst + 2 * plane + static_cast<size_t>(y) * w;
     for (int x = 0; x < w; ++x) {
-      const uint8_t* px = row + x * 3;
       // px[0] = B, px[1] = G, px[2] = R. mean_bgr/std_bgr are in the
       // same BGR order, so channel i gets mean_bgr[i].
-      const float b = (static_cast<float>(px[0]) * scale - mean_bgr[0]) / std_bgr[0];
-      const float g = (static_cast<float>(px[1]) * scale - mean_bgr[1]) / std_bgr[1];
-      const float r = (static_cast<float>(px[2]) * scale - mean_bgr[2]) / std_bgr[2];
-      dst[0 * plane + y * w + x] = b;
-      dst[1 * plane + y * w + x] = g;
-      dst[2 * plane + y * w + x] = r;
+      db[x] = lut[0][row[x * 3 + 0]];
+      dg[x] = lut[1][row[x * 3 + 1]];
+      dr[x] = lut[2][row[x * 3 + 2]];
     }
   }
 }

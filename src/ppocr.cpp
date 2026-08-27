@@ -639,8 +639,14 @@ static void run_rec_sync(Engine& e, const Image& bgr,
   // Pre-compute crops in a vector aligned with `boxes`.
   struct Crop { Image img; };
   std::vector<Crop> crops;
-  crops.reserve(boxes.size());
-  for (const auto& b : boxes) {
+  // M3-PERF2: pre-size and fill by index so the per-box warp work
+  // (perspective warp + rot90) can be fanned out over threads below;
+  // results are per-box independent, so output order/bytes are
+  // unchanged (bit-exact).
+  crops.resize(boxes.size());
+  const std::vector<DetBox>& boxes_ref = boxes;
+  auto crop_one = [&](size_t bi) -> void {
+    const DetBox& b = boxes_ref[bi];
     // db_post returns poly already in PaddleOCR canonical order
     // [TL, TR, BR, BL] (sort_min_area_rect_points was applied).
     PointF quad[4];
@@ -749,8 +755,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
     }
     if (warped.data.empty() || warped.w <= 0 || warped.h <= 0) {
-      crops.push_back({Image{}});
-      continue;
+      return;  // leave crops[bi].img empty, as the old push_back({Image{}}) did
     }
     // Rotate 90° if H/W >= 1.5, matching paddlex crop_image_regions.py:
     //   if dst_img_height * 1.0 / dst_img_width >= 1.5: dst_img = np.rot90(dst_img)
@@ -777,7 +782,30 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       }
       warped = std::move(rot);
     }
-    crops.push_back({std::move(warped)});
+    crops[bi].img = std::move(warped);
+  };
+  {
+    const int nbox = static_cast<int>(boxes.size());
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    int nthr = hw > 0 ? hw : 4;
+    nthr = std::min(nthr, nbox > 0 ? nbox : 1);
+    nthr = std::min(nthr, 8);
+    if (nthr <= 1) {
+      for (int bi = 0; bi < nbox; ++bi) crop_one(static_cast<size_t>(bi));
+    } else {
+      std::vector<std::thread> pool;
+      pool.reserve(nthr);
+      const int chunk = (nbox + nthr - 1) / nthr;
+      for (int t = 0; t < nthr; ++t) {
+        const int lo = t * chunk;
+        const int hi = std::min(nbox, lo + chunk);
+        if (lo >= hi) break;
+        pool.emplace_back([&, lo, hi] {
+          for (int bi = lo; bi < hi; ++bi) crop_one(static_cast<size_t>(bi));
+        });
+      }
+      for (auto& th : pool) th.join();
+    }
   }
   auto t_crop_end = std::chrono::steady_clock::now();
   // ---- M3 cls step ----
@@ -869,13 +897,40 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     // Build the CHW tensor: N * 3 * H * batch_w.
     auto t_rp = std::chrono::steady_clock::now();
     std::vector<float> chw(static_cast<size_t>(n) * 3 * H * batch_w, 0.f);
-    for (size_t i = 0; i < n; ++i) {
-      if (crops[start + i].img.data.empty()) continue;
-      int vw = 0;
-      std::vector<float> line_chw =
-          prep_rec_line(crops[start + i].img, H, batch_w, vw);
-      std::memcpy(chw.data() + i * 3 * H * batch_w, line_chw.data(),
-                  static_cast<size_t>(3) * H * batch_w * sizeof(float));
+    {
+      // M3-PERF2: per-crop prep is independent (resize + normalize +
+      // CHW into its own slice of `chw`); fan out over threads.
+      // Bit-exact: each crop writes the same bytes it wrote before.
+      const int hw = static_cast<int>(std::thread::hardware_concurrency());
+      int nthreads = hw > 0 ? hw : 4;
+      nthreads = std::min(nthreads, static_cast<int>(n));
+      nthreads = std::min(nthreads, 8);
+      auto prep_worker = [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+          if (crops[start + i].img.data.empty()) continue;
+          int vw = 0;
+          std::vector<float> line_chw =
+              prep_rec_line(crops[start + i].img, H, batch_w, vw);
+          std::memcpy(
+              chw.data() + static_cast<size_t>(i) * 3 * H * batch_w,
+              line_chw.data(),
+              static_cast<size_t>(3) * H * batch_w * sizeof(float));
+        }
+      };
+      if (nthreads <= 1) {
+        prep_worker(0, static_cast<int>(n));
+      } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        const int chunk = (static_cast<int>(n) + nthreads - 1) / nthreads;
+        for (int t = 0; t < nthreads; ++t) {
+          const int lo = t * chunk;
+          const int hi = std::min(static_cast<int>(n), lo + chunk);
+          if (lo >= hi) break;
+          pool.emplace_back(prep_worker, lo, hi);
+        }
+        for (auto& th : pool) th.join();
+      }
     }
     auto t_rp_end = std::chrono::steady_clock::now();
     // Resize + run rec.
@@ -899,9 +954,40 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     const int C  = so.shape[2];
     if (N != static_cast<int>(n) || C <= 1 || T <= 0) continue;
     auto t_ctc = std::chrono::steady_clock::now();
+    // M3-PERF2: decode each batch element's (T,C) logits independently;
+    // rows are independent so a fan-out over std::thread is bit-exact.
+    // v6_medium's 18k-class dict makes single-threaded ctc ~21% of
+    // CUDA e2e; N/8-way fan-out cuts it to ~3%.
+    std::vector<RecOut> outs(n);
+    {
+      const int hw = static_cast<int>(std::thread::hardware_concurrency());
+      int nthreads = hw > 0 ? hw : 4;
+      nthreads = std::min(nthreads, static_cast<int>(n));
+      nthreads = std::min(nthreads, 8);
+      auto worker = [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+          const float* row = so.data + static_cast<size_t>(i) * T * C;
+          outs[static_cast<size_t>(i)] =
+              ctc_decode(row, T, C, e.rec_cfg.rec);
+        }
+      };
+      if (nthreads <= 1) {
+        worker(0, static_cast<int>(n));
+      } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        const int chunk = (static_cast<int>(n) + nthreads - 1) / nthreads;
+        for (int t = 0; t < nthreads; ++t) {
+          const int lo = t * chunk;
+          const int hi = std::min(static_cast<int>(n), lo + chunk);
+          if (lo >= hi) break;
+          pool.emplace_back(worker, lo, hi);
+        }
+        for (auto& th : pool) th.join();
+      }
+    }
     for (size_t i = 0; i < n; ++i) {
-      const float* row = so.data + i * T * C;
-      RecOut out = ctc_decode(row, T, C, e.rec_cfg.rec);
+      const RecOut& out = outs[i];
       // Note: ctc_decode returns the mean probability of the
       // emitted characters. We do NOT threshold text by rec score
       // here — the upstream `box_thresh` and `db_post` kMinSize
