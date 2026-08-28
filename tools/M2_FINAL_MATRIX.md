@@ -85,3 +85,20 @@ fluctuation, not corruption.
 - Combined with previously-accepted M1 (pilot CERs 0.0037–0.0113,
   below PaddleX self-consistency), M4 (seal 0.655 ≥ 0.60) and M5
   (cross-platform builds), the project acceptance is complete.
+
+## Post-acceptance addendum (CUDA precision experiment, 2026-08-28)
+
+An attempt to rescue the server-det CUDA cells via
+`ScheduleConfig.backendConfig->precision = Precision_High` produced a
+reproducible **segfault**: `backendConfig` is a *borrowed pointer* to
+MNN-internal static defaults; assigning through it corrupts shared
+state and crashes CUDARuntimeCreator::onCreate. (This was already
+documented in ws-post M3-PERF2 notes; the experiment re-derived it.)
+MNN 2.9/3.6.1 CUDA is a cutlass build without cudnn; precision High/Low
+were A/B'd there: both slower, Low garbles text. Conclusion stands:
+server-det × CUDA is an upstream MNN kernel numeric bug
+(shape-dependent; de/00 OK 0.86 / de/01 zero-box / de/05 NaN),
+forensics above. CPU is the correctness reference for all 7 det
+variants (49/49). CLI placeholder-forcing now guarded behind
+PPOCR_MNN_CUDA_COMPANION (static-archive link only; shared-libMNN
+links define nothing and would break).

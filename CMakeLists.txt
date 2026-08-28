@@ -275,6 +275,7 @@ if(EXISTS "${_mnn_cuda_so}")
   # --no-as-needed MUST precede the .so on the link line; CMake places
   # target_link_options AFTER libraries, so we wrap it into the link items
   # themselves (policy CMP0099 / classic behaviour).
+  target_compile_definitions(ppocr_cli PRIVATE PPOCR_MNN_CUDA_COMPANION)
   target_link_libraries(ppocr_cli PRIVATE
     "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed" "-Wl,--export-dynamic")
 endif()

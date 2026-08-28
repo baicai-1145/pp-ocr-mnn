@@ -163,13 +163,19 @@ void write_result(FILE* f, const char* image, const ppocr_result* r,
 
 } // namespace
 
-// Force the linker to keep MNN's CUDA Register.o when linking libMNN.a
-// statically. Register.cpp self-registers via a global-initializer
-// (placeholder bool). Without a live reference the archive member is
-// dropped and --backend cuda falls back to CPU ("Can't Find type=2").
+// Force the linker to keep MNN's CUDA Register.o. Register.cpp
+// self-registers via a global-initializer (placeholder bool).
+// When MNN is linked as a STATIC archive, without a live reference the
+// archive member is dropped and --backend cuda falls back to CPU
+// ("Can't Find type=2"). When MNN is linked as a SHARED library the
+// symbol already lives in libMNN.so, and forcing an undefined reference
+// here BREAKS the link (placeholder is defined only in the companion's
+// registration TU). So: take the address only when the companion is
+// actually linked (PPOCR_MNN_CUDA_COMPANION, defined by CMakeLists when
+// libMNN_Cuda_Main.so is present).
 // Platform-agnostic (rule 6): weak declaration, resolved only when the
 // CUDA companion is linked (see CMake _mnn_cuda_so block).
-#if defined(__ELF__)
+#if defined(__ELF__) && defined(PPOCR_MNN_CUDA_COMPANION)
 namespace MNN { namespace CUDA { extern bool placeholder; } }
 static volatile const bool* _mnn_cuda_force =
     reinterpret_cast<const bool*>(&MNN::CUDA::placeholder);
