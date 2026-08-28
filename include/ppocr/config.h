@@ -55,11 +55,6 @@ struct RecConfig {
   int c = 3, h = 48, w = 320;
   std::vector<std::string> dict;
   bool use_space = true;
-  // M3-PERF5: optional per-model rec batch default. 0 = unset (engine
-  // default applies). Bigger rec models (v6_medium, 47-77MB) run faster
-  // at batch 8 on CUDA: the [16,3,48,320] session resize + activation
-  // memory outweighs the GEMM win (dense6 w1: 1.08 fps @8 vs 0.87 @16).
-  int rec_batch_hint = 0;
 };
 
 // Text-line orientation classifier (PP-LCNet_x1_0_textline_ori).

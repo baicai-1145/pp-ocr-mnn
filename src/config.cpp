@@ -251,11 +251,6 @@ class JsonParser {
           else if (s_.compare(p_, 5, "false") == 0) { p_ += 5; v = false; }
           else throw err_at("expected boolean");
           cfg.rec.use_space = v;
-        } else if (key == "rec_batch_hint") {
-          const size_t s0 = p_;
-          if (p_ < s_.size() && s_[p_] == '-') ++p_;
-          while (p_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[p_]))) ++p_;
-          cfg.rec.rec_batch_hint = std::stoi(s_.substr(s0, p_ - s0));
         } else if (key == "dict") {
           cfg.rec.dict = parse_string_array();
         } else {

@@ -18,7 +18,10 @@ namespace ppocr {
 //   C = 3
 //   H = in_h
 //   W = in_w
-// ratio_w = src_w / in_w, ratio_h = src_h / in_h — callers use these to
+// NOTE on ratio semantics: prep_det() stores the PaddleX-convention
+// ratio (resize/src). The db_postprocess consumer expects the INVERSE
+// (src/prob); ppocr.cpp computes it explicitly at the call site.
+// Do NOT propagate prep's ratio into db_postprocess directly.
 // unmap polygons from network space back to original-image space.
 struct DetInput {
   int in_w = 0, in_h = 0;
@@ -34,6 +37,13 @@ struct DetInput {
 // normalization: mean {0.485, 0.456, 0.406} std {0.229, 0.224, 0.225}
 // scale 1/255, BGR channel order. Output is CHW float32.
 DetInput prep_det(const Image& bgr, const DetResizeConfig& rc);
+
+// Bit-exact OpenCV INTER_LINEAR for 8-bit 3-channel buffers (see
+// src/preprocess.cpp for the full algorithm note). Exposed so test/verify
+// tooling can compare our kernel against cv2.resize bit-for-bit without
+// going through the whole det pipeline.
+void resize_bilinear_bgr(const uint8_t* src, int src_w, int src_h,
+                         uint8_t* dst, int dst_w, int dst_h);
 
 // One rec line:
 //   1. Resize keep-ratio so h = img_h (= 48), w' = round(h * src_w / src_h).

@@ -120,15 +120,10 @@ struct Engine {
   // Cached rec batch size (1..N). The default rec_batch=0 in the C
   // ABI means "8", per ppocr.h. We resolve it once at create() so
   // run_full() doesn't repeat the math.
-  int rec_batch = 16;
+  int rec_batch = 8;
 
   // Helpers
   ppocr_status load_submodels(const ppocr_config* cfg, char* err, size_t elen);
-  // M3-PERF4: one dummy inference per loaded model (det 640x640, rec
-  // 1x3x48x320, cls 1x3x80x160) to absorb the one-time backend init
-  // (cutlass param selection + workspace allocation on CUDA) at create
-  // time instead of on the first real image. Outputs are discarded.
-  void warmup();
 };
 
 // ---- helpers -------------------------------------------------------------
@@ -240,6 +235,10 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
                                              : std::string("PP-OCRv6_tiny_rec");
   const std::string cls_name = cfg->cls_name ? cfg->cls_name : std::string();
 
+  // Resolve rec_batch early. The C ABI contract says 0 → 8.
+  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch : 8;
+  if (rec_batch < 1) rec_batch = 1;
+
   // M4-SEAL: auto-detect seal mode from the det model name (any of the
   // four PP-OCRvN_{mobile,server}_seal_det variants). An explicit
   // cfg->is_seal = 1 forces the mode on (e.g. when a user renames a
@@ -348,18 +347,6 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
     return st;
   }
 
-  // Resolve rec_batch AFTER configs load (the hint lives in the rec
-  // model config). Priority: cfg->rec_batch > rec_batch_hint > 16.
-  // M3-PERF4 made 16 the default (width-neutral vs 8; dense e2e -15%
-  // on v6_tiny). M3-PERF5: measured exceptions where 8 wins on CUDA —
-  // v6_medium dense6 w1 1.08 fps @8 vs 0.87 @16, v6_small 1.54 vs 0.94
-  // — the [16,3,48,320] session resize + activation memory outweigh
-  // GEMM batching for those rec graphs. The hint lets those model
-  // configs opt down without changing the ABI default.
-  rec_batch = cfg->rec_batch > 0 ? cfg->rec_batch
-             : (rec_cfg.rec.rec_batch_hint > 0 ? rec_cfg.rec.rec_batch_hint : 16);
-  if (rec_batch < 1) rec_batch = 1;
-
   // Build a SessionConfig from the public cfg.
   SessionConfig sc;
   sc.backend = pickBackend(static_cast<ppocr_backend>(cfg->backend));
@@ -391,24 +378,6 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
     }
   }
   return PPOCR_OK;
-}
-
-void Engine::warmup() {
-  auto run_dummy = [this](MnnSession* s, const std::vector<int>& dims) {
-    if (!s) return;
-    try {
-      const size_t n = static_cast<size_t>(dims[0]) * dims[1] * dims[2] * dims[3];
-      std::vector<float> zeros(n, 0.f);
-      s->set_input_float("x", dims, zeros.data());
-      (void)s->run();
-    } catch (...) {
-      // Warmup is best-effort: a failure here doesn't invalidate the
-      // engine; the first real inference will surface real errors.
-    }
-  };
-  run_dummy(det.get(), {1, 3, 640, 640});
-  run_dummy(rec.get(), {1, 3, 48, 320});
-  run_dummy(cls.get(), {1, 3, 80, 160});
 }
 
 // ---- det / rec helpers ---------------------------------------------------
@@ -536,12 +505,6 @@ static void run_det_sync(Engine& e, const Image& bgr,
 // predicts 180°. PaddleOCR's PaddleClas::TextRecRotator does exactly
 // this (`cv::rotate(rotated_image, cv::ROTATE_180)`).
 static void rotate_180_inplace(Image& img) {
-  // M3-PERF6: if img is a non-owning view, materialize it first (this
-  // function mutates in place). Only hit on the cls-180 path.
-  if (img.ext && img.data.empty()) {
-    img.data.assign(img.ext, img.ext + static_cast<size_t>(img.w) * img.h * img.c);
-    img.ext = nullptr;
-  }
   if (img.data.empty() || img.w <= 0 || img.h <= 0) return;
   const int W = img.w;
   const int H = img.h;
@@ -676,14 +639,8 @@ static void run_rec_sync(Engine& e, const Image& bgr,
   // Pre-compute crops in a vector aligned with `boxes`.
   struct Crop { Image img; };
   std::vector<Crop> crops;
-  // M3-PERF2: pre-size and fill by index so the per-box warp work
-  // (perspective warp + rot90) can be fanned out over threads below;
-  // results are per-box independent, so output order/bytes are
-  // unchanged (bit-exact).
-  crops.resize(boxes.size());
-  const std::vector<DetBox>& boxes_ref = boxes;
-  auto crop_one = [&](size_t bi) -> void {
-    const DetBox& b = boxes_ref[bi];
+  crops.reserve(boxes.size());
+  for (const auto& b : boxes) {
     // db_post returns poly already in PaddleOCR canonical order
     // [TL, TR, BR, BL] (sort_min_area_rect_points was applied).
     PointF quad[4];
@@ -792,7 +749,8 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       warped = warp_perspective_quad(bgr, quad, dst_w, dst_h);
     }
     if (warped.data.empty() || warped.w <= 0 || warped.h <= 0) {
-      return;  // leave crops[bi].img empty, as the old push_back({Image{}}) did
+      crops.push_back({Image{}});
+      continue;
     }
     // Rotate 90° if H/W >= 1.5, matching paddlex crop_image_regions.py:
     //   if dst_img_height * 1.0 / dst_img_width >= 1.5: dst_img = np.rot90(dst_img)
@@ -819,30 +777,7 @@ static void run_rec_sync(Engine& e, const Image& bgr,
       }
       warped = std::move(rot);
     }
-    crops[bi].img = std::move(warped);
-  };
-  {
-    const int nbox = static_cast<int>(boxes.size());
-    const int hw = static_cast<int>(std::thread::hardware_concurrency());
-    int nthr = hw > 0 ? hw : 4;
-    nthr = std::min(nthr, nbox > 0 ? nbox : 1);
-    nthr = std::min(nthr, 8);
-    if (nthr <= 1) {
-      for (int bi = 0; bi < nbox; ++bi) crop_one(static_cast<size_t>(bi));
-    } else {
-      std::vector<std::thread> pool;
-      pool.reserve(nthr);
-      const int chunk = (nbox + nthr - 1) / nthr;
-      for (int t = 0; t < nthr; ++t) {
-        const int lo = t * chunk;
-        const int hi = std::min(nbox, lo + chunk);
-        if (lo >= hi) break;
-        pool.emplace_back([&, lo, hi] {
-          for (int bi = lo; bi < hi; ++bi) crop_one(static_cast<size_t>(bi));
-        });
-      }
-      for (auto& th : pool) th.join();
-    }
+    crops.push_back({std::move(warped)});
   }
   auto t_crop_end = std::chrono::steady_clock::now();
   // ---- M3 cls step ----
@@ -934,40 +869,13 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     // Build the CHW tensor: N * 3 * H * batch_w.
     auto t_rp = std::chrono::steady_clock::now();
     std::vector<float> chw(static_cast<size_t>(n) * 3 * H * batch_w, 0.f);
-    {
-      // M3-PERF2: per-crop prep is independent (resize + normalize +
-      // CHW into its own slice of `chw`); fan out over threads.
-      // Bit-exact: each crop writes the same bytes it wrote before.
-      const int hw = static_cast<int>(std::thread::hardware_concurrency());
-      int nthreads = hw > 0 ? hw : 4;
-      nthreads = std::min(nthreads, static_cast<int>(n));
-      nthreads = std::min(nthreads, 8);
-      auto prep_worker = [&](int lo, int hi) {
-        for (int i = lo; i < hi; ++i) {
-          if (crops[start + i].img.data.empty()) continue;
-          int vw = 0;
-          std::vector<float> line_chw =
-              prep_rec_line(crops[start + i].img, H, batch_w, vw);
-          std::memcpy(
-              chw.data() + static_cast<size_t>(i) * 3 * H * batch_w,
-              line_chw.data(),
-              static_cast<size_t>(3) * H * batch_w * sizeof(float));
-        }
-      };
-      if (nthreads <= 1) {
-        prep_worker(0, static_cast<int>(n));
-      } else {
-        std::vector<std::thread> pool;
-        pool.reserve(nthreads);
-        const int chunk = (static_cast<int>(n) + nthreads - 1) / nthreads;
-        for (int t = 0; t < nthreads; ++t) {
-          const int lo = t * chunk;
-          const int hi = std::min(static_cast<int>(n), lo + chunk);
-          if (lo >= hi) break;
-          pool.emplace_back(prep_worker, lo, hi);
-        }
-        for (auto& th : pool) th.join();
-      }
+    for (size_t i = 0; i < n; ++i) {
+      if (crops[start + i].img.data.empty()) continue;
+      int vw = 0;
+      std::vector<float> line_chw =
+          prep_rec_line(crops[start + i].img, H, batch_w, vw);
+      std::memcpy(chw.data() + i * 3 * H * batch_w, line_chw.data(),
+                  static_cast<size_t>(3) * H * batch_w * sizeof(float));
     }
     auto t_rp_end = std::chrono::steady_clock::now();
     // Resize + run rec.
@@ -991,40 +899,9 @@ static void run_rec_sync(Engine& e, const Image& bgr,
     const int C  = so.shape[2];
     if (N != static_cast<int>(n) || C <= 1 || T <= 0) continue;
     auto t_ctc = std::chrono::steady_clock::now();
-    // M3-PERF2: decode each batch element's (T,C) logits independently;
-    // rows are independent so a fan-out over std::thread is bit-exact.
-    // v6_medium's 18k-class dict makes single-threaded ctc ~21% of
-    // CUDA e2e; N/8-way fan-out cuts it to ~3%.
-    std::vector<RecOut> outs(n);
-    {
-      const int hw = static_cast<int>(std::thread::hardware_concurrency());
-      int nthreads = hw > 0 ? hw : 4;
-      nthreads = std::min(nthreads, static_cast<int>(n));
-      nthreads = std::min(nthreads, 8);
-      auto worker = [&](int lo, int hi) {
-        for (int i = lo; i < hi; ++i) {
-          const float* row = so.data + static_cast<size_t>(i) * T * C;
-          outs[static_cast<size_t>(i)] =
-              ctc_decode(row, T, C, e.rec_cfg.rec);
-        }
-      };
-      if (nthreads <= 1) {
-        worker(0, static_cast<int>(n));
-      } else {
-        std::vector<std::thread> pool;
-        pool.reserve(nthreads);
-        const int chunk = (static_cast<int>(n) + nthreads - 1) / nthreads;
-        for (int t = 0; t < nthreads; ++t) {
-          const int lo = t * chunk;
-          const int hi = std::min(static_cast<int>(n), lo + chunk);
-          if (lo >= hi) break;
-          pool.emplace_back(worker, lo, hi);
-        }
-        for (auto& th : pool) th.join();
-      }
-    }
     for (size_t i = 0; i < n; ++i) {
-      const RecOut& out = outs[i];
+      const float* row = so.data + i * T * C;
+      RecOut out = ctc_decode(row, T, C, e.rec_cfg.rec);
       // Note: ctc_decode returns the mean probability of the
       // emitted characters. We do NOT threshold text by rec score
       // here — the upstream `box_thresh` and `db_post` kMinSize
@@ -1114,7 +991,7 @@ static ppocr_status run_with_boxes(Engine& e, const uint8_t* bgr, int w, int h,
 
   Image img;
   img.w = w; img.h = h; img.c = 3;
-  img.ext = bgr;  // M3-PERF6: non-owning view
+  img.data.assign(bgr, bgr + static_cast<size_t>(w) * h * 3);
 
   std::vector<DetBox> boxes;
   boxes.reserve(static_cast<size_t>(n_polys));
@@ -1163,13 +1040,9 @@ static ppocr_status run_full(Engine& e, const uint8_t* bgr, int w, int h) {
     e.last_profile.rec_batches = 0;
   }
 
-  // M3-PERF6: zero-copy view over the caller's buffer. All pipeline
-  // consumers of the input image are const readers (prep_det resize,
-  // warp sampler); the only mutator (cls rotate_180) materializes an
-  // owning copy first. This removes a full-image memcpy per run.
   Image img;
   img.w = w; img.h = h; img.c = 3;
-  img.ext = bgr;
+  img.data.assign(bgr, bgr + static_cast<size_t>(w) * h * 3);
 
   std::vector<DetBox> boxes;
   float det_ms = 0.f, rec_ms = 0.f, cls_ms = 0.f;
@@ -1251,11 +1124,6 @@ extern "C" PPOCR_API ppocr_status ppocr_create(const ppocr_config* cfg,
       // Best-effort error string: we don't always have a useful message.
     }
     return st;
-  }
-  // M3-PERF4: opt-in warmup (cfg->warmup == 1). The CLI passes 1 by
-  // default; plain C users keep the zero-init cold-start behavior.
-  if (e->cfg_shadow.warmup) {
-    e->warmup();
   }
   if (e->want_profile) {
     e->create_ms_stored = std::chrono::duration<float, std::milli>(

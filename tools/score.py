@@ -96,6 +96,57 @@ def cer(pred: str, base: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Matched-line CER (decision metric, spec'd by the decision-maker; see
+# tools/M2_FINAL_MATRIX.md). join-CER (`cer` above) stays as reference.
+#
+#   CER_matched = [ sum lev(p,b) over matched pairs
+#                 + sum len(b) unmatched base (missed lines)
+#                 + sum len(p) unmatched pred (spurious lines) ]
+#                 / sum len(b) over ALL base lines
+#
+# Matching is greedy one-to-one: repeatedly take the (pred, base) pair with
+# the smallest NORMALIZED levenshtein (lev / max(len(p), len(b)), so long
+# lines can't win by being long); ties break by index order for determinism.
+# ---------------------------------------------------------------------------
+def matched_line_cer(pred_lines: List[str],
+                     base_lines: List[str]) -> Tuple[float, float]:
+    """Returns (matched_line_cer, join_cer)."""
+    pred_lines = list(pred_lines or [])
+    base_lines = list(base_lines or [])
+    jc = cer("\n".join(pred_lines), "\n".join(base_lines))
+
+    denom = sum(len(b) for b in base_lines)
+    if not base_lines:
+        # No ground truth: spurious-only. Convention matches `cer()`.
+        return (0.0 if not pred_lines else 1.0), jc
+
+    # Greedy minimal-normalized-levenshtein pairing, O(N*M) pairs.
+    pairs: List[Tuple[float, int, int]] = []  # (norm_lev, pi, bi)
+    for pi, p in enumerate(pred_lines):
+        for bi, b in enumerate(base_lines):
+            if not p and not b:
+                nl = 0.0
+            else:
+                mx = max(len(p), len(b))
+                nl = (levenshtein(p, b) / mx) if mx else 0.0
+            pairs.append((nl, pi, bi))
+    pairs.sort(key=lambda t: (t[0], t[1], t[2]))
+
+    used_p: set = set()
+    used_b: set = set()
+    numer = 0
+    for nl, pi, bi in pairs:
+        if pi in used_p or bi in used_b:
+            continue
+        used_p.add(pi)
+        used_b.add(bi)
+        numer += levenshtein(pred_lines[pi], base_lines[bi])
+    numer += sum(len(b) for i, b in enumerate(base_lines) if i not in used_b)
+    numer += sum(len(p) for i, p in enumerate(pred_lines) if i not in used_p)
+    return (numer / denom if denom else 0.0), jc
+
+
+# ---------------------------------------------------------------------------
 # Loaders
 # ---------------------------------------------------------------------------
 
@@ -193,39 +244,32 @@ def _baseline_entry_is_valid(b: dict) -> Tuple[bool, str]:
     return True, ""
 
 
-def score_image(pred_rec_texts: List[str], base: str) -> float:
-    pred = "\n".join(pred_rec_texts or [])
-    return cer(pred, base)
+def score_image(pred_rec_texts: List[str], base: str) -> Tuple[float, float]:
+    """Returns (matched_line_cer, join_cer) for one image."""
+    pred_lines = list(pred_rec_texts or [])
+    base_lines = base.split("\n") if base else []
+    return matched_line_cer(pred_lines, base_lines)
 
 
 def score_full_cell(combo_dir: Path, lang: str, results_dir: Path
-                    ) -> Tuple[float, int, int, int]:
-    """Score one (combo, lang) cell.
+                    ) -> Tuple[float, float, int, int, int]:
+    """Score one (combo, lang) cell under BOTH metrics.
 
-    Returns (mean_cer, n_scored, n_invalid_baseline, n_missing_pred).
-    - mean_cer: average CER across the images whose baseline entry is
-      valid AND whose pred.json has a matching row. NaN if no images
-      were scoreable.
-    - n_scored: number of images that contributed to mean_cer.
-    - n_invalid_baseline: number of baseline entries marked invalid
-      (det_polys has a None element, or rec_texts missing, etc.). These
-      are NOT counted in n_scored; they are the baseline-regen backlog
-      and a per-cell diagnostic is emitted to stderr.
-    - n_missing_pred: number of baseline entries that have a corresponding
-      image_path but the pred.json row is missing (cli error, OOM, etc.).
+    Returns (mean_mlc, mean_join, n_scored, n_invalid_baseline,
+    n_missing_pred). The decision metric is matched_line_cer; join-CER is
+    carried through for reporting only.
     """
     base = load_baseline(combo_dir / lang / "ocr_results.json")
     pred_path = results_dir / combo_dir.name / lang / "pred.json"
     if not pred_path.exists():
-        # Whole cell missing → report NaN, 0 scored, but keep the invalid
-        # count so the decision-maker can still see the backlog.
         n_invalid = sum(1 for b in base if not _baseline_entry_is_valid(b)[0])
-        return float("nan"), 0, n_invalid, 0
+        return float("nan"), float("nan"), 0, n_invalid, 0
     pred = load_pred(pred_path)
     pred_by_path: Dict[str, List[str]] = {}
     for p in pred:
         pred_by_path[p["image_path"]] = p.get("rec_texts", [])
-    scores: List[float] = []
+    mlcs: List[float] = []
+    joins: List[float] = []
     n_invalid = 0
     n_missing_pred = 0
     for b in base:
@@ -233,49 +277,51 @@ def score_full_cell(combo_dir: Path, lang: str, results_dir: Path
         if not valid:
             n_invalid += 1
             continue
-        btext = _join_texts(b)
         ipath = b.get("image_path", "")
         if ipath not in pred_by_path:
             n_missing_pred += 1
             continue
-        ptexts = pred_by_path[ipath]
-        scores.append(score_image(ptexts, btext))
-    if not scores:
-        return float("nan"), 0, n_invalid, n_missing_pred
-    return sum(scores) / len(scores), len(scores), n_invalid, n_missing_pred
+        mlc, jc = score_image(pred_by_path[ipath], _join_texts(b))
+        mlcs.append(mlc)
+        joins.append(jc)
+    if not mlcs:
+        return float("nan"), float("nan"), 0, n_invalid, n_missing_pred
+    return (sum(mlcs) / len(mlcs), sum(joins) / len(joins), len(mlcs),
+            n_invalid, n_missing_pred)
 
 
 def score_full_cell_lang_avg(combo_dir: Path, results_dir: Path
-                             ) -> Tuple[float, int, int, int]:
-    """Mean over languages. Each cell has one number; aggregates the
-    invalid/missing counts across langs so a single diagnostic is enough.
-    """
-    scores: List[float] = []
+                             ) -> Tuple[float, float, int, int, int]:
+    """Mean over languages; returns (mlc, join, n_scored, n_inv, n_miss)."""
+    mlcs: List[float] = []
+    joins: List[float] = []
     n_scored = 0
     n_invalid = 0
     n_missing = 0
     for lang_dir in sorted(combo_dir.iterdir()):
         if not lang_dir.is_dir():
             continue
-        c, ns, ni, nm = score_full_cell(combo_dir, lang_dir.name, results_dir)
-        if c == c:
-            scores.append(c)
+        m, j, ns, ni, nm = score_full_cell(combo_dir, lang_dir.name, results_dir)
+        if m == m:
+            mlcs.append(m)
+        if j == j:
+            joins.append(j)
         n_scored += ns
         n_invalid += ni
         n_missing += nm
-    if not scores:
-        return float("nan"), 0, n_invalid, n_missing
-    return sum(scores) / len(scores), n_scored, n_invalid, n_missing
+    if not mlcs:
+        return float("nan"), float("nan"), 0, n_invalid, n_missing
+    return (sum(mlcs) / len(mlcs), sum(joins) / len(joins), n_scored,
+            n_invalid, n_missing)
 
 
 def score_strip_cell(combo_dir: Path, lang: str, results_dir: Path,
-                     strip_gt: Dict[str, str]) -> Tuple[float, int, List[str]]:
-    """Per-lang score for a strip cell. Returns (cer, n, warnings)."""
+                     strip_gt: Dict[str, str]) -> Tuple[float, float, int, List[str]]:
+    """Per-lang score for a strip cell: (mlc, join, n, warnings)."""
     pred_path = results_dir / combo_dir.name / lang / "pred.json"
     if not pred_path.exists():
-        return float("nan"), 0, [f"missing pred: {pred_path}"]
+        return float("nan"), float("nan"), 0, [f"missing pred: {pred_path}"]
     pred = load_pred(pred_path)
-    # Validate pred schema (must include image_path + rec_texts).
     warnings: List[str] = []
     for i, p in enumerate(pred):
         if "image_path" not in p or "rec_texts" not in p:
@@ -283,7 +329,8 @@ def score_strip_cell(combo_dir: Path, lang: str, results_dir: Path,
     base_path = combo_dir / lang / "ocr_results.json"
     base = load_baseline(base_path) if base_path.exists() else []
     base_by_path: Dict[str, dict] = {b["image_path"]: b for b in base}
-    scores: List[float] = []
+    mlcs: List[float] = []
+    joins: List[float] = []
     for p in pred:
         ipath = p["image_path"]
         b = base_by_path.get(ipath)
@@ -292,10 +339,12 @@ def score_strip_cell(combo_dir: Path, lang: str, results_dir: Path,
             if err is not None:
                 warnings.append(f"baseline[{Path(ipath).name}]: {err}")
         gt = strip_gt.get(ipath, "")
-        scores.append(score_image(p.get("rec_texts", []), gt))
-    if not scores:
-        return float("nan"), 0, warnings
-    return sum(scores) / len(scores), len(scores), warnings
+        m, j = score_image(p.get("rec_texts", []), gt)
+        mlcs.append(m)
+        joins.append(j)
+    if not mlcs:
+        return float("nan"), float("nan"), 0, warnings
+    return sum(mlcs) / len(mlcs), sum(joins) / len(joins), len(mlcs), warnings
 
 
 # ---------------------------------------------------------------------------
@@ -314,17 +363,18 @@ def _status(x: float, thr: float = 0.05) -> str:
     return "PASS" if x <= thr else "FAIL"
 
 
-def _matrix_7x7(det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
+def _matrix_7x7(det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, float, int]],
                 threshold: float) -> str:
-    """Render a 7x7 main matrix: rows=det, cols=rec; cell=CER (status)."""
+    """Render 7x7 matrix: rows=det, cols=rec; cell=MLC (join) status."""
     lines: List[str] = []
     lines.append("| det \\\\ rec | " + " | ".join(MAIN_RECS) + " |")
     lines.append("|" + "|".join(["---"] * (len(MAIN_RECS) + 1)) + "|")
     for det in MAIN_DETS:
         row = [det]
         for rec in MAIN_RECS:
-            cer, _n = det_to_rec_cer.get((det, rec), (float("nan"), 0))
-            row.append(f"{_fmt(cer)} {_status(cer, threshold)}")
+            m, j, _n = det_to_rec_cer.get(
+                (det, rec), (float("nan"), float("nan"), 0))
+            row.append(f"{_fmt(m)} ({_fmt(j)}) {_status(m, threshold)}")
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines) + "\n"
 
@@ -332,7 +382,7 @@ def _matrix_7x7(det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
 def _summary(rows: List[dict], threshold: float) -> Tuple[int, int, int]:
     pass_n = fail_n = nan_n = 0
     for r in rows:
-        c = r.get("cer", float("nan"))
+        c = r.get("mlc", float("nan"))
         if c != c:
             nan_n += 1
         elif c <= threshold:
@@ -342,29 +392,33 @@ def _summary(rows: List[dict], threshold: float) -> Tuple[int, int, int]:
     return pass_n, fail_n, nan_n
 
 
-def render_report(*, det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
+def render_report(*, det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, float, int]],
                   lang_rec_rows: List[dict], doc_rows: List[dict],
                   strip_rows: List[dict], seal_rows: List[dict],
                   threshold: float, warnings: List[str]) -> Tuple[str, bool]:
-    """Build the markdown report. Returns (md, has_fail)."""
+    """Build the markdown report. Returns (md, has_fail).
+
+    PASS/FAIL is judged on matched_line_cer only; join_cer is carried as a
+    strict reference column next to every number.
+    """
     lines: List[str] = []
     lines.append("# PP-OCR CER report")
     lines.append("")
-    lines.append(f"Threshold: CER ≤ {threshold}")
+    lines.append(f"Threshold (matched-line CER): ≤ {threshold}; "
+                 "join-CER reported as reference.")
     lines.append("")
 
     # ---- Main 7x7 matrix -------------------------------------------------
     if det_to_rec_cer:
-        lines.append("## Main matrix (7×7) — lang-averaged CER")
+        lines.append("## Main matrix (7×7) — lang-averaged matched-line CER")
         lines.append("")
-        lines.append("Rows = `det`, cols = `rec`. Cell = mean CER across the 16 "
-                     "languages. Status: PASS / FAIL.")
+        lines.append("Rows = `det`, cols = `rec`. Cell = `MLC (joinCER)` over "
+                     "16 languages; status judged on MLC.")
         lines.append("")
         lines.append(_matrix_7x7(det_to_rec_cer, threshold))
-        # Flatten for summary
         flat: List[dict] = []
-        for (det, rec), (cer_, n) in det_to_rec_cer.items():
-            flat.append({"combo": f"{det}__{rec}", "cer": cer_, "n": n})
+        for (det, rec), (m, j, n) in det_to_rec_cer.items():
+            flat.append({"combo": f"{det}__{rec}", "mlc": m, "join": j, "n": n})
         pass_n, fail_n, nan_n = _summary(flat, threshold)
         lines.append(f"**Main matrix (49 cells):** PASS={pass_n}  FAIL={fail_n}  N/A={nan_n}")
         lines.append("")
@@ -373,13 +427,13 @@ def render_report(*, det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
 
     # ---- Lang-rec block --------------------------------------------------
     if lang_rec_rows:
-        lines.append("## Lang-rec block (per-cell CER)")
+        lines.append("## Lang-rec block (per-cell MLC with join-CER)")
         lines.append("")
-        lines.append("| combo | langs scored | mean CER | status |")
-        lines.append("|---|---|---|---|")
+        lines.append("| combo | langs | MLC | join-CER | status |")
+        lines.append("|---|---|---|---|---|")
         for r in lang_rec_rows:
-            lines.append(f"| {r['combo']} | {r['n_langs']} | {_fmt(r['cer'])} | "
-                         f"{_status(r['cer'], threshold)} |")
+            lines.append(f"| {r['combo']} | {r['n_langs']} | {_fmt(r['mlc'])} | "
+                         f"{_fmt(r['join'])} | {_status(r['mlc'], threshold)} |")
         flat += lang_rec_rows
         lines.append("")
 
@@ -387,11 +441,11 @@ def render_report(*, det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
     if doc_rows:
         lines.append("## Doc-rec block (PP-OCRv4_server_rec_doc)")
         lines.append("")
-        lines.append("| combo | langs scored | mean CER | status |")
-        lines.append("|---|---|---|---|")
+        lines.append("| combo | langs | MLC | join-CER | status |")
+        lines.append("|---|---|---|---|---|")
         for r in doc_rows:
-            lines.append(f"| {r['combo']} | {r['n_langs']} | {_fmt(r['cer'])} | "
-                         f"{_status(r['cer'], threshold)} |")
+            lines.append(f"| {r['combo']} | {r['n_langs']} | {_fmt(r['mlc'])} | "
+                         f"{_fmt(r['join'])} | {_status(r['mlc'], threshold)} |")
         flat += doc_rows
         lines.append("")
 
@@ -399,11 +453,12 @@ def render_report(*, det_to_rec_cer: Dict[Tuple[str, str], Tuple[float, int]],
     if strip_rows:
         lines.append("## Strip rec-only (ta/te)")
         lines.append("")
-        lines.append("| combo | lang | imgs | CER | status |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| combo | lang | imgs | MLC | join-CER | status |")
+        lines.append("|---|---|---|---|---|---|")
         for r in strip_rows:
             lines.append(f"| {r['combo']} | {r['lang']} | {r['n']} | "
-                         f"{_fmt(r['cer'])} | {_status(r['cer'], threshold)} |")
+                         f"{_fmt(r['mlc'])} | {_fmt(r.get('join', float('nan')))} | "
+                         f"{_status(r['mlc'], threshold)} |")
         flat += strip_rows
         lines.append("")
 
@@ -474,10 +529,11 @@ def _iter_seal() -> List[Path]:
 # Top-level score functions (return rows + warnings)
 # ---------------------------------------------------------------------------
 
-def collect_main_matrix(results_dir: Path) -> Tuple[Dict[Tuple[str, str], Tuple[float, int]],
-                                                    List[str]]:
-    """Build the 7×7 (det, rec) → (cer, n_imgs) map using lang-averaged CER."""
-    det_to_rec: Dict[Tuple[str, str], Tuple[float, int]] = {}
+def collect_main_matrix(results_dir: Path
+                        ) -> Tuple[Dict[Tuple[str, str], Tuple[float, float, int]],
+                                   List[str]]:
+    """(det, rec) → (mlc, join_cer, n_imgs), lang-averaged."""
+    det_to_rec: Dict[Tuple[str, str], Tuple[float, float, int]] = {}
     warnings: List[str] = []
     for combo_dir in _iter_full_combos():
         n = combo_dir.name
@@ -486,13 +542,13 @@ def collect_main_matrix(results_dir: Path) -> Tuple[Dict[Tuple[str, str], Tuple[
         det, rec = n.split("__", 1)
         if det not in MAIN_DETS or rec not in MAIN_RECS:
             continue
-        c, n_imgs, n_invalid, n_missing = score_full_cell_lang_avg(
+        m, j, n_imgs, n_invalid, n_missing = score_full_cell_lang_avg(
             combo_dir, results_dir)
-        det_to_rec[(det, rec)] = (c, n_imgs)
+        det_to_rec[(det, rec)] = (m, j, n_imgs)
         if n_invalid or n_missing:
             warnings.append(
                 f"{n}: {n_invalid} invalid-baseline + {n_missing} missing-pred "
-                f"(backlog for M2-BASELINE-REGEN; see tools/M2_BASELINE_REGEN.md)"
+                f"(backlog; see tools/M2_BASELINE_REGEN.md)"
             )
     return det_to_rec, warnings
 
@@ -511,10 +567,9 @@ def collect_lang_rec_block(results_dir: Path) -> List[dict]:
         det, rec = n.split("__", 1)
         if rec not in LANG_RECS:
             continue
-        c, n_imgs, _n_invalid, _n_missing = score_full_cell_lang_avg(
-            combo_dir, results_dir)
+        m, j, _ni, _nm, _np = score_full_cell_lang_avg(combo_dir, results_dir)
         n_langs = _count_langs_in_cell(combo_dir)
-        rows.append({"combo": n, "cer": c, "n_langs": n_langs})
+        rows.append({"combo": n, "mlc": m, "join": j, "n_langs": n_langs})
     return rows
 
 
@@ -527,10 +582,9 @@ def collect_doc_block(results_dir: Path) -> List[dict]:
         det, rec = n.split("__", 1)
         if rec != DOC_REC:
             continue
-        c, n_imgs, _n_invalid, _n_missing = score_full_cell_lang_avg(
-            combo_dir, results_dir)
+        m, j, _ni, _nm, _np = score_full_cell_lang_avg(combo_dir, results_dir)
         n_langs = _count_langs_in_cell(combo_dir)
-        rows.append({"combo": n, "cer": c, "n_langs": n_langs})
+        rows.append({"combo": n, "mlc": m, "join": j, "n_langs": n_langs})
     return rows
 
 
@@ -545,8 +599,9 @@ def collect_strip_block(results_dir: Path) -> Tuple[List[dict], List[str]]:
             if not lang_dir.is_dir():
                 continue
             lang = lang_dir.name
-            c, n, ws = score_strip_cell(combo_dir, lang, results_dir, strip_gt)
-            rows.append({"combo": combo_dir.name, "lang": lang, "cer": c, "n": n})
+            m, j, n, ws = score_strip_cell(combo_dir, lang, results_dir, strip_gt)
+            rows.append({"combo": combo_dir.name, "lang": lang,
+                         "mlc": m, "join": j, "n": n})
             warnings.extend(ws)
     return rows, warnings
 
@@ -554,7 +609,8 @@ def collect_strip_block(results_dir: Path) -> Tuple[List[dict], List[str]]:
 def collect_seal_block() -> List[dict]:
     rows: List[dict] = []
     for s in _iter_seal():
-        rows.append({"combo": s.name, "lang": "seal", "cer": float("nan"), "n": 0})
+        rows.append({"combo": s.name, "lang": "seal", "mlc": float("nan"),
+                     "join": float("nan"), "n": 0})
     return rows
 
 

@@ -22,10 +22,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <sched.h>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -54,8 +50,6 @@ struct Args {
   // M3-PERF3 batch mode
   std::string batch_dir;         // --batch-dir DIR: process all images in DIR
   int workers = 2;               // --workers N: engine-per-worker (default 2)
-  int warmup = 1;                // M3-PERF4: dummy inference at create
-  int pin_offset = 0;            // M3-PERF6: cores per worker for --batch-dir
 };
 
 void usage() {
@@ -64,8 +58,7 @@ void usage() {
     "          [--model-dir DIR] [--backend auto|cpu|cuda|opencl|vulkan]\n"
     "          [--threads N] [--batch N] [--det-only] [--json OUT] [--time]\n"
     "          [--profile]  # M3-PERF1: add per-stage ms to the JSON output\n"
-    "          [--batch-dir DIR] [--workers N]  # M3-PERF3: engine-per-worker batch mode\n"
-    "          [--pin-offset N]  # M3-PERF6: pin each worker to N CPUs (taskset-style)\n");
+    "          [--batch-dir DIR] [--workers N]  # M3-PERF3: engine-per-worker batch mode\n");
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -92,8 +85,6 @@ bool parse_args(int argc, char** argv, Args& a) {
   else if (k == "--profile")       { a.profile = 1; }
   else if (k == "--batch-dir")     { auto v = need("--batch-dir");     if (!v) return false; a.batch_dir = v; }
   else if (k == "--workers")       { auto v = need("--workers");       if (!v) return false; a.workers = std::atoi(v); }
-  else if (k == "--no-warmup")     { a.warmup = 0; }
-    else if (k == "--pin-offset")   { auto v = need("--pin-offset");   if (!v) return false; a.pin_offset = std::atoi(v); }
     else if (k == "-h" || k == "--help") { a.help = 1; return true; }
     else {
       std::fprintf(stderr, "unknown flag: %s\n", k.c_str());
@@ -127,45 +118,30 @@ std::string config_basename(const std::string& p) {
 
 void write_result(FILE* f, const char* image, const ppocr_result* r,
                   const ppocr_profile* prof = nullptr) {
-  // M3-PERF6: assemble the JSON into one string and fwrite once.
-  // Byte-identical to the previous per-token fprintf/fputc version
-  // (same formats, same order) but avoids thousands of locked stdio
-  // calls on dense outputs (283 lines x per-char fputc).
-  std::string buf;
-  buf.reserve(256 + static_cast<size_t>(r->n_lines) * 96);
-  char num[64];
-  buf += "{\"image\":\"";
-  buf += image ? image : "";
-  buf += "\",\"backend\":\"";
-  buf += r->backend_used;
-  buf += "\",\"lines\":[";
+  std::fprintf(f, "{\"image\":\"%s\",\"backend\":\"%s\",",
+               image ? image : "", r->backend_used);
+  std::fprintf(f, "\"lines\":[");
   for (int i = 0; i < r->n_lines; ++i) {
     const ppocr_line& ln = r->lines[i];
-    if (i) buf += ',';
-    buf += "{\"poly\":[";
+    if (i) std::fputc(',', f);
+    std::fprintf(f, "{\"poly\":[");
     for (int k = 0; k < 8; ++k) {
-      if (k) buf += ',';
-      std::snprintf(num, sizeof(num), "%d", ln.poly[k]);
-      buf += num;
+      if (k) std::fputc(',', f);
+      std::fprintf(f, "%d", ln.poly[k]);
     }
-    buf += "],\"text\":\"";
+    std::fprintf(f, "],\"text\":\"");
     // Escape JSON string minimally: " and \.
     for (const char* p = ln.text ? ln.text : ""; *p; ++p) {
-      if (*p == '"' || *p == '\\') buf += '\\';
-      buf += *p;
+      if (*p == '"' || *p == '\\') std::fputc('\\', f);
+      std::fputc(*p, f);
     }
-    std::snprintf(num, sizeof(num), "\",\"score\":%.4f}", ln.score);
-    buf += num;
+    std::fprintf(f, "\",\"score\":%.4f}", ln.score);
   }
-  buf += "],";
-  std::snprintf(num, sizeof(num),
-                "\"ms\":{\"det\":%.2f,\"rec\":%.2f,\"cls\":%.2f,\"total\":%.2f}",
-                r->det_ms, r->rec_ms, r->cls_ms, r->total_ms);
-  buf += num;
+  std::fprintf(f, "],");
+  std::fprintf(f, "\"ms\":{\"det\":%.2f,\"rec\":%.2f,\"cls\":%.2f,\"total\":%.2f}",
+               r->det_ms, r->rec_ms, r->cls_ms, r->total_ms);
   if (prof) {
-    // Profile JSON grows past `num`, so format through a bigger scratch.
-    char pbuf[1024];
-    std::snprintf(pbuf, sizeof(pbuf),
+    std::fprintf(f,
         ",\"profile\":{"
         "\"decode_ms\":%.3f,\"det_prep_ms\":%.3f,\"det_run_ms\":%.3f,"
         "\"db_post_ms\":%.3f,\"crop_warp_ms\":%.3f,\"rec_prep_ms\":%.3f,"
@@ -178,16 +154,33 @@ void write_result(FILE* f, const char* image, const ppocr_result* r,
         prof->rec_run_ms, prof->ctc_decode_ms, prof->cls_ms,
         prof->e2e_ms, prof->create_ms, prof->first_run_ms,
         prof->n_boxes, prof->rec_batches, prof->threads, prof->backend);
-    buf += pbuf;
-    buf += '}';   // close the profile object AND the outer result
+    std::fputc('}', f);   // close the profile object AND the outer result
   } else {
-    buf += '}';   // close the outer result (no profile)
+    std::fputc('}', f);   // close the outer result (no profile)
   }
-  buf += '\n';
-  std::fwrite(buf.data(), 1, buf.size(), f);
+  std::fputc('\n', f);
 }
 
 } // namespace
+
+// Force the linker to keep MNN's CUDA Register.o. Register.cpp
+// self-registers via a global-initializer (placeholder bool).
+// When MNN is linked as a STATIC archive, without a live reference the
+// archive member is dropped and --backend cuda falls back to CPU
+// ("Can't Find type=2"). When MNN is linked as a SHARED library the
+// symbol already lives in libMNN.so, and forcing an undefined reference
+// here BREAKS the link (placeholder is defined only in the companion's
+// registration TU). So: take the address only when the companion is
+// actually linked (PPOCR_MNN_CUDA_COMPANION, defined by CMakeLists when
+// libMNN_Cuda_Main.so is present).
+// Platform-agnostic (rule 6): weak declaration, resolved only when the
+// CUDA companion is linked (see CMake _mnn_cuda_so block).
+#if defined(__ELF__) && defined(PPOCR_MNN_CUDA_COMPANION)
+namespace MNN { namespace CUDA { extern bool placeholder; } }
+static volatile const bool* _mnn_cuda_force =
+    reinterpret_cast<const bool*>(&MNN::CUDA::placeholder);
+#endif
+
 
 // ---- M3-PERF3: batch-dir mode ------------------------------------------
 // Process every image in a directory through an engine-per-worker pool.
@@ -254,7 +247,6 @@ int run_batch(const Args& a) {
     cfg.backend    = parse_backend(a.backend);
     cfg.num_threads = a.threads;
     cfg.rec_batch  = a.batch;
-  cfg.warmup     = a.warmup;
     cfg.max_side   = a.max_side;
     cfg.offline    = 1;
     cfg.download   = 0;
@@ -279,24 +271,7 @@ int run_batch(const Args& a) {
   }
   std::atomic<size_t> next{0};
   std::atomic<int> failures{0};
-  auto worker_main = [&](int wid) {
-    // M3-PERF6: --pin-offset N — pin this worker to N consecutive CPUs
-    // starting at (wid*N) % ncpu (taskset semantics, no exec). Keeps
-    // batch workers on disjoint core sets. 0 = off (default).
-    if (a.pin_offset > 0) {
-      const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
-      if (ncpu > 0) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        const int base = (wid * a.pin_offset) % ncpu;
-        for (int i = 0; i < a.pin_offset; ++i) {
-          CPU_SET((base + i) % ncpu, &set);
-        }
-        if (sched_setaffinity(0, sizeof(set), &set) != 0) {
-          // non-fatal: best-effort pinning
-        }
-      }
-    }
+  auto worker_main = [&](int) {
     ppocr_engine* eng = make_engine();
     if (!eng) { failures.fetch_add(1); return; }
     // Per-worker string scratch: write_result needs FILE*; use open_memstream.
@@ -384,12 +359,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Pre-compute basenames into owning std::strings so the c_str() views
-  // stay valid for the duration of ppocr_create (which copies them).
-  const std::string det_name = config_basename(a.det_config);
-  const std::string rec_name = (a.det_only || a.rec_config.empty())
+  // PERF5-urgent: in --boxes-json mode det is never used; skip its
+  // ensure (sha256 of up-to-95MB) and session load entirely.
+  const bool rec_only_mode = !a.boxes_json.empty();
+  const std::string det_name = rec_only_mode
                                    ? std::string{}
-                                   : config_basename(a.rec_config);
+                                   : config_basename(a.det_config);
+  // --boxes-json requires only rec; keep arg validation above unchanged.
+  const std::string rec_name = (!a.rec_config.empty())
+                                   ? config_basename(a.rec_config)
+                                   : std::string{};
   const std::string cls_name = a.cls_config.empty()
                                    ? std::string{}
                                    : config_basename(a.cls_config);
@@ -404,7 +383,6 @@ int main(int argc, char** argv) {
   cfg.backend    = parse_backend(a.backend);
   cfg.num_threads = a.threads;
   cfg.rec_batch  = a.batch;
-  cfg.warmup     = a.warmup;
   cfg.max_side   = a.max_side;
   cfg.offline    = 1; // M1: never download; if file is missing we want a hard error
   cfg.download   = 0;

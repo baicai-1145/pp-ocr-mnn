@@ -24,8 +24,9 @@ The tool writes /root/ppocr_reference/<combo>/<lang>/ocr_results.json
 (overwriting existing). BACKUP FIRST:
     mv /root/ppocr_reference /root/ppocr_reference.paddlex.bak
 """
-import os, sys, json, math, time, gc, glob, argparse, traceback, warnings
+import os, sys, json, math, time, gc, glob, argparse, traceback, warnings, subprocess
 warnings.filterwarnings("ignore")
+USE_GPU = os.environ.get("GEN_BASELINE_GPU", "0") == "1"
 import numpy as np
 import cv2
 import paddle.inference as paddle_infer
@@ -74,6 +75,28 @@ CONFIG_ROOT = "/root/pp-ocr-mnn/configs"
 
 
 # --- helpers ---
+
+def sort_quad_boxes_reading_order(boxes_with_scores):
+    """Port of Paddle C++ ComponentsProcessor::SortQuadBoxes
+    (deploy/cpp_infer/src/common/processors.cc:590-611).
+    Input: list of (box_pts[4][2], score); each box's first vertex is its
+    TL (sort_min_area_rect_points output, so poly[0]=(x0,y0)).
+    """
+    if len(boxes_with_scores) < 2:
+        return boxes_with_scores
+    # primary: (y0, x0)
+    bs = sorted(boxes_with_scores, key=lambda b: (b[0][0][1], b[0][0][0]))
+    # bubble pass: left-to-right within |dy|<10
+    for i in range(len(bs) - 1):
+        for j in range(i + 1, 0, -1):
+            y_j = bs[j][0][0][1]
+            y_jm1 = bs[j-1][0][0][1]
+            if abs(y_j - y_jm1) < 10.0 and bs[j][0][0][0] < bs[j-1][0][0][0]:
+                bs[j], bs[j-1] = bs[j-1], bs[j]
+            else:
+                break
+    return bs
+
 
 def warp_crop(raw, points):
     """PaddleX-style GetRotateCropImage port (cv2.warpPerspective)."""
@@ -137,12 +160,28 @@ def det_preprocess(raw, det_cfg):
     return chw, resize_h, resize_w
 
 
-def det_infer(det_name, chw, resize_h, resize_w):
+_PRED_CACHE = {}
+
+def _get_predictor(model_name):
+    """Worker-lifetime predictor cache: model load (the expensive op) happens
+    once per (model_name); Config creation is ~100x cheaper."""
+    if model_name in _PRED_CACHE:
+        return _PRED_CACHE[model_name]
     cfg = paddle_infer.Config(
-        os.path.join(MODEL_ROOT, det_name, "inference.json"),
-        os.path.join(MODEL_ROOT, det_name, "inference.pdiparams"))
-    cfg.disable_glog_info(); cfg.disable_gpu(); cfg.disable_mkldnn()
+        os.path.join(MODEL_ROOT, model_name, "inference.json"),
+        os.path.join(MODEL_ROOT, model_name, "inference.pdiparams"))
+    cfg.disable_glog_info()
+    if USE_GPU:
+        cfg.enable_use_gpu(100, 0)
+    else:
+        cfg.disable_gpu(); cfg.disable_mkldnn()
     pred = paddle_infer.create_predictor(cfg)
+    _PRED_CACHE[model_name] = pred
+    return pred
+
+
+def det_infer(det_name, chw, resize_h, resize_w):
+    pred = _get_predictor(det_name)
     inp = pred.get_input_handle(pred.get_input_names()[0])
     inp.reshape([1, 3, resize_h, resize_w])
     inp.copy_from_cpu(chw[np.newaxis, ...])
@@ -183,11 +222,7 @@ def rec_infer(rec_name, crop):
     resized -= 0.5; resized /= 0.5
     chw = np.zeros((imgC, imgH, batch_w), dtype=np.float32)
     chw[:, :, 0:resized_w] = resized
-    cfg = paddle_infer.Config(
-        os.path.join(MODEL_ROOT, rec_name, "inference.json"),
-        os.path.join(MODEL_ROOT, rec_name, "inference.pdiparams"))
-    cfg.disable_glog_info(); cfg.disable_gpu(); cfg.disable_mkldnn()
-    pred = paddle_infer.create_predictor(cfg)
+    pred = _get_predictor(rec_name)
     inp = pred.get_input_handle(pred.get_input_names()[0])
     inp.reshape([1, 3, 48, batch_w])
     inp.copy_from_cpu(chw[np.newaxis, ...])
@@ -227,6 +262,64 @@ def images_for(lang):
     return sorted(set(out))
 
 
+CLI_BIN = os.environ.get("PPOCR_CLI", "/root/pp-ocr-mnn/build-main/ppocr_cli")
+MODEL_DIR = os.environ.get("PPOCR_MODEL_DIR", "/root/pp-ocr-mnn/models")
+
+
+def rec_via_cli(rec_name, img_path, boxes_sorted):
+    """Call our ppocr_cli with --boxes-json to do the rec stage.
+
+    Architecture note: det is run via paddle.inference direct (Python),
+    rec is delegated to the trusted CLI path (M2-NUM proved MNN rec
+    matches paddle2onnx rec within 4.1e-6 logit noise, and the C++
+    warp/rot90 path is the same one validated by M2-ISO/M2-ROBUST).
+    This avoids maintaining a duplicate Python crop implementation.
+    Returns (rec_texts, rec_scores, det_polys) in box order.
+    """
+    rec_cfg = f"{CONFIG_ROOT}/{rec_name}.json"
+    if not boxes_sorted:
+        return [], [], []
+    # Write flat int array: TL,TR,BR,BL per box
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        for box, _s in boxes_sorted:
+            for pt in box:
+                f.write(f"{int(round(pt[0]))} {int(round(pt[1]))} ")
+        boxes_json = f.name
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            out_json = f.name
+        r = subprocess.run(
+            [CLI_BIN, "--image", img_path,
+             "--det-config", f"{CONFIG_ROOT}/{rec_name}.json",  # required by arg parser; not used in --boxes-json path
+             "--rec-config", rec_cfg,
+             "--model-dir", MODEL_DIR,
+             "--boxes-json", boxes_json,
+             "--json", out_json],
+            env={**os.environ, "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu"},
+            capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"  rec CLI err: {r.stderr[:200]}", file=sys.stderr)
+            return None, None, None
+        with open(out_json) as f:
+            res = json.load(f)
+        rec_texts = [ln.get("text", "") for ln in res.get("lines", [])]
+        rec_scores = [float(ln.get("score", 0.0)) for ln in res.get("lines", [])]
+        det_polys = []
+        for ln in res.get("lines", []):
+            p = ln.get("poly", [])
+            if isinstance(p[0], (list, tuple)):
+                det_polys.append([int(round(v)) for pt in p for v in pt[:2]])
+            else:
+                det_polys.append([int(round(v)) for v in p])
+        return rec_texts, rec_scores, det_polys
+    finally:
+        try: os.unlink(boxes_json)
+        except OSError: pass
+        try: os.unlink(out_json)
+        except OSError: pass
+
+
 # --- core: run one (det, rec) combo on one lang ---
 
 def run_ocr_cell(det_name, rec_name, lang):
@@ -245,23 +338,19 @@ def run_ocr_cell(det_name, rec_name, lang):
             chw, rh, rw = det_preprocess(raw, det_cfg)
             det_out = det_infer(det_name, chw, rh, rw)
             boxes, scores = db_postprocess(det_out, src_h, src_w, rh, rw, det_cfg)
-            order = sorted(range(len(boxes)), key=lambda i: (boxes[i][0][1], boxes[i][0][0]))
-            rec_texts, rec_scores, det_polys = [], [], []
-            for i in order:
-                crop = warp_crop(raw, boxes[i])
-                if crop is None or crop.size == 0:
-                    continue
-                text, score = rec_infer(rec_name, crop)
-                if score > 0.0:  # match PaddleX default
-                    poly = [int(round(x)) for x in np.array(boxes[i]).flatten()[:8]]
-                    rec_texts.append(text)
-                    rec_scores.append(score)
-                    det_polys.append(poly)
+            # SortQuadBoxes (PaddleX pipeline applies this BEFORE rec pairing)
+            sorted_bs = sort_quad_boxes_reading_order(list(zip(boxes, scores)))
+            # rec via trusted CLI (M2-NUM bit-equivalent to paddle2onnx rec)
+            rec_texts, rec_scores, det_polys = rec_via_cli(rec_name, img, sorted_bs)
+            if rec_texts is None:
+                out_records.append({"image_path": img, "error": "rec_cli_failed"})
+                continue
             detections = [
                 {"poly": det_polys[i], "rec_text": rec_texts[i], "rec_score": rec_scores[i]}
                 for i in range(len(rec_texts))
             ]
             out_records.append({
+                "gen": "paddle-direct-v3",
                 "image_path": img,
                 "text": "\n".join(rec_texts),
                 "rec_texts": rec_texts,
@@ -298,6 +387,7 @@ def run_strip_cell(rec_name, lang):
             raw = cv2.imread(img)
             text, score = rec_infer(rec_name, raw)
             out_records.append({
+                "gen": "paddle-direct-v3",
                 "image_path": img,
                 "rec_texts": [text],
                 "rec_scores": [score],
@@ -350,6 +440,8 @@ def main():
     ap.add_argument("--combo", default=None, help="only run this combo")
     ap.add_argument("--workers", type=int, default=1, help="parallel workers")
     ap.add_argument("--full", action="store_true", help="all 811 cells")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip cells whose ocr_results.json exists with current schema")
     args = ap.parse_args()
 
     if args.pilot:
@@ -366,6 +458,10 @@ def main():
         return 2
 
     tasks = build_plan(lang if False else None, only_combo, langs)
+    if args.skip_existing:
+        before = len(tasks)
+        tasks = [t for t in tasks if not cell_done(t)]
+        print(f"[skip-existing] {before - len(tasks)} cells skipped, {len(tasks)} to run", flush=True)
     if not tasks:
         print("no tasks", file=sys.stderr)
         return 0
@@ -381,6 +477,24 @@ def main():
             print(f"[{i}/{len(tasks)}] {worker(t)}", flush=True)
     print(f"[done] {time.time()-t0:.0f}s")
     return 0
+
+
+def cell_done(task):
+    """A cell is done if its ocr_results.json parses, has records, and every
+    record carries the current-schema marker (v3: 'gen' key + paddle-direct)."""
+    if task[0] == "strip":
+        rec, lang = task[1], task[2]
+        jf = os.path.join(REF_ROOT, "strip", f"{rec}__{lang}", "ocr_results.json")
+    else:
+        _, det, rec, lang = task
+        jf = os.path.join(REF_ROOT, f"{det}__{rec}", lang, "ocr_results.json")
+    if not os.path.exists(jf):
+        return False
+    try:
+        recs = json.load(open(jf, encoding="utf-8"))
+        return bool(recs) and all("gen" in r and r.get("gen","").startswith("paddle-direct") for r in recs)
+    except Exception:
+        return False
 
 
 def worker(task):

@@ -17,14 +17,6 @@ struct Image {
   int h = 0;        // height in pixels
   int c = 0;        // channels (always 3 after load; this codebase is BGR-only)
   std::vector<uint8_t> data; // w * h * 3 bytes, row-major, BGR order
-
-  // M3-PERF6: optional non-owning view over external storage. When set,
-  // `data` stays empty and pipeline readers use bytes() instead of
-  // data.data(). Writers (rot90 etc.) only ever build fresh owning
-  // Images, so views never alias mutable state.
-  const uint8_t* ext = nullptr;
-  const uint8_t* bytes() const { return ext ? ext : data.data(); }
-  bool empty() const { return !ext && data.empty(); }
 };
 
 // Decode an image file (jpg/png/bmp/gif first frame) into BGR8.
