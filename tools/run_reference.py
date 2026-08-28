@@ -193,7 +193,11 @@ def _run_one(cli: str, *, image: Path, det_cfg: Path, rec_cfg: Path,
             return None
         try:
             with open(json_path, "r") as f:
-                return json.load(f)
+                txt = f.read()
+            if ':nan' in txt or ':NaN' in txt or ':inf' in txt:
+                import re as _re
+                txt = _re.sub(r':(-?)(nan|NaN|inf|Infinity)', r':null', txt)
+            return json.loads(txt)
         except (json.JSONDecodeError, OSError) as e:
             sys.stderr.write(f"[run] bad-json img={image} err={e}\n")
             return None
