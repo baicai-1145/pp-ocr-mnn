@@ -418,7 +418,10 @@ static void run_det_sync(Engine& e, const Image& bgr,
       try {
         SessionConfig cpu_sc;
         cpu_sc.backend = Backend::Cpu;
-        cpu_sc.num_threads = e.cfg_shadow.num_threads;
+        cpu_sc.num_threads = e.cfg_shadow.num_threads > 0
+                                 ? e.cfg_shadow.num_threads
+                                 : static_cast<int>(
+                                       std::min(8u, std::thread::hardware_concurrency()));
         auto fb = std::make_unique<MnnSession>();
         fb->load(e.det_path, cpu_sc);
         e.det_cpu_fallback = std::move(fb);
