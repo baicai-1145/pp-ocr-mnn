@@ -74,10 +74,10 @@ def run_cell(task):
     if not imgs: return f"noimg:{combo}/{lang}"
     jp = out_dir / "pred.json"
     env = _ld_for(backend)
-    if backend == "cuda":
-        # CUDA + server det: MNN session dynamic resize reuses a stale
-        # workspace and silently yields empty outputs after the first
-        # shape. Run one CLI process per image instead (correct, ~2s/img).
+    if backend == "cuda" and os.environ.get("PPOCR_RUNNER_PER_IMAGE") == "1":
+        # Optional per-image mode (legacy workaround for the pre-fix MNN
+        # int32 overflow which corrupted batch-mode outputs; the fixed
+        # build batches fine, engine-side CPU fallback covers OOM bigs).
         recs = []
         for im in imgs:
             tmp_json = out_dir / f".tmp_{Path(im).stem}.json"
