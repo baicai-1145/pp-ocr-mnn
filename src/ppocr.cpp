@@ -91,6 +91,12 @@ struct Engine {
   std::unique_ptr<MnnSession> det;
   std::unique_ptr<MnnSession> rec;
   std::unique_ptr<MnnSession> cls;
+  // GPU det can fail to resize/run on very large images (e.g. the cutlass
+  // conv im2col workspace for a 256ch 9x9 layer at 1280x3556 exceeds what
+  // fits on a 24GB board). Lazily-created CPU det session used as fallback
+  // so such images still detect instead of silently returning 0 boxes.
+  std::unique_ptr<MnnSession> det_cpu_fallback;
+  bool det_cpu_fallback_tried = false;
 
   // Last ppocr_result buffers. `last_text` owns the storage that
   // `last_lines[i].text` points into; the public C ABI guarantees the
@@ -402,6 +408,40 @@ static void run_det_sync(Engine& e, const Image& bgr,
   auto t_run = std::chrono::steady_clock::now();
   int ec = e.det->run();
   auto t_run_end = std::chrono::steady_clock::now();
+  SessionOutput det_fb_output;
+  bool use_fb_output = false;
+  if (ec != 0 && e.det_path.length() > 0) {
+    // GPU det failed (typically a CUDA workspace alloc on huge inputs).
+    // Fall back to a CPU det session for this image.
+    if (!e.det_cpu_fallback && !e.det_cpu_fallback_tried) {
+      e.det_cpu_fallback_tried = true;
+      try {
+        SessionConfig cpu_sc;
+        cpu_sc.backend = Backend::Cpu;
+        cpu_sc.num_threads = e.cfg_shadow.num_threads;
+        auto fb = std::make_unique<MnnSession>();
+        fb->load(e.det_path, cpu_sc);
+        e.det_cpu_fallback = std::move(fb);
+      } catch (const std::exception&) {
+        e.det_cpu_fallback.reset();
+      }
+    }
+    if (e.det_cpu_fallback) {
+      e.det_cpu_fallback->set_input_float("x", dims, in.chw.data());
+      if (e.det_cpu_fallback->run() == 0) {
+        SessionOutput so_fb = e.det_cpu_fallback->output("sigmoid_0.tmp_0");
+        if (so_fb.data == nullptr || so_fb.shape.empty()) {
+          so_fb = e.det_cpu_fallback->output("fetch_name_0");
+        }
+        if (so_fb.data != nullptr && so_fb.shape.size() >= 4) {
+          ec = 0;
+          // decode below uses `so`; swap the host-side view to the CPU one
+          det_fb_output = std::move(so_fb);
+          use_fb_output = true;
+        }
+      }
+    }
+  }
   if (ec != 0) {
     boxes_out.clear();
     ms_out = static_cast<float>(std::chrono::duration<double, std::milli>(
@@ -411,9 +451,14 @@ static void run_det_sync(Engine& e, const Image& bgr,
   // The DB probability map is the first (and only) output; some
   // PaddleOCR exports name it `sigmoid_0.tmp_0` while others leave the
   // auto-generated name `fetch_name_0`. We try both.
-  SessionOutput so = e.det->output("sigmoid_0.tmp_0");
-  if (so.data == nullptr || so.shape.empty()) {
-    so = e.det->output("fetch_name_0");
+  SessionOutput so;
+  if (use_fb_output) {
+    so = std::move(det_fb_output);
+  } else {
+    so = e.det->output("sigmoid_0.tmp_0");
+    if (so.data == nullptr || so.shape.empty()) {
+      so = e.det->output("fetch_name_0");
+    }
   }
   if (so.data == nullptr || so.shape.size() < 4) {
     boxes_out.clear();
@@ -424,6 +469,11 @@ static void run_det_sync(Engine& e, const Image& bgr,
   // NCHW with N=1, C=1, H, W
   const int H = so.shape[2];
   const int W = so.shape[3];
+  if (const char* dump = std::getenv("PPOCR_DUMP_PROB")) {
+    FILE* f = std::fopen(dump, "wb");
+    if (f) { std::fwrite(so.data, sizeof(float), (size_t)H * W, f); std::fclose(f);
+             std::fprintf(stderr, "dumped prob %dx%d to %s\n", H, W, dump); }
+  }
   // db_postprocess expects the ratio that maps prob-map coords back to
   // original image coords: x_orig = x_prob * (src_w / prob_w). This is
   // DIFFERENT from prep's `in.ratio_w = resize_w / bgr.w` (= network

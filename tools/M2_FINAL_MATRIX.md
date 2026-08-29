@@ -121,3 +121,15 @@ the 224 server-det CUDA cells were re-run (per-image CLI process mode):
      (corr=1.000, maxdiff ~0.02) slightly shifting crop boundaries. Box counts
      match baseline in every case. CPU remains the correctness reference and
      passes all cells.
+
+### Addendum: det CPU fallback for GPU-oversized inputs (2026-08-29)
+
+`run_det_sync` now lazily builds a CPU det session when the GPU session
+fails to run (CUDA workspace alloc failure on huge inputs). With the
+fallback, the previously unpassable el/02 + el/05 cells (1280x3556)
+detect correctly and all 10 `el` cells pass: **191 / 224 PASS**.
+
+The remaining 33 FAIL are the single-character rec differences analyzed
+above (GPU fp32 Simt conv accumulation ~0.03 prob maxdiff vs CPU, shifting
+1px crop edges). No configuration eliminates them; the CPU backend remains
+the correctness reference and passes all cells.
