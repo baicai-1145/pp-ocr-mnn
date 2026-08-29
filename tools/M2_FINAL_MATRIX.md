@@ -102,3 +102,22 @@ forensics above. CPU is the correctness reference for all 7 det
 variants (49/49). CLI placeholder-forcing now guarded behind
 PPOCR_MNN_CUDA_COMPANION (static-archive link only; shared-libMNN
 links define nothing and would break).
+
+## CUDA server-det rerun with int-overflow-fixed MNN (2026-08-29)
+
+After MNN fork fix (im2col int32 overflow, branch fix/cuda-int-overflow-conv-im2col),
+the 224 server-det CUDA cells were re-run (per-image CLI process mode):
+
+- **177 / 224 PASS** (was 0 server-det cells passing pre-fix due to silent
+  cudaLaunchKernel failure from int overflow)
+- Remaining 47 FAIL fall into two classes:
+  1. **12 cells — el/02.jpg + el/05.jpg (1280x3556)**: the 256ch 9x9 conv layer
+     materializes a 22.5 GB im2col buffer (e=284160 x lp=20736 x 2B fp16) which
+     does not fit in 24 GB. This is an upstream MNN architecture limitation
+     (cutlass conv path materializes im2col); the commented-out block-im2col
+     path was enabled experimentally and produces wrong results (prob max 0.012).
+  2. **35 cells — MLC 0.05-0.11**: single-character rec differences
+     ('Cooe'->'Coe', 'ru: ()'->'(e)') from fp16-mix det prob differences
+     (corr=1.000, maxdiff ~0.02) slightly shifting crop boundaries. Box counts
+     match baseline in every case. CPU remains the correctness reference and
+     passes all cells.
