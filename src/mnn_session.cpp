@@ -25,6 +25,12 @@ namespace ppocr {
 struct MnnSessionImpl {
   std::unique_ptr<MNN::Interpreter> interp;
   MNN::Session* session = nullptr;          // owned by `interp`
+  // Owned BackendConfig for GPU backends. ScheduleConfig::backendConfig is
+  // a BORROWED pointer that must outlive the session (writing through the
+  // MNN-internal static default segfaults in CUDARuntimeCreator::onCreate,
+  // see M2_FINAL_MATRIX.md addendum), so we keep our own copy here.
+  MNN::BackendConfig backend_config;
+  bool backend_config_set = false;
   MNNForwardType resolved_type = MNN_FORWARD_CPU;
   std::string resolved_name = "cpu";
   // Cached dims per input name, used by run() to verify sizes.
@@ -102,6 +108,23 @@ void MnnSession::load(const std::string& model_path,
   // power / precision / memory are passed through via MNN's options.
   // (MNN 2.9 ignores out-of-range values, so we keep the defaults when
   // the caller didn't request a low-power / fp16-everywhere path.)
+  // GPU backends: force Precision_High (full fp32) via an OWNED config.
+  // Diagnostic purpose: if server-det still corrupts on CUDA with fp32
+  // forced, the cutlass kernel-selection bug is precision-independent;
+  // if it heals, MNN's default was silently taking a reduced-precision
+  // path. PERF2 numbers (High slower than Normal on this cutlass build)
+  // still argue for shipping Normal on mobile-class models.
+  if (cfg.backend == Backend::Cuda || cfg.backend == Backend::OpenCL ||
+      cfg.backend == Backend::Vulkan) {
+    impl_->backend_config = MNN::BackendConfig{};
+    impl_->backend_config.precision = MNN::BackendConfig::Precision_High;
+    sc.backendConfig = &impl_->backend_config;
+    impl_->backend_config_set = true;
+  } else if (impl_->backend_config_set) {
+    // backend switched away from GPU in a reload: restore borrowed default
+    sc.backendConfig = nullptr;
+    impl_->backend_config_set = false;
+  }
   impl_->session = impl_->interp->createSession(sc);
   if (!impl_->session) {
     throw std::runtime_error("MnnSession: createSession failed");
