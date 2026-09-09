@@ -211,6 +211,14 @@ option(PPOCR_PREP_BILEXACT "Use bit-exact OpenCV INTER_LINEAR replica in det pre
 if(PPOCR_PREP_BILEXACT)
   target_compile_definitions(ppocr_core PUBLIC PPOCR_PREP_BILEXACT=1)
 endif()
+# Apple system frameworks libMNN.a depends on when built with MNN_METAL=ON
+# (MetalBackend.mm / MNNMetalContext.mm are Objective-C++). Empty on other
+# platforms; consumed by ppocr_core (prebuilt path) and the raw-link-item
+# downloader test targets (raw items don't propagate interface libs).
+set(_PPOCR_MNN_FRAMEWORKS)
+if(APPLE)
+  set(_PPOCR_MNN_FRAMEWORKS "-framework Metal" "-framework Foundation")
+endif()
 if(_ppocr_using_prebuilt_mnn)
   # libMNN.a needs zlib (for weight compression). MNN itself declares
   # -lz transitively, so we propagate that requirement up.
@@ -221,10 +229,17 @@ if(_ppocr_using_prebuilt_mnn)
       /usr/lib/libz.so.1
       /lib/x86_64-linux-gnu/libz.so.1
       /lib/libz.so.1)
+  if(APPLE)
+    # macOS ships zlib in the dyld shared cache / SDK tbd stubs, not as a
+    # visible /usr/lib file; the default find_library search (which covers
+    # the Xcode SDK sysroot and Homebrew) resolves it as a link item.
+    find_library(PPOCR_ZLIB_LIBRARY NAMES z libz)
+  else()
   find_library(PPOCR_ZLIB_LIBRARY
                NAMES z libz
                PATHS /usr/lib /usr/lib/x86_64-linux-gnu /lib /lib/x86_64-linux-gnu /opt/conda/lib /opt/miniconda3/lib
                NO_DEFAULT_PATH)
+  endif()
   if(NOT PPOCR_ZLIB_LIBRARY)
     foreach(p IN LISTS _ppocr_zlib_candidates)
       if(EXISTS "${p}")
@@ -241,12 +256,14 @@ if(_ppocr_using_prebuilt_mnn)
   # without a .note.GNU-stack section, which makes the linker warn about
   # an implicit executable stack. Suppress at link time so our build
   # output is clean — the sections are still safe, just stale.
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  # (GNU-ld only; Apple ld64 rejects -z and doesn't need it.)
+  if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
     add_link_options("-Wl,-z,noexecstack")
   endif()
   target_link_libraries(ppocr_core PUBLIC
     "${MNN_LIBRARY}"
     "${PPOCR_ZLIB_LIBRARY}"
+    ${_PPOCR_MNN_FRAMEWORKS}
     pthread)
 else()
   # CPU-only, no converter, no express auto-link. This path is only
@@ -320,6 +337,9 @@ target_include_directories(test_downloader PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # E2E: auto-download from the default mirror into an empty model dir.
 add_executable(test_auto_download tests/test_auto_download.c)
+# -force_load/--whole-archive are raw link items, so ppocr_core's CXX
+# linker language no longer propagates to this C target; pin it.
+set_target_properties(test_auto_download PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(test_auto_download PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Static libs don't pull unreferenced objects into a downstream
@@ -338,6 +358,7 @@ set(_PPOCR_TEST_EXTRA_LIBS)
 if(PPOCR_JPEG_LIBRARIES)
   list(APPEND _PPOCR_TEST_EXTRA_LIBS "${PPOCR_JPEG_LIBRARIES}")
 endif()
+list(APPEND _PPOCR_TEST_EXTRA_LIBS ${_PPOCR_MNN_FRAMEWORKS})
 target_link_libraries(test_auto_download PRIVATE
   ${_PPOCR_WHOLE_CORE}
   "${MNN_LIBRARY}"

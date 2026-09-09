@@ -115,8 +115,12 @@ void MnnSession::load(const std::string& model_path,
   // path. PERF2 numbers (High slower than Normal on this cutlass build)
   // still argue for shipping Normal on mobile-class models.
   if (cfg.backend == Backend::Cuda || cfg.backend == Backend::OpenCL ||
-      cfg.backend == Backend::Vulkan) {
+      cfg.backend == Backend::Vulkan || cfg.backend == Backend::Metal) {
     impl_->backend_config = MNN::BackendConfig{};
+    // GPU backends: force full fp32 (see comment above). Metal joins the
+    // same policy: on Apple GPUs MNN's Metal fp16 path (the default)
+    // diverges badly from CPU (MLC 0.1–0.85 across the matrix), while
+    // fp32 is box-exact vs CPU (see platform/desktop/README.md).
     impl_->backend_config.precision = MNN::BackendConfig::Precision_High;
     sc.backendConfig = &impl_->backend_config;
     impl_->backend_config_set = true;

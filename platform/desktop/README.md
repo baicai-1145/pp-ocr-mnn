@@ -236,3 +236,69 @@ Single-image smoke (zh/04.jpg, PP-OCRv6_tiny, 4 threads): det 110 ms /
 rec 13 ms / total 122 ms — `examples/c_api_demo.c` links and runs with
 `clang ... build-mac/libppocr_core.a build-mac/_mnn_build/libMNN.a -lz
 -ljpeg -lcurl -lc++`.
+
+## Metal backend (Apple GPU) — validated, with one upstream caveat
+
+`third_party/MNN` is rebuilt locally with Metal for this backend:
+
+```sh
+cmake -S third_party/MNN -B third_party/MNN/build -DCMAKE_BUILD_TYPE=Release \
+  -DMNN_METAL=ON -DMNN_BUILD_SHARED_LIBS=OFF -DMNN_BUILD_CONVERTER=OFF \
+  -DMNN_BUILD_TOOLS=OFF -DMNN_BUILD_DEMO=OFF -DMNN_BUILD_BENCHMARK=OFF \
+  -DMNN_BUILD_TEST=OFF -DMNN_OPENCL=OFF -DMNN_VULKAN=OFF -DMNN_CUDA=OFF
+cmake --build third_party/MNN/build -j8   # -> libMNN.a, picked up as "prebuilt"
+cmake -S . -B build-mac && cmake --build build-mac -j8
+```
+
+With a Metal-enabled libMNN.a present, the top-level CMake switches to its
+prebuilt path; linking needs `-framework Metal -framework Foundation`
+(added in the top-level CMakeLists) and `-Wl,-force_load` test targets need
+CXX linker language + the same frameworks explicitly (raw link items do not
+propagate interface deps).
+
+`--backend metal` and `--backend auto` both work end-to-end (AUTO resolves
+to Metal on this build; output is bit-identical to `--backend metal`).
+
+### Numerics (MNN 3.6.1, MacBook Air M4, published eval dataset)
+
+The engine forces `BackendConfig::Precision_High` (fp32) on all GPU
+backends; Metal now joins CUDA/OpenCL/Vulkan in that policy because MNN's
+Metal fp16 path (the default) diverges badly from CPU — with fp16 the
+5-cell subset scores MLC 0.10–0.85 (gate: ≤ 0.05).
+
+With fp32 forced (`src/mnn_session.cpp`, GPU-backend branch):
+
+| cell (800 imgs) | Metal fp32 MLC | CPU MLC | status |
+|---|---|---|---|
+| PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0413 | 0.0388 | PASS |
+| PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec | 0.3341 | 0.0187 | **FAIL** |
+| PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec | 0.0082 | 0.0000 | PASS |
+| PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec | 0.0073 | 0.0030 | PASS |
+| PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec | 0.0170 | 0.0119 | PASS |
+
+Spot-checked det boxes on clean images (zh/03, zh/08, en/03) are **poly-exact
+and score-exact vs CPU** under fp32. The v6_tiny FAIL is a single upstream
+artifact: on large det inputs (e.g. ru/02, 1280×853 → ~864-row resized det
+input) MNN's Metal conv emits elevated prob values in the **first output
+rows**, so DB postprocess yields a strip of top-edge noise boxes (ru/02:
+baseline 1 box, Metal fp32 21 boxes, all 21 hugging y ≤ 22 in original
+coords with 4–9 px heights; the true box matches CPU exactly). zh is clean
+(0.0179 vs CPU 0.0151); the damage concentrates on larger images across
+de/el/fr/hi/ru/th/tr. This is an upstream MNN Metal kernel issue, not a
+preprocess/postprocess/conversion defect on our side — same status class as
+the CUDA server-det cutlass bug in `tools/M2_FINAL_DIAG.md`.
+
+### Performance (single-image CLI mode, per-process engine)
+
+| metric | CPU (4 thr) | Metal fp32 |
+|---|---|---|
+| zh/04.jpg e2e (steady) | ~122 ms | ~810 ms |
+| 800-image matrix wall | 172 s | 1021 s |
+| batch-dir zh w1 (fp16, engine-resident) | — | 2.34 FPS |
+
+Metal fp32 is slower than CPU for this workload on M4 (Apple GPU fp32
+throughput is a fraction of fp16; shader pipelines also recompile per
+process in single-image mode). Recommendation for the auto selector on
+macOS: CPU for det-heavy small models until the upstream edge artifact and
+fp32 perf are addressed; Metal remains available via explicit
+`--backend metal`.
