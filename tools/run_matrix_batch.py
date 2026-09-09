@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "build-main" / "ppocr_cli"
 CONFIG = ROOT / "configs"
-IMG_ROOT = "/root/ocr_test_imgs"
+IMG_ROOT = os.environ.get("PPOCR_IMG_ROOT", "/root/ocr_test_imgs")
 REF_ROOT = "/root/ppocr_reference"
 
 LANGS = ["ar","de","el","en","es","fr","hi","it","ja","ko","ru","th","tr","vi","zh","pt"]

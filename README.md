@@ -31,6 +31,20 @@ The runtime resolves models against `<model-dir>/configs/registry.json` and
 fetches missing files from the default mirror (HF); point
 `PPORC_MNN_MIRROR` at the ModelScope URL for faster downloads in China.
 
+### Evaluation dataset (811-cell matrix)
+
+The scoring corpus — test images (273, 18 languages + seal + strip),
+canonical `paddle.inference` baselines (808 `ocr_results.json` + manifest),
+and scoring configs — is published separately:
+
+- Hugging Face: `https://huggingface.co/datasets/baicai1145/pp-ocr-mnn-eval`
+- ModelScope: `https://modelscope.cn/models/baicai1145/pp-ocr-mnn-eval`
+
+Browse per-cell or grab the single-file snapshot
+(`ppocr-eval-dataset.tar.zst`, sha256-verified). Score MNN outputs against
+it with `tools/score.py`; the cell gate is MLC ≤ 0.05 (see
+`tools/M2_FINAL_MATRIX.md` for the current state and known deviations).
+
 ### Build (Linux desktop, CPU)
 
 ```sh

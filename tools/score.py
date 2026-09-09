@@ -34,8 +34,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-REF_ROOT = Path("/root/ppocr_reference")
-STRIP_GT = Path("/root/ocr_test_imgs/strip_gt.json")
+# Dataset roots, overridable for users who unpacked the published
+# eval dataset (hf.co/datasets/baicai1145/pp-ocr-mnn-eval) elsewhere.
+REF_ROOT = Path(os.environ.get("PPOCR_REF_ROOT", "/root/ppocr_reference"))
+STRIP_GT = Path(os.environ.get(
+    "PPOCR_STRIP_GT", "/root/ocr_test_imgs/strip_gt.json"))
 
 # Canonical dets / recs for the 7×7 main matrix (per AGENTS.md).
 MAIN_DETS: List[str] = [
