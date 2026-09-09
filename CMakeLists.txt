@@ -140,6 +140,16 @@ if(NOT CURL_FOUND)
   endif()
 else()
   set(PPOCR_HAS_CURL TRUE)
+  # CMake's FindCURL module does not always create the CURL::CURL imported
+  # target (observed with curl-config-based discovery on macOS/Homebrew);
+  # synthesize it from the module variables when it is missing so the
+  # downstream target_link_libraries(CURL::CURL) works on every platform.
+  if(NOT TARGET CURL::CURL)
+    add_library(CURL::CURL UNKNOWN IMPORTED)
+    set_target_properties(CURL::CURL PROPERTIES
+      IMPORTED_LOCATION "${CURL_LIBRARIES}"
+      INTERFACE_INCLUDE_DIRECTORIES "${CURL_INCLUDE_DIRS}")
+  endif()
 endif()
 if(PPOCR_HAS_CURL)
   message(STATUS "ppocr-mnn: model auto-downloader will use libcurl")
@@ -241,6 +251,11 @@ if(_ppocr_using_prebuilt_mnn)
 else()
   # CPU-only, no converter, no express auto-link. This path is only
   # used in development environments without the prebuilt libMNN.a.
+  # The MNN CMake target carries zlib transitively; alias the variables
+  # the prebuilt-path test targets reference unconditionally so the same
+  # target blocks work on both paths (macOS local builds hit this branch).
+  set(MNN_LIBRARY MNN)
+  set(PPOCR_ZLIB_LIBRARY z)
   set(MNN_BUILD_CONVERTER OFF CACHE BOOL "" FORCE)
   set(MNN_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   set(MNN_BUILD_TRAIN OFF CACHE BOOL "" FORCE)
@@ -299,12 +314,35 @@ endif()
 # tests/test_downloader.cpp for the scenarios.
 if(PPOCR_BUILD_TESTS)
 add_executable(test_downloader tests/test_downloader.cpp)
+# -force_load/--whole-archive link items are raw (not the ppocr_core
+# target), so the public include dirs do not propagate; add them here.
+target_include_directories(test_downloader PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # E2E: auto-download from the default mirror into an empty model dir.
 add_executable(test_auto_download tests/test_auto_download.c)
+target_include_directories(test_auto_download PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Static libs don't pull unreferenced objects into a downstream
+# executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
+# and zlib are linked normally (the same set ppocr_core uses).
+# Apple ld64 has no --whole-archive; -force_load on the resolved archive
+# file is the equivalent.
+if(APPLE)
+  set(_PPOCR_WHOLE_CORE "-Wl,-force_load,$<TARGET_FILE:ppocr_core>")
+else()
+  set(_PPOCR_WHOLE_CORE "-Wl,--whole-archive" ppocr_core "-Wl,--no-whole-archive")
+endif()
+# ppocr_core's PUBLIC link deps (libjpeg) don't propagate through the raw
+# -force_load/whole-archive link items; pull the jpeg lib in explicitly.
+set(_PPOCR_TEST_EXTRA_LIBS)
+if(PPOCR_JPEG_LIBRARIES)
+  list(APPEND _PPOCR_TEST_EXTRA_LIBS "${PPOCR_JPEG_LIBRARIES}")
+endif()
 target_link_libraries(test_auto_download PRIVATE
-  -Wl,--whole-archive ppocr_core -Wl,--no-whole-archive
+  ${_PPOCR_WHOLE_CORE}
   "${MNN_LIBRARY}"
   "${PPOCR_ZLIB_LIBRARY}"
+  ${_PPOCR_TEST_EXTRA_LIBS}
   Threads::Threads
   dl
 )
@@ -317,12 +355,13 @@ if(EXISTS "${_mnn_cuda_so}")
     "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed")
 endif()
 # Static libs don't pull unreferenced objects into a downstream
-# executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
-# and zlib are linked normally (the same set ppocr_core uses).
+# executable, so we wrap ppocr_core with --whole-archive (see the
+# _PPOCR_WHOLE_CORE definition above; APPLE uses -force_load).
 target_link_libraries(test_downloader PRIVATE
-  -Wl,--whole-archive ppocr_core -Wl,--no-whole-archive
+  ${_PPOCR_WHOLE_CORE}
   "${MNN_LIBRARY}"
   "${PPOCR_ZLIB_LIBRARY}"
+  ${_PPOCR_TEST_EXTRA_LIBS}
   Threads::Threads
   dl
 )

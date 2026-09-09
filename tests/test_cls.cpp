@@ -40,9 +40,15 @@ namespace {
 
 
 int main() {
-  // Use a real test image: /root/ocr_test_imgs/zh/04.jpg (SOLINSKY / ALLEY).
-  const std::string model_dir = "/root/pp-ocr-mnn/models";
-  const std::string test_image = "/root/ocr_test_imgs/zh/04.jpg";
+  // Dataset roots are env-overridable (matches tools/run_reference.py):
+  // PPORC_MNN_MODELS points at the models dir, PPOCR_IMG_ROOT at the
+  // ocr_test_imgs dir. Defaults keep the original server paths.
+  const char* env_models = std::getenv("PPORC_MNN_MODELS");
+  const char* env_imgs   = std::getenv("PPOCR_IMG_ROOT");
+  const std::string model_dir = env_models ? env_models : "/root/pp-ocr-mnn/models";
+  const std::string img_root  = env_imgs   ? env_imgs   : "/root/ocr_test_imgs";
+  // Use a real test image: <img_root>/zh/04.jpg (SOLINSKY / ALLEY).
+  const std::string test_image = img_root + "/zh/04.jpg";
 
   // --- 1. set up engine WITH cls ---
   ppocr_config cfg{};

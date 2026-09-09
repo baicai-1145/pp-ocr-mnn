@@ -163,3 +163,76 @@ valid Windows PE file. No wine runtime on this host to
 actually execute it, but the cross-compile completes
 cleanly and the symbol resolution succeeds (no undefined
 references).
+
+## macOS (Apple Silicon / arm64, native host build)
+
+Status: **validated** — CPU backend (MNN ARM82 + KleidiAI, NEON fp32), on
+MacBook Air M4 / macOS 26.6 / Xcode 26.2 / CMake 4.3, against the published
+eval dataset (`hf.co/datasets/baicai1145/pp-ocr-mnn-eval`).
+
+There is no prebuilt `libMNN.a` in `third_party/MNN/build` on a fresh macOS
+clone, so the top-level CMake takes its documented fallback path:
+`add_subdirectory(third_party/MNN)` with a CPU-only MNN config
+(ARM82/KleidiAI ON, Metal/OpenCL/Vulkan OFF — Metal/CoreML validation is M5
+scope). Build:
+
+```sh
+cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release
+cmake --build build-mac -j8
+ctest --test-dir build-mac   # with PPORC_MNN_MODELS/PPOCR_IMG_ROOT set
+```
+
+Two things differ from the prebuilt-MNN Linux path (both handled in the
+top-level CMakeLists):
+
+1. The fallback branch aliases `MNN_LIBRARY=MNN` (the CMake target) so the
+   downloader test targets resolve without a `find_library` hit.
+2. `-Wl,--whole-archive` is GNU-ld only; Apple ld64 uses
+   `-Wl,-force_load,<archive>` (applied to the two downloader test targets,
+   which then also need the public include dirs + libjpeg linked explicitly
+   because a raw link item does not propagate `ppocr_core`'s interface).
+   `find_package(CURL)` on Homebrew can find the lib without creating the
+   `CURL::CURL` target, so CMake synthesizes it when missing.
+
+NFS-hosted worktrees: macOS creates AppleDouble `._*` metadata files next to
+every source file, which MNN's source GLOBs pick up and clang rejects
+(`no such file: .../._Backend.cpp`). Clean them before configuring and after
+any FetchContent extraction:
+
+```sh
+find third_party/MNN build-mac/_mnn_build/_deps -name '._*' -delete
+```
+
+then re-run `cmake -S . -B build-mac` (GLOB results are cached in the
+generated Makefiles) and build.
+
+### e2e acceptance run (published dataset, no /root paths)
+
+```sh
+export PPOCR_MNN_MODELS=./models
+export PPOCR_IMG_ROOT=_downloads/eval/root/ocr_test_imgs
+export PPOCR_REF_ROOT=_downloads/eval/root/ppocr_reference
+python3 tools/run_reference.py --cli ./build-mac/ppocr_cli --backend cpu \
+  --threads 4 --jobs 4 --results-dir results/mac-cpu \
+  --only-combo PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec \
+  --only-combo PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec \
+  --only-combo PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec \
+  --only-combo PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec \
+  --only-combo PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec
+python3 tools/score.py --results-dir results/mac-cpu --report report.md
+```
+
+Verified results (800 images, MLC gate ≤ 0.05, all PASS):
+
+| cell | MLC (join) |
+|---|---|
+| PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0388 (0.0322) |
+| PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec | 0.0187 (0.0182) |
+| PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec | 0.0000 (0.0001) |
+| PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec | 0.0030 (0.0031) |
+| PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec | 0.0119 (0.0254) |
+
+Single-image smoke (zh/04.jpg, PP-OCRv6_tiny, 4 threads): det 110 ms /
+rec 13 ms / total 122 ms — `examples/c_api_demo.c` links and runs with
+`clang ... build-mac/libppocr_core.a build-mac/_mnn_build/libMNN.a -lz
+-ljpeg -lcurl -lc++`.

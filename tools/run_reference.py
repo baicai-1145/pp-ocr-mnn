@@ -55,8 +55,11 @@ from typing import Dict, List, Optional, Tuple
 # Discovery
 # ---------------------------------------------------------------------------
 
-REF_ROOT = Path("/root/ppocr_reference")
-IMG_ROOT = Path("/root/ocr_test_imgs")
+# Dataset roots, overridable for users who unpacked the published
+# eval dataset (hf.co/datasets/baicai1145/pp-ocr-mnn-eval) elsewhere
+# (matches tools/score.py).
+REF_ROOT = Path(os.environ.get("PPOCR_REF_ROOT", "/root/ppocr_reference"))
+IMG_ROOT = Path(os.environ.get("PPOCR_IMG_ROOT", "/root/ocr_test_imgs"))
 
 
 def discover_combos(cells_re: Optional[str] = None,
@@ -295,7 +298,7 @@ def process_combo(combo: str, det: str, rec: str, *,
         rec_cfg = resolve_rec_config(rec, configs_dir)
     else:
         det_cfg, rec_cfg = resolve_configs(det, rec, configs_dir)
-    ref_root = Path("/root/ppocr_reference")
+    ref_root = REF_ROOT
     resume = os.environ.get("RUN_REFERENCE_RESUME", "0") == "1"
     only_with_baseline = os.environ.get("RUN_REFERENCE_ONLY_BASELINE", "0") == "1"
     for lang in langs:
