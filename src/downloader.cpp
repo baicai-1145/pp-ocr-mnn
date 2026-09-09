@@ -491,6 +491,11 @@ bool http_download(const std::string& url, const fs::path& dst,
   curl_easy_setopt(h, CURLOPT_TIMEOUT, 600L);
   curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(h, CURLOPT_USERAGENT, "ppocr-mnn/0.1 downloader");
+  // Honour http(s)_proxy env like the curl CLI does (libcurl only reads
+  // these automatically when built with that default; be explicit).
+  if (const char* p = std::getenv("https_proxy")) curl_easy_setopt(h, CURLOPT_PROXY, p);
+  else if (const char* p = std::getenv("HTTPS_PROXY")) curl_easy_setopt(h, CURLOPT_PROXY, p);
+  else if (const char* p = std::getenv("http_proxy")) curl_easy_setopt(h, CURLOPT_PROXY, p);
   // Accept any TLS cert by default; production deployments override
   // the system trust store via CURLOPT_CAINFO. Out of scope here.
   CURLcode rc = curl_easy_perform(h);

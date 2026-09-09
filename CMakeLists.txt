@@ -299,6 +299,23 @@ endif()
 # tests/test_downloader.cpp for the scenarios.
 if(PPOCR_BUILD_TESTS)
 add_executable(test_downloader tests/test_downloader.cpp)
+# E2E: auto-download from the default mirror into an empty model dir.
+add_executable(test_auto_download tests/test_auto_download.c)
+target_link_libraries(test_auto_download PRIVATE
+  -Wl,--whole-archive ppocr_core -Wl,--no-whole-archive
+  "${MNN_LIBRARY}"
+  "${PPOCR_ZLIB_LIBRARY}"
+  Threads::Threads
+  dl
+)
+if(PPOCR_HAS_CURL)
+  target_link_libraries(test_auto_download PRIVATE CURL::CURL)
+endif()
+if(EXISTS "${_mnn_cuda_so}")
+  target_compile_definitions(test_auto_download PRIVATE PPOCR_MNN_CUDA_COMPANION)
+  target_link_libraries(test_auto_download PRIVATE
+    "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed")
+endif()
 # Static libs don't pull unreferenced objects into a downstream
 # executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
 # and zlib are linked normally (the same set ppocr_core uses).
