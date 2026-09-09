@@ -86,7 +86,10 @@ retries.
 
 The brief asked for a placeholder URL. We use
 `https://example.com/ppocr-mnn-models` (RFC 2606 reserved TLD; any
-real deployment will point `PPORC_MNN_MIRROR` at GitHub Releases,
+the default mirror is the Hugging Face repo
+`baicai1145/pp-ocr-mnn-models` (mirrored on ModelScope at the same
+org/name — set `PPORC_MNN_MIRROR=https://www.modelscope.cn/models/baicai1145/pp-ocr-mnn-models/resolve/master`
+if that is faster in your region). Previously,
 Hugging Face, or a self-hosted bucket). The default is overridable
 via:
 - The `mirror` field of `ppocr_config`

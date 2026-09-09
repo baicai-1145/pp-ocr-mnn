@@ -273,7 +273,9 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   //   cfg->registry_path: explicit override for the registry.json
   //                   (default <model_dir>/configs/registry.json).
   //   cfg->mirror: download base URL (default
-  //                $PPORC_MNN_MIRROR or "https://example.com/ppocr-mnn-models"
+  //                $PPORC_MNN_MIRROR (default: the Hugging Face repo
+//                baicai1145/pp-ocr-mnn-models; point it at a ModelScope
+//                repo or local mirror if preferred)
   //                per the M3 placeholder documented in AGENTS.md).
   //   cfg->offline: 1 = never download.
   //   cfg->download: 0 = never download (overrides env / mirror).
@@ -291,7 +293,7 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   std::string mirror      = cfg->mirror
                               ? std::string(cfg->mirror)
                               : env_or("PPORC_MNN_MIRROR",
-                                       std::string("https://example.com/ppocr-mnn-models"));
+                                       std::string("https://huggingface.co/baicai1145/pp-ocr-mnn-models/resolve/main"));
   int offline  = cfg->offline  ? 1 : 0;
   int download = cfg->download ? 1 : 0;
 
