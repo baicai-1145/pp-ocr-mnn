@@ -237,7 +237,7 @@ rec 13 ms / total 122 ms — `examples/c_api_demo.c` links and runs with
 `clang ... build-mac/libppocr_core.a build-mac/_mnn_build/libMNN.a -lz
 -ljpeg -lcurl -lc++`.
 
-## Metal backend (Apple GPU) — validated, with one upstream caveat
+## Metal backend (Apple GPU) — validated: 5/5 cells PASS
 
 `third_party/MNN` is rebuilt locally with Metal for this backend:
 
@@ -261,44 +261,55 @@ to Metal on this build; output is bit-identical to `--backend metal`).
 
 ### Numerics (MNN 3.6.1, MacBook Air M4, published eval dataset)
 
-The engine forces `BackendConfig::Precision_High` (fp32) on all GPU
-backends; Metal now joins CUDA/OpenCL/Vulkan in that policy because MNN's
-Metal fp16 path (the default) diverges badly from CPU — with fp16 the
-5-cell subset scores MLC 0.10–0.85 (gate: ≤ 0.05).
+Two MNN Metal issues were diagnosed and are mitigated in the engine
+(`src/mnn_session.cpp`), without touching the submodule:
 
-With fp32 forced (`src/mnn_session.cpp`, GPU-backend branch):
+1. **fp16 divergence** — MNN's Metal fp16 path (its default) diverges badly
+   from CPU: with fp16 the 5-cell subset scores MLC 0.05–0.62 (gate ≤ 0.05),
+   0/5 PASS even with winograd off. fp16 on Metal is therefore not usable
+   for this workload.
+2. **Winograd first-rows corruption (upstream MNN bug)** — MNN's Metal
+   Winograd transform emits elevated prob values in the first output rows
+   of the det prob map for large det inputs (ru/02, 1280×853 → ~864-row
+   input: baseline 1 box → 21 boxes, all hugging y ≤ 22 with 4–9 px
+   heights; the true box matches CPU exactly). With
+   `Interpreter::setSessionHint(WINOGRAD_MEMORY_LEVEL, 0)` (Metal only; the
+   CPU winograd path is part of the validated matrix numerics) the artifact
+   disappears and det becomes box-exact vs CPU.
+   `PPOCR_MNN_WINOGRAD=1` re-enables it for upstream comparison.
 
-| cell (800 imgs) | Metal fp32 MLC | CPU MLC | status |
+Final config = **fp32 (Precision_High) + winograd off**. The engine forces
+`Precision_High` on all GPU backends; Metal joins CUDA/OpenCL/Vulkan there.
+
+| cell (800 imgs) | Metal fp32+w0 MLC | CPU MLC | status |
 |---|---|---|---|
-| PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0413 | 0.0388 | PASS |
-| PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec | 0.3341 | 0.0187 | **FAIL** |
-| PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec | 0.0082 | 0.0000 | PASS |
-| PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec | 0.0073 | 0.0030 | PASS |
-| PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec | 0.0170 | 0.0119 | PASS |
+| PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0388 | 0.0388 | PASS |
+| PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec | 0.0227 | 0.0187 | PASS |
+| PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec | 0.0000 | 0.0000 | PASS |
+| PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec | 0.0030 | 0.0030 | PASS |
+| PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec | 0.0119 | 0.0119 | PASS |
 
-Spot-checked det boxes on clean images (zh/03, zh/08, en/03) are **poly-exact
-and score-exact vs CPU** under fp32. The v6_tiny FAIL is a single upstream
-artifact: on large det inputs (e.g. ru/02, 1280×853 → ~864-row resized det
-input) MNN's Metal conv emits elevated prob values in the **first output
-rows**, so DB postprocess yields a strip of top-edge noise boxes (ru/02:
-baseline 1 box, Metal fp32 21 boxes, all 21 hugging y ≤ 22 in original
-coords with 4–9 px heights; the true box matches CPU exactly). zh is clean
-(0.0179 vs CPU 0.0151); the damage concentrates on larger images across
-de/el/fr/hi/ru/th/tr. This is an upstream MNN Metal kernel issue, not a
-preprocess/postprocess/conversion defect on our side — same status class as
-the CUDA server-det cutlass bug in `tools/M2_FINAL_DIAG.md`.
+`--backend metal` and `--backend auto` both work end-to-end.
 
-### Performance (single-image CLI mode, per-process engine)
+### Backend selection: AUTO resolves to CPU
 
-| metric | CPU (4 thr) | Metal fp32 |
-|---|---|---|
-| zh/04.jpg e2e (steady) | ~122 ms | ~810 ms |
-| 800-image matrix wall | 172 s | 1021 s |
-| batch-dir zh w1 (fp16, engine-resident) | — | 2.34 FPS |
+`pickBackend()` now maps `PPOCR_BACKEND_AUTO` to CPU unconditionally: CPU
+is the only backend validated on every host, and MNN's own
+`MNN_FORWARD_AUTO` picked Metal on this build — slower than CPU for this
+workload (see perf table) and previously numerically off-contract. GPU
+remains explicit opt-in (`--backend metal` etc.).
+
+### Performance (MacBook Air M4)
+
+| metric | CPU (4 thr) | Metal fp32+w0 | Metal fp16 (default) |
+|---|---|---|---|
+| zh/04.jpg e2e (steady, batch-dir w1) | ~193 ms | ~810 ms | ~425 ms |
+| batch-dir zh w1 throughput | 4.87 FPS | 1.23 FPS | 2.34 FPS |
+| 800-image single-image-mode matrix wall | 172 s | 3363 s | 1983 s |
 
 Metal fp32 is slower than CPU for this workload on M4 (Apple GPU fp32
-throughput is a fraction of fp16; shader pipelines also recompile per
-process in single-image mode). Recommendation for the auto selector on
-macOS: CPU for det-heavy small models until the upstream edge artifact and
-fp32 perf are addressed; Metal remains available via explicit
-`--backend metal`.
+throughput is a fraction of fp16; winograd off costs conv throughput; shader
+pipelines also recompile per process in single-image mode). AUTO→CPU is
+therefore the right default on macOS; Metal is available explicitly and
+numerically safe. Filing the winograd first-rows bug upstream would make
+fp16... still off-contract numerically — so CPU stays the macOS default.

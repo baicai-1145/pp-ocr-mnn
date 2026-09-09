@@ -49,7 +49,13 @@ namespace ppocr {
 // the backend; that's the rule (CONTRACT hard rule #6).
 Backend pickBackend(ppocr_backend requested) {
   switch (requested) {
-    case PPOCR_BACKEND_AUTO:   return Backend::Auto;
+    case PPOCR_BACKEND_AUTO:
+      // AUTO resolves to CPU unconditionally: CPU is the only backend with
+      // full-matrix numerical validation on every host, and MNN's own
+      // MNN_FORWARD_AUTO can pick GPU paths (Metal on macOS) that are
+      // slower or numerically off-contract (see platform/desktop/README.md).
+      // Explicit --backend metal/cuda/... remains the opt-in for GPU.
+      return Backend::Cpu;
     case PPOCR_BACKEND_CPU:    return Backend::Cpu;
     case PPOCR_BACKEND_CUDA:   return Backend::Cuda;
     case PPOCR_BACKEND_OPENCL: return Backend::OpenCL;

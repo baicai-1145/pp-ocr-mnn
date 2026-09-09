@@ -117,10 +117,9 @@ void MnnSession::load(const std::string& model_path,
   if (cfg.backend == Backend::Cuda || cfg.backend == Backend::OpenCL ||
       cfg.backend == Backend::Vulkan || cfg.backend == Backend::Metal) {
     impl_->backend_config = MNN::BackendConfig{};
-    // GPU backends: force full fp32 (see comment above). Metal joins the
-    // same policy: on Apple GPUs MNN's Metal fp16 path (the default)
-    // diverges badly from CPU (MLC 0.1–0.85 across the matrix), while
-    // fp32 is box-exact vs CPU (see platform/desktop/README.md).
+    // GPU backends: force full fp32 (Precision_High). On Metal this is
+    // mandatory: MNN's Metal fp16 path diverges from CPU (MLC 0.10–0.85;
+    // see platform/desktop/README.md), while fp32 is box-exact vs CPU.
     impl_->backend_config.precision = MNN::BackendConfig::Precision_High;
     sc.backendConfig = &impl_->backend_config;
     impl_->backend_config_set = true;
@@ -128,6 +127,20 @@ void MnnSession::load(const std::string& model_path,
     // backend switched away from GPU in a reload: restore borrowed default
     sc.backendConfig = nullptr;
     impl_->backend_config_set = false;
+  }
+  // MNN's Metal Winograd transform corrupts the first output rows of the
+  // det prob map for large det inputs (upstream bug, MNN 3.6.1): ru/02
+  // grows 1 -> 21 top-edge noise boxes; real-text boxes stay exact. The
+  // runtime hint is read when the session runtime is created, so it must
+  // be set pre-create. Metal only — the CPU winograd path is part of the
+  // validated matrix numerics and must not change. PPOCR_MNN_WINOGRAD=1
+  // re-enables it for upstream comparison.
+  if (cfg.backend == Backend::Metal) {
+    const char* w = std::getenv("PPOCR_MNN_WINOGRAD");
+    if (!w || w[0] != '1') {
+      impl_->interp->setSessionHint(
+          MNN::Interpreter::HintMode::WINOGRAD_MEMORY_LEVEL, 0);
+    }
   }
   impl_->session = impl_->interp->createSession(sc);
   if (!impl_->session) {

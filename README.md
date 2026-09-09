@@ -131,7 +131,8 @@ download policy) is overridable on `ppocr_config` — full field table in
 | CPU | ✅ validated (all rounds; M3-CUDA report: CPU numerics stable across MNN 2.9.1→3.6.1, mean diff 0.0) |
 | CUDA | ✅ validated (M3-CUDA gate: CUDA vs CPU mean diff 0.000055 << 0.002; fp32/Normal precision; all PERF rounds) |
 | OpenCL / Vulkan | ⚙️ compiled into the MNN build; **not validated on this host** (M3-CUDA report: OpenCL init fails → CPU fallback; Vulkan segfaults in the NVIDIA loader) |
-| Metal / CoreML / NNAPI | ⚙️ enum + platform wiring shipped (`platform/ios`, `platform/android`); requires Apple/Android hardware — M5 scope |
+| Metal | ✅ validated on macOS M4 (fp32 + winograd-off; 5/5 cells PASS; AUTO→CPU — see `platform/desktop/README.md`) |
+| CoreML / NNAPI | ⚙️ enum + platform wiring shipped (`platform/ios`, `platform/android`); M5 scope |
 
 `PPOCR_BACKEND_AUTO` maps to MNN `MNN_FORWARD_AUTO` (best available, CPU
 guaranteed). Explicit requests fail with `PPOCR_ERR_BACKEND` if unavailable.
