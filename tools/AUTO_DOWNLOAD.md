@@ -82,15 +82,20 @@ Download to `<cache_dir>/<file>.part`, verify sha, then
 harmless `<file>.part`; the next `ensure_model` removes it and
 retries.
 
-### 6. Mirror default: `https://example.com/ppocr-mnn-models`
+### 6. Mirror default: Hugging Face (ModelScope mirror)
 
-The brief asked for a placeholder URL. We use
-`https://example.com/ppocr-mnn-models` (RFC 2606 reserved TLD; any
-the default mirror is the Hugging Face repo
-`baicai1145/pp-ocr-mnn-models` (mirrored on ModelScope at the same
-org/name — set `PPORC_MNN_MIRROR=https://www.modelscope.cn/models/baicai1145/pp-ocr-mnn-models/resolve/master`
-if that is faster in your region). Previously,
-Hugging Face, or a self-hosted bucket). The default is overridable
+The default mirror is the Hugging Face repo
+`baicai1145/pp-ocr-mnn-models` (30 .mnn + registry.json, sha256-verified,
+anon download). A ModelScope mirror of the same content is available for
+regions where HF is slow — set:
+
+```
+PPORC_MNN_MIRROR=https://www.modelscope.cn/models/baicai1145/pp-ocr-mnn-models/resolve/master
+```
+
+Both hosts serve the exact conversion artifacts validated by the 811-cell
+matrix; the downloader verifies sha256 from `registry.json` after fetch.
+The default is overridable
 via:
 - The `mirror` field of `ppocr_config`
 - The `PPORC_MNN_MIRROR` env var (read in `Engine::load_submodels`)

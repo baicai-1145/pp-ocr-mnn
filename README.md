@@ -19,6 +19,18 @@ C ABI with zero platform `#ifdef`s in the business code.
 
 ## Quick start
 
+### Models (auto-download)
+
+The 30 converted `.mnn` models ship from a versioned registry with sha256
+verification — no PaddleOCR install needed:
+
+- Hugging Face: `https://huggingface.co/baicai1145/pp-ocr-mnn-models`
+- ModelScope (CN-fast mirror): `https://modelscope.cn/models/baicai1145/pp-ocr-mnn-models`
+
+The runtime resolves models against `<model-dir>/configs/registry.json` and
+fetches missing files from the default mirror (HF); point
+`PPORC_MNN_MIRROR` at the ModelScope URL for faster downloads in China.
+
 ### Build (Linux desktop, CPU)
 
 ```sh
