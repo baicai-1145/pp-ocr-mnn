@@ -15,12 +15,37 @@
 #include <MNN/MNNForwardType.h>
 #include <MNN/Tensor.hpp>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace ppocr {
+
+// Debug helper: PPOCR_DUMP_INPUT=<prefix> writes the raw float32 input
+// tensor of every MNN session input to <prefix>.<name>.<n>.<dims>.bin
+// right before it is staged (same bytes the session receives). Used to
+// build bit-exact minimal repros for backend numerics debugging.
+static void dump_input_if_requested(const std::string& name,
+                                    const std::vector<int>& dims,
+                                    const float* data) {
+  const char* prefix = std::getenv("PPOCR_DUMP_INPUT");
+  if (!prefix || !data) return;
+  static int seq = 0;
+  char path[1024];
+  std::snprintf(path, sizeof(path), "%s.%s.%d", prefix, name.c_str(), seq++);
+  FILE* f = std::fopen(path, "wb");
+  if (!f) return;
+  int nd = (int)dims.size();
+  std::fwrite(&nd, sizeof(int), 1, f);
+  std::fwrite(dims.data(), sizeof(int), nd, f);
+  size_t n = 1;
+  for (int d : dims) n *= (size_t)(d > 0 ? d : 1);
+  std::fwrite(data, sizeof(float), n, f);
+  std::fclose(f);
+}
 
 struct MnnSessionImpl {
   std::unique_ptr<MNN::Interpreter> interp;
@@ -128,14 +153,14 @@ void MnnSession::load(const std::string& model_path,
     sc.backendConfig = nullptr;
     impl_->backend_config_set = false;
   }
-  // MNN's Metal Winograd transform corrupts the first output rows of the
-  // det prob map for large det inputs (upstream bug, MNN 3.6.1): ru/02
-  // grows 1 -> 21 top-edge noise boxes; real-text boxes stay exact. The
-  // runtime hint is read when the session runtime is created, so it must
-  // be set pre-create. Metal only — the CPU winograd path is part of the
-  // validated matrix numerics and must not change. PPOCR_MNN_WINOGRAD=1
-  // re-enables it for upstream comparison.
-  if (cfg.backend == Backend::Metal) {
+  // MNN 3.6.1's Winograd convolution is corrupt on BOTH CPU and Metal for
+  // the det head conv (320x216x16->4): the top ~28 output rows come out as
+  // ~0.99 garbage (ru/02: 1 -> 21 top-edge noise boxes). Metal always uses
+  // Winograd at the default hint level; CPU autotune may select it too, so
+  // both backends are forced to level 0 (direct conv, bit-verified against
+  // the Paddle baseline). PPOCR_MNN_WINOGRAD=1 opts back in for upstream
+  // comparison only.
+  {
     const char* w = std::getenv("PPOCR_MNN_WINOGRAD");
     if (!w || w[0] != '1') {
       impl_->interp->setSessionHint(
@@ -223,6 +248,7 @@ void MnnSession::set_input_float(const std::string& name,
     // CPU backend (or device backend with host-mapped memory): the
     // fast path — write the host pointer directly.
     std::memcpy(dst, data, n * sizeof(float));
+    dump_input_if_requested(name, dims, data);
     return;
   }
   // MNN 3.6.1, non-CPU backend: the session input tensor lives on the
@@ -239,6 +265,7 @@ void MnnSession::set_input_float(const std::string& name,
     throw std::runtime_error("MnnSession: host staging tensor alloc failed");
   }
   std::memcpy(host_tensor->host<float>(), data, n * sizeof(float));
+  dump_input_if_requested(name, dims, data);
   if (!dev->copyFromHostTensor(host_tensor)) {
     delete host_tensor;
     throw std::runtime_error("MnnSession: copyFromHostTensor failed");
@@ -270,6 +297,8 @@ int MnnSession::run() {
 SessionOutput MnnSession::output(const std::string& name) const {
   SessionOutput so;
   if (!impl_->interp) return so;
+  // DEBUG(wino): PPOCR_DUMP_OUTPUT=<prefix> dumps each output after readback.
+  struct DumpGuard { ~DumpGuard() {} } _dumpGuardUnused;
   for (size_t i = 0; i < impl_->output_names.size(); ++i) {
     if (impl_->output_names[i] != name) continue;
     so.shape = impl_->output_dims[i];
@@ -292,6 +321,19 @@ SessionOutput MnnSession::output(const std::string& name) const {
     impl_->device_out_cache = new float[total];
     std::memcpy(impl_->device_out_cache, host_out->host<float>(),
                 host_out->size());
+    if (const char* dp = std::getenv("PPOCR_DUMP_OUTPUT")) {
+      static int oseq = 0;
+      char pth[1024];
+      std::snprintf(pth, sizeof(pth), "%s.%s.%d", dp, name.c_str(), oseq++);
+      FILE* f = std::fopen(pth, "wb");
+      if (f) {
+        int nd = (int)impl_->output_dims[i].size();
+        std::fwrite(&nd, sizeof(int), 1, f);
+        std::fwrite(impl_->output_dims[i].data(), sizeof(int), nd, f);
+        std::fwrite(impl_->device_out_cache, sizeof(float), total, f);
+        std::fclose(f);
+      }
+    }
     so.data = impl_->device_out_cache;
     delete host_out;
     return so;
