@@ -163,3 +163,153 @@ valid Windows PE file. No wine runtime on this host to
 actually execute it, but the cross-compile completes
 cleanly and the symbol resolution succeeds (no undefined
 references).
+
+## macOS (Apple Silicon / arm64, native host build)
+
+Status: **validated** — CPU backend (MNN ARM82 + KleidiAI, NEON fp32), on
+MacBook Air M4 / macOS 26.6 / Xcode 26.2 / CMake 4.3, against the published
+eval dataset (`hf.co/datasets/baicai1145/pp-ocr-mnn-eval`).
+
+There is no prebuilt `libMNN.a` in `third_party/MNN/build` on a fresh macOS
+clone, so the top-level CMake takes its documented fallback path:
+`add_subdirectory(third_party/MNN)` with a CPU-only MNN config
+(ARM82/KleidiAI ON, Metal/OpenCL/Vulkan OFF — Metal/CoreML validation is M5
+scope). Build:
+
+```sh
+cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release
+cmake --build build-mac -j8
+ctest --test-dir build-mac   # with PPORC_MNN_MODELS/PPOCR_IMG_ROOT set
+```
+
+Two things differ from the prebuilt-MNN Linux path (both handled in the
+top-level CMakeLists):
+
+1. The fallback branch aliases `MNN_LIBRARY=MNN` (the CMake target) so the
+   downloader test targets resolve without a `find_library` hit.
+2. `-Wl,--whole-archive` is GNU-ld only; Apple ld64 uses
+   `-Wl,-force_load,<archive>` (applied to the two downloader test targets,
+   which then also need the public include dirs + libjpeg linked explicitly
+   because a raw link item does not propagate `ppocr_core`'s interface).
+   `find_package(CURL)` on Homebrew can find the lib without creating the
+   `CURL::CURL` target, so CMake synthesizes it when missing.
+
+NFS-hosted worktrees: macOS creates AppleDouble `._*` metadata files next to
+every source file, which MNN's source GLOBs pick up and clang rejects
+(`no such file: .../._Backend.cpp`). Clean them before configuring and after
+any FetchContent extraction:
+
+```sh
+find third_party/MNN build-mac/_mnn_build/_deps -name '._*' -delete
+```
+
+then re-run `cmake -S . -B build-mac` (GLOB results are cached in the
+generated Makefiles) and build.
+
+### e2e acceptance run (published dataset, no /root paths)
+
+```sh
+export PPOCR_MNN_MODELS=./models
+export PPOCR_IMG_ROOT=_downloads/eval/root/ocr_test_imgs
+export PPOCR_REF_ROOT=_downloads/eval/root/ppocr_reference
+python3 tools/run_reference.py --cli ./build-mac/ppocr_cli --backend cpu \
+  --threads 4 --jobs 4 --results-dir results/mac-cpu \
+  --only-combo PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec \
+  --only-combo PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec \
+  --only-combo PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec \
+  --only-combo PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec \
+  --only-combo PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec
+python3 tools/score.py --results-dir results/mac-cpu --report report.md
+```
+
+Verified results (800 images, MLC gate ≤ 0.05, all PASS):
+
+| cell | MLC (join) |
+|---|---|
+| PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0388 (0.0322) |
+| PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec | 0.0187 (0.0182) |
+| PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec | 0.0000 (0.0001) |
+| PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec | 0.0030 (0.0031) |
+| PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec | 0.0119 (0.0254) |
+
+Single-image smoke (zh/04.jpg, PP-OCRv6_tiny, 4 threads): det 110 ms /
+rec 13 ms / total 122 ms — `examples/c_api_demo.c` links and runs with
+`clang ... build-mac/libppocr_core.a build-mac/_mnn_build/libMNN.a -lz
+-ljpeg -lcurl -lc++`.
+
+## Metal backend (Apple GPU) — validated: 5/5 cells PASS
+
+`third_party/MNN` is rebuilt locally with Metal for this backend:
+
+```sh
+cmake -S third_party/MNN -B third_party/MNN/build -DCMAKE_BUILD_TYPE=Release \
+  -DMNN_METAL=ON -DMNN_BUILD_SHARED_LIBS=OFF -DMNN_BUILD_CONVERTER=OFF \
+  -DMNN_BUILD_TOOLS=OFF -DMNN_BUILD_DEMO=OFF -DMNN_BUILD_BENCHMARK=OFF \
+  -DMNN_BUILD_TEST=OFF -DMNN_OPENCL=OFF -DMNN_VULKAN=OFF -DMNN_CUDA=OFF
+cmake --build third_party/MNN/build -j8   # -> libMNN.a, picked up as "prebuilt"
+cmake -S . -B build-mac && cmake --build build-mac -j8
+```
+
+With a Metal-enabled libMNN.a present, the top-level CMake switches to its
+prebuilt path; linking needs `-framework Metal -framework Foundation`
+(added in the top-level CMakeLists) and `-Wl,-force_load` test targets need
+CXX linker language + the same frameworks explicitly (raw link items do not
+propagate interface deps).
+
+`--backend metal` and `--backend auto` both work end-to-end (AUTO resolves
+to Metal on this build; output is bit-identical to `--backend metal`).
+
+### Numerics (MNN 3.6.1, MacBook Air M4, published eval dataset)
+
+Two MNN Metal issues were diagnosed and are mitigated in the engine
+(`src/mnn_session.cpp`), without touching the submodule:
+
+1. **fp16 divergence** — MNN's Metal fp16 path (its default) diverges badly
+   from CPU: with fp16 the 5-cell subset scores MLC 0.05–0.62 (gate ≤ 0.05),
+   0/5 PASS even with winograd off. fp16 on Metal is therefore not usable
+   for this workload.
+2. **Winograd first-rows corruption (upstream MNN bug)** — MNN's Metal
+   Winograd transform emits elevated prob values in the first output rows
+   of the det prob map for large det inputs (ru/02, 1280×853 → ~864-row
+   input: baseline 1 box → 21 boxes, all hugging y ≤ 22 with 4–9 px
+   heights; the true box matches CPU exactly). With
+   `Interpreter::setSessionHint(WINOGRAD_MEMORY_LEVEL, 0)` (Metal only; the
+   CPU winograd path is part of the validated matrix numerics) the artifact
+   disappears and det becomes box-exact vs CPU.
+   `PPOCR_MNN_WINOGRAD=1` re-enables it for upstream comparison.
+
+Final config = **fp32 (Precision_High) + winograd off**. The engine forces
+`Precision_High` on all GPU backends; Metal joins CUDA/OpenCL/Vulkan there.
+
+| cell (800 imgs) | Metal fp32+w0 MLC | CPU MLC | status |
+|---|---|---|---|
+| PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0388 | 0.0388 | PASS |
+| PP-OCRv6_tiny_det__PP-OCRv6_tiny_rec | 0.0227 | 0.0187 | PASS |
+| PP-OCRv5_mobile_det__en_PP-OCRv5_mobile_rec | 0.0000 | 0.0000 | PASS |
+| PP-OCRv5_mobile_det__th_PP-OCRv5_mobile_rec | 0.0030 | 0.0030 | PASS |
+| PP-OCRv5_mobile_det__korean_PP-OCRv5_mobile_rec | 0.0119 | 0.0119 | PASS |
+
+`--backend metal` and `--backend auto` both work end-to-end.
+
+### Backend selection: AUTO resolves to CPU
+
+`pickBackend()` now maps `PPOCR_BACKEND_AUTO` to CPU unconditionally: CPU
+is the only backend validated on every host, and MNN's own
+`MNN_FORWARD_AUTO` picked Metal on this build — slower than CPU for this
+workload (see perf table) and previously numerically off-contract. GPU
+remains explicit opt-in (`--backend metal` etc.).
+
+### Performance (MacBook Air M4)
+
+| metric | CPU (4 thr) | Metal fp32+w0 | Metal fp16 (default) |
+|---|---|---|---|
+| zh/04.jpg e2e (steady, batch-dir w1) | ~193 ms | ~810 ms | ~425 ms |
+| batch-dir zh w1 throughput | 4.87 FPS | 1.23 FPS | 2.34 FPS |
+| 800-image single-image-mode matrix wall | 172 s | 3363 s | 1983 s |
+
+Metal fp32 is slower than CPU for this workload on M4 (Apple GPU fp32
+throughput is a fraction of fp16; winograd off costs conv throughput; shader
+pipelines also recompile per process in single-image mode). AUTO→CPU is
+therefore the right default on macOS; Metal is available explicitly and
+numerically safe. Filing the winograd first-rows bug upstream would make
+fp16... still off-contract numerically — so CPU stays the macOS default.

@@ -22,8 +22,13 @@
 #include <string>
 #include <vector>
 
-#if !defined(PPDECODE_HAVE_LIBJPEG)
-#define PPDECODE_HAVE_LIBJPEG 1
+// CMake defines this to 1 only when it actually located a system libjpeg.
+// When the macro is absent the build has no jpeglib.h — which is exactly the
+// case this fallback exists for — so the default must be 0. It used to
+// default to 1, which made the fallback unreachable and broke every build
+// without libjpeg (e.g. Android NDK: "'jpeglib.h' file not found").
+#ifndef PPDECODE_HAVE_LIBJPEG
+#define PPDECODE_HAVE_LIBJPEG 0
 #endif
 
 #if PPDECODE_HAVE_LIBJPEG
@@ -65,9 +70,18 @@ bool decode_jpeg_bgr(const std::string& path, ppocr::Image& img) {
     return false;
   }
   // cv2.imread reads 3-channel BGR for both color and gray jpegs (gray is
-  // broadcast), so request JCS_EXT_BGR unconditionally and let libjpeg's
-  // color converter handle grayscale / YCbCr / CMYK sources.
-  cinfo.out_color_space = JCS_EXT_BGR;
+  // broadcast), so ask libjpeg for BGR directly and let its color converter
+  // handle grayscale / YCbCr / CMYK sources.
+  //
+  // Request plain JCS_RGB and swap R/B in the scanline loop below, rather
+  // than asking for JCS_EXT_BGR. JCS_EXT_BGR is a libjpeg-turbo extension
+  // that a stock IJG libjpeg does not have (GitHub's macOS runners ship the
+  // IJG one, so the build failed there), and it is an enum member, not a
+  // macro — so it cannot be probed with #ifdef either. JCS_RGB exists in
+  // both libraries and libjpeg's colour conversion is identical for the two
+  // requests (EXT_BGR only reorders the bytes it emits), so this yields
+  // byte-identical BGR output on every libjpeg flavour.
+  cinfo.out_color_space = JCS_RGB;
   jpeg_start_decompress(&cinfo);
   const int w = static_cast<int>(cinfo.output_width);
   const int h = static_cast<int>(cinfo.output_height);
@@ -83,6 +97,16 @@ bool decode_jpeg_bgr(const std::string& path, ppocr::Image& img) {
     if (jpeg_read_scanlines(&cinfo, rp, 1) != 1) {
       jpeg_destroy_decompress(&cinfo);
       return false;
+    }
+    {
+      // libjpeg handed us RGB; the cv2.imread contract (and therefore the
+      // baseline pipeline) is BGR.
+      unsigned char* q = rp[0];
+      for (int x = 0; x < w; ++x, q += 3) {
+        const unsigned char t = q[0];
+        q[0] = q[2];
+        q[2] = t;
+      }
     }
   }
   jpeg_finish_decompress(&cinfo);

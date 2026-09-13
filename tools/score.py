@@ -158,6 +158,20 @@ def load_pred(pred_path: Path) -> List[dict]:
         return json.load(f)
 
 
+def norm_img_path(p: str) -> str:
+    """Normalize image_path for cross-machine scoring.
+
+    Baselines bake in the generating host's absolute path
+    (/root/ocr_test_imgs/<lang>/NN.jpg); external users run the CLI over
+    their own unpacked dataset copy. Key both sides by the path tail after
+    the last 'ocr_test_imgs/' so matching is machine-independent.
+    """
+    if not isinstance(p, str):
+        return p
+    idx = p.rfind("ocr_test_imgs/")
+    return p[idx:] if idx >= 0 else p
+
+
 def load_baseline(base_path: Path) -> List[dict]:
     with open(base_path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -270,7 +284,7 @@ def score_full_cell(combo_dir: Path, lang: str, results_dir: Path
     pred = load_pred(pred_path)
     pred_by_path: Dict[str, List[str]] = {}
     for p in pred:
-        pred_by_path[p["image_path"]] = p.get("rec_texts", [])
+        pred_by_path[norm_img_path(p["image_path"])] = p.get("rec_texts", [])
     mlcs: List[float] = []
     joins: List[float] = []
     n_invalid = 0
@@ -280,7 +294,7 @@ def score_full_cell(combo_dir: Path, lang: str, results_dir: Path
         if not valid:
             n_invalid += 1
             continue
-        ipath = b.get("image_path", "")
+        ipath = norm_img_path(b.get("image_path", ""))
         if ipath not in pred_by_path:
             n_missing_pred += 1
             continue
@@ -331,11 +345,11 @@ def score_strip_cell(combo_dir: Path, lang: str, results_dir: Path,
             warnings.append(f"pred[{i}] missing keys")
     base_path = combo_dir / lang / "ocr_results.json"
     base = load_baseline(base_path) if base_path.exists() else []
-    base_by_path: Dict[str, dict] = {b["image_path"]: b for b in base}
+    base_by_path: Dict[str, dict] = {norm_img_path(b["image_path"]): b for b in base}
     mlcs: List[float] = []
     joins: List[float] = []
     for p in pred:
-        ipath = p["image_path"]
+        ipath = norm_img_path(p["image_path"])
         b = base_by_path.get(ipath)
         if b is not None:
             err = validate_strip_entry(b)

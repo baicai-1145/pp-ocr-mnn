@@ -140,6 +140,16 @@ if(NOT CURL_FOUND)
   endif()
 else()
   set(PPOCR_HAS_CURL TRUE)
+  # CMake's FindCURL module does not always create the CURL::CURL imported
+  # target (observed with curl-config-based discovery on macOS/Homebrew);
+  # synthesize it from the module variables when it is missing so the
+  # downstream target_link_libraries(CURL::CURL) works on every platform.
+  if(NOT TARGET CURL::CURL)
+    add_library(CURL::CURL UNKNOWN IMPORTED)
+    set_target_properties(CURL::CURL PROPERTIES
+      IMPORTED_LOCATION "${CURL_LIBRARIES}"
+      INTERFACE_INCLUDE_DIRECTORIES "${CURL_INCLUDE_DIRS}")
+  endif()
 endif()
 if(PPOCR_HAS_CURL)
   message(STATUS "ppocr-mnn: model auto-downloader will use libcurl")
@@ -201,6 +211,14 @@ option(PPOCR_PREP_BILEXACT "Use bit-exact OpenCV INTER_LINEAR replica in det pre
 if(PPOCR_PREP_BILEXACT)
   target_compile_definitions(ppocr_core PUBLIC PPOCR_PREP_BILEXACT=1)
 endif()
+# Apple system frameworks libMNN.a depends on when built with MNN_METAL=ON
+# (MetalBackend.mm / MNNMetalContext.mm are Objective-C++). Empty on other
+# platforms; consumed by ppocr_core (prebuilt path) and the raw-link-item
+# downloader test targets (raw items don't propagate interface libs).
+set(_PPOCR_MNN_FRAMEWORKS)
+if(APPLE)
+  set(_PPOCR_MNN_FRAMEWORKS "-framework Metal" "-framework Foundation")
+endif()
 if(_ppocr_using_prebuilt_mnn)
   # libMNN.a needs zlib (for weight compression). MNN itself declares
   # -lz transitively, so we propagate that requirement up.
@@ -211,10 +229,17 @@ if(_ppocr_using_prebuilt_mnn)
       /usr/lib/libz.so.1
       /lib/x86_64-linux-gnu/libz.so.1
       /lib/libz.so.1)
+  if(APPLE)
+    # macOS ships zlib in the dyld shared cache / SDK tbd stubs, not as a
+    # visible /usr/lib file; the default find_library search (which covers
+    # the Xcode SDK sysroot and Homebrew) resolves it as a link item.
+    find_library(PPOCR_ZLIB_LIBRARY NAMES z libz)
+  else()
   find_library(PPOCR_ZLIB_LIBRARY
                NAMES z libz
                PATHS /usr/lib /usr/lib/x86_64-linux-gnu /lib /lib/x86_64-linux-gnu /opt/conda/lib /opt/miniconda3/lib
                NO_DEFAULT_PATH)
+  endif()
   if(NOT PPOCR_ZLIB_LIBRARY)
     foreach(p IN LISTS _ppocr_zlib_candidates)
       if(EXISTS "${p}")
@@ -231,16 +256,23 @@ if(_ppocr_using_prebuilt_mnn)
   # without a .note.GNU-stack section, which makes the linker warn about
   # an implicit executable stack. Suppress at link time so our build
   # output is clean — the sections are still safe, just stale.
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  # (GNU-ld only; Apple ld64 rejects -z and doesn't need it.)
+  if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
     add_link_options("-Wl,-z,noexecstack")
   endif()
   target_link_libraries(ppocr_core PUBLIC
     "${MNN_LIBRARY}"
     "${PPOCR_ZLIB_LIBRARY}"
+    ${_PPOCR_MNN_FRAMEWORKS}
     pthread)
 else()
   # CPU-only, no converter, no express auto-link. This path is only
   # used in development environments without the prebuilt libMNN.a.
+  # The MNN CMake target carries zlib transitively; alias the variables
+  # the prebuilt-path test targets reference unconditionally so the same
+  # target blocks work on both paths (macOS local builds hit this branch).
+  set(MNN_LIBRARY MNN)
+  set(PPOCR_ZLIB_LIBRARY z)
   set(MNN_BUILD_CONVERTER OFF CACHE BOOL "" FORCE)
   set(MNN_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   set(MNN_BUILD_TRAIN OFF CACHE BOOL "" FORCE)
@@ -268,6 +300,11 @@ endif()
 set(_mnn_cuda_so "${PPOCR_MNN_ROOT}/build/source/backend/cuda/libMNN_Cuda_Main.so")
 
 # ---- CLI ----------------------------------------------------------------
+# Guarded by PPOCR_BUILD_TOOLS: an iOS build sets it OFF (a CLI executable
+# is meaningless there), and leaving the target unconditional made CMake
+# treat ppocr_cli as a MACOSX_BUNDLE executable and then fail the install()
+# rule below with "install TARGETS given no BUNDLE DESTINATION".
+if(PPOCR_BUILD_TOOLS)
 add_executable(ppocr_cli apps/ppocr_cli.cpp)
 target_link_libraries(ppocr_cli PRIVATE ppocr_core)
 if(EXISTS "${_mnn_cuda_so}")
@@ -279,6 +316,7 @@ if(EXISTS "${_mnn_cuda_so}")
   target_link_libraries(ppocr_cli PRIVATE
     "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed" "-Wl,--export-dynamic")
 endif()
+endif() # PPOCR_BUILD_TOOLS
 
 # ---- tests --------------------------------------------------------------
 enable_testing()
@@ -299,12 +337,39 @@ endif()
 # tests/test_downloader.cpp for the scenarios.
 if(PPOCR_BUILD_TESTS)
 add_executable(test_downloader tests/test_downloader.cpp)
+# -force_load/--whole-archive link items are raw (not the ppocr_core
+# target), so the public include dirs do not propagate; add them here.
+target_include_directories(test_downloader PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # E2E: auto-download from the default mirror into an empty model dir.
 add_executable(test_auto_download tests/test_auto_download.c)
+# -force_load/--whole-archive are raw link items, so ppocr_core's CXX
+# linker language no longer propagates to this C target; pin it.
+set_target_properties(test_auto_download PROPERTIES LINKER_LANGUAGE CXX)
+target_include_directories(test_auto_download PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Static libs don't pull unreferenced objects into a downstream
+# executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
+# and zlib are linked normally (the same set ppocr_core uses).
+# Apple ld64 has no --whole-archive; -force_load on the resolved archive
+# file is the equivalent.
+if(APPLE)
+  set(_PPOCR_WHOLE_CORE "-Wl,-force_load,$<TARGET_FILE:ppocr_core>")
+else()
+  set(_PPOCR_WHOLE_CORE "-Wl,--whole-archive" ppocr_core "-Wl,--no-whole-archive")
+endif()
+# ppocr_core's PUBLIC link deps (libjpeg) don't propagate through the raw
+# -force_load/whole-archive link items; pull the jpeg lib in explicitly.
+set(_PPOCR_TEST_EXTRA_LIBS)
+if(PPOCR_JPEG_LIBRARIES)
+  list(APPEND _PPOCR_TEST_EXTRA_LIBS "${PPOCR_JPEG_LIBRARIES}")
+endif()
+list(APPEND _PPOCR_TEST_EXTRA_LIBS ${_PPOCR_MNN_FRAMEWORKS})
 target_link_libraries(test_auto_download PRIVATE
-  -Wl,--whole-archive ppocr_core -Wl,--no-whole-archive
+  ${_PPOCR_WHOLE_CORE}
   "${MNN_LIBRARY}"
   "${PPOCR_ZLIB_LIBRARY}"
+  ${_PPOCR_TEST_EXTRA_LIBS}
   Threads::Threads
   dl
 )
@@ -317,12 +382,13 @@ if(EXISTS "${_mnn_cuda_so}")
     "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed")
 endif()
 # Static libs don't pull unreferenced objects into a downstream
-# executable, so we wrap ppocr_core with --whole-archive. MNN, curl,
-# and zlib are linked normally (the same set ppocr_core uses).
+# executable, so we wrap ppocr_core with --whole-archive (see the
+# _PPOCR_WHOLE_CORE definition above; APPLE uses -force_load).
 target_link_libraries(test_downloader PRIVATE
-  -Wl,--whole-archive ppocr_core -Wl,--no-whole-archive
+  ${_PPOCR_WHOLE_CORE}
   "${MNN_LIBRARY}"
   "${PPOCR_ZLIB_LIBRARY}"
+  ${_PPOCR_TEST_EXTRA_LIBS}
   Threads::Threads
   dl
 )
@@ -385,8 +451,10 @@ endif()
 #   ... (all the public headers in include/ppocr/ and
 #        include/ppocr/postprocess/)
 include(GNUInstallDirs)
+if(PPOCR_BUILD_TOOLS)
 install(TARGETS ppocr_cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(TARGETS ppocr_core
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ppocr
