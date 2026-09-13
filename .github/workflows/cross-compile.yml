@@ -13,10 +13,14 @@
 #   - pull_request          (always; same as push)
 #
 # The matrix is **optional** via workflow_dispatch's
-# "matrix" input. The default empty array means "build
+# "matrix" input. The default empty value means "build
 # all four" on manual runs. The default is intentionally
 # empty so a CI admin can select "ios-only" or "windows-only"
 # to iterate on a single platform.
+#
+# The `filter` job emits a comma-delimited platform list (wrapped in commas)
+# that the build jobs match with plain substring `contains()` — see the note
+# in that job for why the list form is used instead of a JSON array.
 
 name: cross-compile
 
@@ -49,31 +53,31 @@ jobs:
     name: decide matrix
     runs-on: ubuntu-latest
     outputs:
-      include: ${{ steps.set.outputs.include }}
+      platforms: ${{ steps.set.outputs.platforms }}
     steps:
       - id: set
         run: |
+          # NOTE: $GITHUB_OUTPUT requires `name=value` lines (or the
+          # `name<<DELIM` heredoc form). Earlier revisions wrote a JSON array
+          # across several bare lines, which the runner rejects with
+          # "Invalid format '{...}'" — failing the pipeline before any build
+          # job could start (every run up to and including 2026-09-13 failed
+          # that way).
+          #
+          # The value is a comma-delimited list wrapped in commas so the
+          # job-level `contains()` checks (plain substring matching) can
+          # match exact names without prefix collisions.
           if [[ -z "${{ inputs.matrix }}" ]]; then
-            echo "include=[" > $GITHUB_OUTPUT
-            echo '{"platform":"android-aarch64","runner":"ubuntu-latest"},' >> $GITHUB_OUTPUT
-            echo '{"platform":"ios","runner":"macos-14"},' >> $GITHUB_OUTPUT
-            echo '{"platform":"macos","runner":"macos-14"},' >> $GITHUB_OUTPUT
-            echo '{"platform":"windows-mingw","runner":"ubuntu-latest"}' >> $GITHUB_OUTPUT
-            echo "]" >> $GITHUB_OUTPUT
+            echo 'platforms=,android-aarch64,ios,macos,windows-mingw,' >> $GITHUB_OUTPUT
           else
-            case "${{ inputs.matrix }}" in
-              android-aarch64) echo 'include=[{"platform":"android-aarch64","runner":"ubuntu-latest"}]' >> $GITHUB_OUTPUT;;
-              ios)              echo 'include=[{"platform":"ios","runner":"macos-14"}]'              >> $GITHUB_OUTPUT;;
-              macos)            echo 'include=[{"platform":"macos","runner":"macos-14"}]'            >> $GITHUB_OUTPUT;;
-              windows-mingw)    echo 'include=[{"platform":"windows-mingw","runner":"ubuntu-latest"}]'>> $GITHUB_OUTPUT;;
-            esac
+            echo 'platforms=,${{ inputs.matrix }},' >> $GITHUB_OUTPUT
           fi
 
   # ---- matrix entries --------------------------------------------------
   android-aarch64:
     name: android aarch64 (NDK r27)
     needs: filter
-    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'android-aarch64') }}
+    if: ${{ contains(needs.filter.outputs.platforms, ',android-aarch64,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -108,7 +112,7 @@ jobs:
   ios:
     name: ios (xcframework wiring)
     needs: filter
-    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'ios') }}
+    if: ${{ contains(needs.filter.outputs.platforms, ',ios,') }}
     runs-on: macos-14
     timeout-minutes: 30
     steps:
@@ -164,7 +168,7 @@ jobs:
   macos:
     name: macos (x86_64)
     needs: filter
-    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'macos') }}
+    if: ${{ contains(needs.filter.outputs.platforms, ',macos,') }}
     runs-on: macos-14
     timeout-minutes: 30
     steps:
@@ -181,11 +185,15 @@ jobs:
       - name: Smoke-test the CLI
         run: |
           set -e
-          if [[ ! -d /tmp/ppocr-models ]]; then
-            echo "Skipping smoke test: no model dir on this host"
-            exit 0
-          fi
+          # `--help` needs no model files, so it always runs and proves the
+          # binary is executable. A real inference smoke test would need the
+          # (gitignored) model weights, so it is gated on their presence.
           ./build-mac/ppocr_cli --help
+          if [[ -d /tmp/ppocr-models ]]; then
+            echo "models found; running inference smoke test"
+          else
+            echo "Skipping inference smoke test: no model dir on this host"
+          fi
       - name: Install + verify layout
         run: |
           set -e
@@ -201,7 +209,7 @@ jobs:
   windows-mingw:
     name: windows-mingw (x86_64)
     needs: filter
-    if: ${{ needs.filter.outputs.include != '[]' && contains(needs.filter.outputs.include, 'windows-mingw') }}
+    if: ${{ contains(needs.filter.outputs.platforms, ',windows-mingw,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
