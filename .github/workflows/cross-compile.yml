@@ -8,9 +8,10 @@
 # already have the runtime results.
 #
 # Triggers:
-#   - push to main / ws/*  (always)
+#   - push to main         (only main; feature branches go through the PR
+#                           trigger, otherwise every push runs the matrix twice)
+#   - pull_request         (all PRs targeting main)
 #   - workflow_dispatch     (manual)
-#   - pull_request          (always; same as push)
 #
 # The matrix is **optional** via workflow_dispatch's
 # "matrix" input. The default empty value means "build
@@ -25,8 +26,16 @@
 name: cross-compile
 
 on:
+  # Feature branches are covered by the `pull_request` trigger below; adding
+  # them to `push` runs the whole four-job matrix twice for the same commit
+  # (the two events have different refs — refs/heads/<branch> vs
+  # refs/pull/<n>/merge — so no concurrency group can deduplicate them).
+  # Hosted runners then run out of capacity and jobs get killed mid-build
+  # with "the runner has received a shutdown signal", which looks like a
+  # build failure but is not. `main` has no PR of its own, so it still needs
+  # the push trigger.
   push:
-    branches: [main, 'ws/**']
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -43,13 +52,10 @@ on:
           - macos
           - windows-mingw
 
+# Same rationale as the trigger note above: include the event name so a run
+# can never cancel a run of the other event, and let cancel-in-progress only
+# drop superseded pushes (e.g. two quick pushes to main).
 concurrency:
-  # A push to a branch that already has an open PR starts TWO runs of the same
-  # four-job matrix (one for `push`, one for `pull_request`, since github.ref
-  # differs between them: refs/heads/<branch> vs refs/pull/<n>/merge). That
-  # doubles the load on the hosted runners and got jobs killed mid-build with
-  # "the runner has received a shutdown signal". Key the group on the event
-  # too, and let cancel-in-progress drop the stale run of the SAME event.
   group: cross-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
