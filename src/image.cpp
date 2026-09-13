@@ -22,8 +22,13 @@
 #include <string>
 #include <vector>
 
-#if !defined(PPDECODE_HAVE_LIBJPEG)
-#define PPDECODE_HAVE_LIBJPEG 1
+// CMake defines this to 1 only when it actually located a system libjpeg.
+// When the macro is absent the build has no jpeglib.h — which is exactly the
+// case this fallback exists for — so the default must be 0. It used to
+// default to 1, which made the fallback unreachable and broke every build
+// without libjpeg (e.g. Android NDK: "'jpeglib.h' file not found").
+#ifndef PPDECODE_HAVE_LIBJPEG
+#define PPDECODE_HAVE_LIBJPEG 0
 #endif
 
 #if PPDECODE_HAVE_LIBJPEG
