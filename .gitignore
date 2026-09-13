@@ -38,3 +38,9 @@ platform/ios/.build/
 platform/desktop/build/
 platform/desktop/dist/
 examples/build/
+
+# macOS AppleDouble sidecars (auto-created on NFS/SMB volumes)
+._*
+# NFS mount artifacts
+.order
+.metadata_never_index
