@@ -300,6 +300,11 @@ endif()
 set(_mnn_cuda_so "${PPOCR_MNN_ROOT}/build/source/backend/cuda/libMNN_Cuda_Main.so")
 
 # ---- CLI ----------------------------------------------------------------
+# Guarded by PPOCR_BUILD_TOOLS: an iOS build sets it OFF (a CLI executable
+# is meaningless there), and leaving the target unconditional made CMake
+# treat ppocr_cli as a MACOSX_BUNDLE executable and then fail the install()
+# rule below with "install TARGETS given no BUNDLE DESTINATION".
+if(PPOCR_BUILD_TOOLS)
 add_executable(ppocr_cli apps/ppocr_cli.cpp)
 target_link_libraries(ppocr_cli PRIVATE ppocr_core)
 if(EXISTS "${_mnn_cuda_so}")
@@ -311,6 +316,7 @@ if(EXISTS "${_mnn_cuda_so}")
   target_link_libraries(ppocr_cli PRIVATE
     "-Wl,--no-as-needed" "${_mnn_cuda_so}" "-Wl,--as-needed" "-Wl,--export-dynamic")
 endif()
+endif() # PPOCR_BUILD_TOOLS
 
 # ---- tests --------------------------------------------------------------
 enable_testing()
@@ -445,8 +451,10 @@ endif()
 #   ... (all the public headers in include/ppocr/ and
 #        include/ppocr/postprocess/)
 include(GNUInstallDirs)
+if(PPOCR_BUILD_TOOLS)
 install(TARGETS ppocr_cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(TARGETS ppocr_core
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ppocr

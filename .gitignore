@@ -44,3 +44,4 @@ examples/build/
 # NFS mount artifacts
 .order
 .metadata_never_index
+.tmp
