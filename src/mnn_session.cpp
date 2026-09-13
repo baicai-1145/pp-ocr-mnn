@@ -146,6 +146,14 @@ void MnnSession::load(const std::string& model_path,
     // mandatory: MNN's Metal fp16 path diverges from CPU (MLC 0.10–0.85;
     // see platform/desktop/README.md), while fp32 is box-exact vs CPU.
     impl_->backend_config.precision = MNN::BackendConfig::Precision_High;
+    // PPOCR_METAL_PREC=low: diagnostic opt-in to re-test the Metal fp16
+    // path against the CPU fp32/fp16 references.
+    if (cfg.backend == Backend::Metal) {
+      const char* mp = std::getenv("PPOCR_METAL_PREC");
+      if (mp && mp[0] == 'l') {
+        impl_->backend_config.precision = MNN::BackendConfig::Precision_Low;
+      }
+    }
     sc.backendConfig = &impl_->backend_config;
     impl_->backend_config_set = true;
   } else if (impl_->backend_config_set) {
@@ -153,13 +161,29 @@ void MnnSession::load(const std::string& model_path,
     sc.backendConfig = nullptr;
     impl_->backend_config_set = false;
   }
-  // MNN 3.6.1's Winograd convolution is corrupt on BOTH CPU and Metal for
-  // the det head conv (320x216x16->4): the top ~28 output rows come out as
-  // ~0.99 garbage (ru/02: 1 -> 21 top-edge noise boxes). Metal always uses
-  // Winograd at the default hint level; CPU autotune may select it too, so
-  // both backends are forced to level 0 (direct conv, bit-verified against
-  // the Paddle baseline). PPOCR_MNN_WINOGRAD=1 opts back in for upstream
-  // comparison only.
+  // PPOCR_CPU_PREC=low: opt-in CPU fp16 (Arm82/KleidiAI kernels; the shipped
+  // prebuilt has both compiled in). CER/PERF validation pending - do not
+  // enable by default until the matrix passes.
+  if (cfg.backend == Backend::Cpu) {
+    const char* prec = std::getenv("PPOCR_CPU_PREC");
+    if (prec && prec[0] == 'l') {
+      impl_->backend_config = MNN::BackendConfig{};
+      impl_->backend_config.precision = MNN::BackendConfig::Precision_Low;
+      sc.backendConfig = &impl_->backend_config;
+      impl_->backend_config_set = true;
+    }
+  }
+  // MNN 3.6.1's METAL Winograd convolution is corrupt for the det head conv
+  // (320x216, 64->16): nondeterministic noise boxes on some images
+  // (ru/00,02,03,07 -> 14..37 boxes instead of 1-6), reproducible with the
+  // pristine prebuilt libMNN.a and the real engine (per-inference input
+  // copy). CPU Winograd 3.6.1 is CORRECT when the input tensor is re-copied
+  // before every runSession (bit-parity with Winograd off on ru+zh) - the
+  // earlier "CPU winograd data race" was an artifact of debug drivers that
+  // copied the input only once: MNN's pipeline raster (NCHW->NC4HW4)
+  // overwrites the engine input tensor in place, so repeated runSession
+  // without re-setting the input drifts. To be safe on every backend we
+  // force level 0 by default; PPOCR_MNN_WINOGRAD=1 opts back in.
   {
     const char* w = std::getenv("PPOCR_MNN_WINOGRAD");
     if (!w || w[0] != '1') {
@@ -241,20 +265,14 @@ void MnnSession::set_input_float(const std::string& name,
                                  const float* data) {
   if (!data) throw std::runtime_error("MnnSession: null input data");
   MnnSession::resize_input(name, dims);
-  float* dst = MnnSession::input_host(name);
   size_t n = 1;
   for (int d : dims) n *= static_cast<size_t>(d > 0 ? d : 1);
-  if (dst) {
-    // CPU backend (or device backend with host-mapped memory): the
-    // fast path — write the host pointer directly.
-    std::memcpy(dst, data, n * sizeof(float));
-    dump_input_if_requested(name, dims, data);
-    return;
-  }
-  // MNN 3.6.1, non-CPU backend: the session input tensor lives on the
-  // device (host == nullptr). Stage through a host tensor so the
-  // backend's onCopyBuffer (CUDA / Vulkan / OpenCL) does the transfer
-  // (same fix as the m3-cuda gate driver).
+  // Always stage through a host tensor and copyFromHostTensor.
+  // NEVER memcpy into the session tensor's host pointer directly: for the
+  // Arm82 (CPU fp16, precision=Low) backend the session tensors carry fp16
+  // data, and copyFromHostTensor routes through onCopyBuffer, which
+  // quantizes fp32->fp16 (CPU->Arm82) or is a plain copy for float
+  // backends. Direct memcpy feeds fp32 bytes to kernels that read fp16.
   MNN::Tensor* dev = impl_->interp->getSessionInput(impl_->session,
                                                       name.c_str());
   if (!dev) throw std::runtime_error("MnnSession: no input named " + name);
@@ -302,12 +320,12 @@ SessionOutput MnnSession::output(const std::string& name) const {
   for (size_t i = 0; i < impl_->output_names.size(); ++i) {
     if (impl_->output_names[i] != name) continue;
     so.shape = impl_->output_dims[i];
-    so.data = impl_->output_hosts[i];
-    if (so.data) return so;
-    // MNN 3.6.1, non-CPU backend: the output tensor lives on the
-    // device. Snapshot it into a caller-lifetime host buffer (the
-    // MnnSession owns it until the next output() call — fine for the
-    // single-threaded run-then-decode flow of the engine).
+    // Always snapshot through copyToHostTensor. NEVER read the session
+    // output tensor's host pointer directly: for the Arm82 (CPU fp16,
+    // precision=Low) backend the session tensors carry fp16 data, and
+    // copyToHostTensor routes through onCopyBuffer, which dequantizes
+    // fp16->fp32 (Arm82->CPU). A direct read would reinterpret fp16
+    // bytes as fp32 (e.g. uniform 0x7e007e00 = fp16 NaN pattern).
     MNN::Tensor* dev = impl_->interp->getSessionOutput(
         impl_->session, name.c_str());
     if (!dev) return so;
