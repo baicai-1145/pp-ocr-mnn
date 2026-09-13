@@ -144,7 +144,7 @@ jobs:
                 -DMNN_OPENCL=OFF -DMNN_VULKAN=OFF \
                 -DMNN_CUDA=OFF -DMNN_ARM82=OFF \
                 -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-ios --target MNN -j
+          cmake --build build-ios --target MNN -- -j "$(sysctl -n hw.ncpu)"
       - name: Build PpocrC for iOS arm64
         run: |
           set -e
@@ -158,7 +158,7 @@ jobs:
                 -DPPOCR_BUILD_TESTS=OFF -DPPOCR_BUILD_TOOLS=OFF \
                 -DPPOCR_BUILD_CLS=OFF -DPPOCR_BUILD_JNI=OFF \
                 -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-ios-app --target ppocr_core -j
+          cmake --build build-ios-app --target ppocr_core -- -j "$(sysctl -n hw.ncpu)"
       - name: Verify ObjC wrapper syntactic check
         # The Swift Package needs Mac-side tooling (swift build)
         # which this CI does not run. We do a syntactic ObjC++ check.
@@ -193,7 +193,7 @@ jobs:
           cmake -B build-mac -S . \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DPPOCR_BUILD_TESTS=OFF
-          cmake --build build-mac --target ppocr_cli -j
+          cmake --build build-mac --target ppocr_cli -- -j "$(sysctl -n hw.ncpu)"
       - name: Smoke-test the CLI
         run: |
           set -e
@@ -250,7 +250,7 @@ jobs:
                   -DMNN_NNAPI=OFF -DMNN_ARM82=OFF -DMNN_METAL=OFF \
                   -DMNN_ONEDNN=OFF \
                   -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-win-mnn --target MNN -j
+          cmake --build build-win-mnn --target MNN -- -j "$(nproc)"
       - name: Build ppocr_core for Windows
         run: |
           set -e
@@ -268,7 +268,7 @@ jobs:
                   -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
                   -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
                   -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-windows --target ppocr_core -j
+          cmake --build build-windows --target ppocr_core -- -j "$(nproc)"
       - name: Build c_api_demo.exe
         run: |
           set -e
