@@ -44,7 +44,13 @@ on:
           - windows-mingw
 
 concurrency:
-  group: cross-${{ github.ref }}
+  # A push to a branch that already has an open PR starts TWO runs of the same
+  # four-job matrix (one for `push`, one for `pull_request`, since github.ref
+  # differs between them: refs/heads/<branch> vs refs/pull/<n>/merge). That
+  # doubles the load on the hosted runners and got jobs killed mid-build with
+  # "the runner has received a shutdown signal". Key the group on the event
+  # too, and let cancel-in-progress drop the stale run of the SAME event.
+  group: cross-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
