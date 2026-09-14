@@ -45,3 +45,6 @@ examples/build/
 .order
 .metadata_never_index
 .tmp
+
+# verify_suzuki.py build output
+third_party/_suzuki_driver
