@@ -281,6 +281,36 @@ Two MNN Metal issues were diagnosed and are mitigated in the engine
 Final config = **fp32 (Precision_High) + winograd off**. The engine forces
 `Precision_High` on all GPU backends; Metal joins CUDA/OpenCL/Vulkan there.
 
+### Metal SE-pool rewrite variant (`<name>.red.mnn`)
+
+`tools/rewrite_se_pool.py` swaps the SE-block global average poolings
+(`Pooling3D{isGlobal:true}`) for an equivalent `Reduction{MEAN, dim=[2,3]}`.
+It is a pure graph re-serialization (weights untouched) and numerically
+inert at the tensor level (prob-map meanabs ~7e-6, binarized agreement
+100%), but it only helps on Metal: MNN's Metal global pool dispatches a
+single threadgroup (`group=1x1x1`, a serial W×H scan) for these models.
+On CPU the rewritten graph is 2-6 % slower, and for `PP-OCRv4_server_det`
+(the one det whose pooling is already grouped-dispatched and is only 0.36 %
+of its GPU time) it is 3.1x slower under Metal.
+
+The engine therefore loads `<model_dir>/<name>.red.mnn` **only** when all of
+these hold: backend is Metal, the model is one of the four allowlisted
+dets (`PP-OCRv6_tiny_det`, `PP-OCRv6_small_det`, `PP-OCRv5_mobile_det`,
+`PP-OCRv4_mobile_det`), and the file exists. Otherwise the original model
+loads exactly as before — the variant is a transparent, optional
+optimization, never a replacement. Place the file next to the original in
+the model dir (`models/PP-OCRv5_mobile_det.red.mnn`); nothing is renamed or
+overwritten. A variant that fails to load logs and falls back to the
+original, so a truncated download cannot take down a working deployment.
+
+Gate impact (Metal, full-resolution, 5 languages, single binary with the
+dispatch toggled): 4 of 5 languages bit-identical per model; deltas are
+≤ 4.1e-3 (v5_mobile ja), ~10x below the 0.05 gate, from ≤ 1 px polygon
+shifts on borderline lines. `ru`/`ar` stay exactly at their pre-existing
+values (both already sit at/over the gate with the original model too).
+Diagnostic: `PPOCR_SE_REWRITE=0` forces the original model (and
+`PPOCR_SE_REWRITE=1` logs the selection to stderr).
+
 Diagnostic knobs (never for production, both fail the gate on this build):
 `PPOCR_METAL_PREC=normal` (fp16 storage) is ~35 % faster on the det stage
 (tiny det @1280×960: 37.9 ms vs 57.9 ms total, min of 10 interleaved rounds)

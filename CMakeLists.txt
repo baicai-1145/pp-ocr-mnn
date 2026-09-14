@@ -343,6 +343,13 @@ add_test(NAME test_suzuki COMMAND test_suzuki)
 add_executable(test_db_post_switch tests/test_db_post_switch.cpp)
 target_link_libraries(test_db_post_switch PRIVATE ppocr_core)
 add_test(NAME test_db_post_switch COMMAND test_db_post_switch)
+
+# SE-pool rewrite variant policy (task-7, PPOCR_SE_REWRITE): which det models
+# may load the `<name>.red.mnn` Metal variant. Pure header, no MNN/models.
+add_executable(test_se_rewrite tests/test_se_rewrite.cpp)
+target_include_directories(test_se_rewrite PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_test(NAME test_se_rewrite COMMAND test_se_rewrite)
 endif()
 
 # Auto-downloader test driver (TOOLS-5 / M3). It links against
