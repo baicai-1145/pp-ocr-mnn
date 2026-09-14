@@ -24,6 +24,17 @@
 
 namespace ppocr {
 
+// Winograd memory level handed to MNN. Default 0 (Winograd convolution off).
+// Measured on this build (MNN 3.6.1, M4, v6-tiny det @1280x960, min-of-18):
+//   level 0: 57.6 ms, RSS 169 MB
+//   level 3: 63.3 ms, RSS 190 MB   (MNN's own default)
+// so level 3 is slower AND costs ~20 MB more workspace here. Level 1 is
+// reported broken (wrong boxes on ru). The det graph is dominated by
+// global-pooling/Raster traffic, not convolution, so Winograd cannot pay
+// for itself; keep it off. PPOCR_MNN_WINOGRAD overrides (0/1/3).
+#ifndef MNN_DEFAULT_WINOGRAD_LEVEL
+#define MNN_DEFAULT_WINOGRAD_LEVEL 0
+#endif
 // Debug helper: PPOCR_DUMP_INPUT=<prefix> writes the raw float32 input
 // tensor of every MNN session input to <prefix>.<name>.<n>.<dims>.bin
 // right before it is staged (same bytes the session receives). Used to
@@ -70,6 +81,16 @@ struct MnnSessionImpl {
   std::vector<const float*>     output_hosts;
   // Host snapshot of the last device output (non-CPU backends). Owned.
   float* device_out_cache = nullptr;
+  size_t device_out_cache_cap = 0;    // floats, reused instead of new/delete
+  // Staging tensor reused across set_input_float calls (created once per
+  // distinct shape). Avoids a 4.9 MB alloc + free per frame.
+  MNN::Tensor* stage_tensor = nullptr;
+  std::vector<int> stage_dims;
+  // Last dims handed to resizeTensor, so we can skip a redundant
+  // resizeSession when the caller asks for the same shape again.
+  std::vector<std::vector<int>> resized_dims;
+  // Cached per-output readback tensors (host side), reused across runs.
+  std::vector<MNN::Tensor*> out_host_tensors;
 };
 
 namespace {
@@ -112,6 +133,8 @@ __attribute__((used)) static const char* mnn_backend_label(MNNForwardType t) {
 MnnSession::MnnSession() : impl_(new MnnSessionImpl) {}
 MnnSession::~MnnSession() {
   delete[] impl_->device_out_cache;
+  for (auto* t : impl_->out_host_tensors) delete t;
+  delete impl_->stage_tensor;
   delete impl_;
 }
 
@@ -141,16 +164,21 @@ void MnnSession::load(const std::string& model_path,
   // still argue for shipping Normal on mobile-class models.
   if (cfg.backend == Backend::Cuda || cfg.backend == Backend::OpenCL ||
       cfg.backend == Backend::Vulkan || cfg.backend == Backend::Metal) {
+    // GPU backends: precision defaults to full fp32 (Precision_High).
+    // On Metal, High = fp32 storage + fp32 shaders (~58 ms det on v6-tiny at
+    // 1280x960); Normal = fp16 storage + fp32 accumulate is ~35% faster
+    // (38 ms) BUT fails the accuracy gate badly (measured, metal backend,
+    // 5 langs, vs the fp32 paddle reference): v6-tiny MLC zh 0.099 / en 0.160
+    // / ru 0.600 / ja 0.596 / ar 0.448; v4-mobile ru 0.139 / ar 0.267.
+    // So High stays the default. PPOCR_METAL_PREC=normal|low is a
+    // diagnostic-only opt-in and must never be shipped.
     impl_->backend_config = MNN::BackendConfig{};
-    // GPU backends: force full fp32 (Precision_High). On Metal this is
-    // mandatory: MNN's Metal fp16 path diverges from CPU (MLC 0.10–0.85;
-    // see platform/desktop/README.md), while fp32 is box-exact vs CPU.
     impl_->backend_config.precision = MNN::BackendConfig::Precision_High;
-    // PPOCR_METAL_PREC=low: diagnostic opt-in to re-test the Metal fp16
-    // path against the CPU fp32/fp16 references.
     if (cfg.backend == Backend::Metal) {
       const char* mp = std::getenv("PPOCR_METAL_PREC");
-      if (mp && mp[0] == 'l') {
+      if (mp && mp[0] == 'n') {
+        impl_->backend_config.precision = MNN::BackendConfig::Precision_Normal;
+      } else if (mp && mp[0] == 'l') {
         impl_->backend_config.precision = MNN::BackendConfig::Precision_Low;
       }
     }
@@ -173,22 +201,32 @@ void MnnSession::load(const std::string& model_path,
       impl_->backend_config_set = true;
     }
   }
-  // MNN 3.6.1's METAL Winograd convolution is corrupt for the det head conv
-  // (320x216, 64->16): nondeterministic noise boxes on some images
-  // (ru/00,02,03,07 -> 14..37 boxes instead of 1-6), reproducible with the
-  // pristine prebuilt libMNN.a and the real engine (per-inference input
-  // copy). CPU Winograd 3.6.1 is CORRECT when the input tensor is re-copied
-  // before every runSession (bit-parity with Winograd off on ru+zh) - the
-  // earlier "CPU winograd data race" was an artifact of debug drivers that
-  // copied the input only once: MNN's pipeline raster (NCHW->NC4HW4)
-  // overwrites the engine input tensor in place, so repeated runSession
-  // without re-setting the input drifts. To be safe on every backend we
-  // force level 0 by default; PPOCR_MNN_WINOGRAD=1 opts back in.
+  // Winograd memory level (see MNN_DEFAULT_WINOGRAD_LEVEL above): default 0.
+  // PPOCR_MNN_WINOGRAD=3 / =1 opts into MNN's aggressive levels.
   {
     const char* w = std::getenv("PPOCR_MNN_WINOGRAD");
-    if (!w || w[0] != '1') {
-      impl_->interp->setSessionHint(
-          MNN::Interpreter::HintMode::WINOGRAD_MEMORY_LEVEL, 0);
+    int level = MNN_DEFAULT_WINOGRAD_LEVEL;  // 0 = Winograd off
+    if (w) {
+      if (w[0] == '1') level = 1;
+      else if (w[0] == '3') level = 3;
+      else if (w[0] == '0') level = 0;
+    }
+    impl_->interp->setSessionHint(
+        MNN::Interpreter::HintMode::WINOGRAD_MEMORY_LEVEL, level);
+  }
+  // OP_ENCODER_NUMBER_FOR_COMMIT batches N encoded ops per MTLCommandBuffer.
+  // MNN's default is 10; on the det graph that yields ~11 command buffers per
+  // inference. Measured neutral (10/32/128/100000 all min ~58 ms), because
+  // the global poolings force their own syncs regardless, so leave MNN's
+  // default alone. PPOCR_MNN_COMMIT_OPS is the A/B knob.
+  {
+    const char* c = std::getenv("PPOCR_MNN_COMMIT_OPS");
+    if (c && c[0]) {
+      int ops = std::atoi(c);
+      if (ops > 0) {
+        impl_->interp->setSessionHint(
+            MNN::Interpreter::HintMode::OP_ENCODER_NUMBER_FOR_COMMIT, ops);
+      }
     }
   }
   impl_->session = impl_->interp->createSession(sc);
@@ -218,6 +256,14 @@ void MnnSession::load(const std::string& model_path,
     impl_->output_dims.push_back(kv.second->shape());
     impl_->output_hosts.push_back(kv.second->host<float>());
   }
+  // Readback host tensors are shaped per (output, dims); drop any stale
+  // ones from a previous load() and re-create lazily.
+  for (auto* t : impl_->out_host_tensors) delete t;
+  impl_->out_host_tensors.assign(impl_->output_names.size(), nullptr);
+  delete impl_->stage_tensor;
+  impl_->stage_tensor = nullptr;
+  impl_->stage_dims.clear();
+  impl_->resized_dims.assign(impl_->input_names.size(), std::vector<int>());
 }
 
 void MnnSession::resize_input(const std::string& name,
@@ -226,19 +272,35 @@ void MnnSession::resize_input(const std::string& name,
   MNN::Tensor* t = impl_->interp->getSessionInput(impl_->session,
                                                     name.c_str());
   if (!t) throw std::runtime_error("MnnSession: no input named " + name);
-  impl_->interp->resizeTensor(t, dims);
-  // After resizing an input, the session must be told to settle so that
-  // the new buffers are allocated. MNN recommends calling resizeSession
-  // exactly once after the last resizeTensor.
-  impl_->interp->resizeSession(impl_->session);
-  // Refresh host pointers and dims; resize may have reallocated.
+  // PERF: resizeTensor + resizeSession on every call is redundant churn when
+  // the shape repeats (the common case: same image size for det, same
+  // batch_w for rec), so remember the last dims per input and skip the
+  // settle. Measured effect on the Metal det path: ~0.4-0.8 ms/frame off
+  // set_input (min 1.4 ms with the skip vs 2.2 ms without). It also avoids
+  // invalidating the backend's cached buffers every frame.
+  // PPOCR_NO_RESIZE_CACHE=0 restores the old always-resize behaviour (A/B).
+  bool dirty = true;
   for (size_t i = 0; i < impl_->input_names.size(); ++i) {
-    if (impl_->input_names[i] == name) {
-      impl_->input_dims[i] = dims;
-      impl_->input_hosts[i] =
-          impl_->interp->getSessionInput(impl_->session, name.c_str())
-              ->host<float>();
+    if (impl_->input_names[i] != name) continue;
+    if (i < impl_->resized_dims.size() && impl_->resized_dims[i] == dims) {
+      dirty = false;
     }
+    const char* ab = std::getenv("PPOCR_NO_RESIZE_CACHE");
+    if (ab && ab[0] == '0') dirty = true;
+    if (dirty) {
+      impl_->interp->resizeTensor(t, dims);
+      // After resizing an input the session must settle once so the new
+      // buffers are allocated (MNN's documented contract).
+      impl_->interp->resizeSession(impl_->session);
+      impl_->resized_dims[i] = dims;
+    }
+    // Refresh host pointers and dims; resize may have reallocated (and on
+    // Metal the session input lives on the device -> host == nullptr).
+    impl_->input_dims[i] = dims;
+    impl_->input_hosts[i] =
+        impl_->interp->getSessionInput(impl_->session, name.c_str())
+            ->host<float>();
+    break;
   }
 }
 
@@ -276,19 +338,34 @@ void MnnSession::set_input_float(const std::string& name,
   MNN::Tensor* dev = impl_->interp->getSessionInput(impl_->session,
                                                       name.c_str());
   if (!dev) throw std::runtime_error("MnnSession: no input named " + name);
-  MNN::Tensor* host_tensor = MNN::Tensor::create(
-      dev->shape(), halide_type_of<float>(), nullptr, MNN::Tensor::CAFFE);
-  if (!host_tensor || !host_tensor->host<float>()) {
-    delete host_tensor;
-    throw std::runtime_error("MnnSession: host staging tensor alloc failed");
+  // PERF: reuse one staging tensor instead of create+delete per call
+  // (the det input is 1280x960x3 f32 = 4.9 MB; create/delete churned
+  // malloc + a full-page memset every frame). Re-create only when the
+  // staging buffer is missing, its shape/type no longer matches the device
+  // input, or the caller's element count would not fit (MNN may keep a
+  // different shape than `dims` when it pads channels).
+  const size_t stage_bytes = n * sizeof(float);
+  const bool need_new_stage =
+      impl_->stage_tensor == nullptr || impl_->stage_dims != dev->shape() ||
+      impl_->stage_tensor->getType() != dev->getType() ||
+      static_cast<size_t>(impl_->stage_tensor->size()) < stage_bytes;
+  if (need_new_stage) {
+    delete impl_->stage_tensor;
+    impl_->stage_tensor = MNN::Tensor::create(
+        dev->shape(), dev->getType(), nullptr, MNN::Tensor::CAFFE);
+    impl_->stage_dims = dev->shape();
+    if (!impl_->stage_tensor || !impl_->stage_tensor->host<void>() ||
+        static_cast<size_t>(impl_->stage_tensor->size()) < stage_bytes) {
+      delete impl_->stage_tensor;
+      impl_->stage_tensor = nullptr;
+      throw std::runtime_error("MnnSession: host staging tensor alloc failed");
+    }
   }
-  std::memcpy(host_tensor->host<float>(), data, n * sizeof(float));
+  std::memcpy(impl_->stage_tensor->host<float>(), data, stage_bytes);
   dump_input_if_requested(name, dims, data);
-  if (!dev->copyFromHostTensor(host_tensor)) {
-    delete host_tensor;
+  if (!dev->copyFromHostTensor(impl_->stage_tensor)) {
     throw std::runtime_error("MnnSession: copyFromHostTensor failed");
   }
-  delete host_tensor;
 }
 
 int MnnSession::run() {
@@ -329,16 +406,29 @@ SessionOutput MnnSession::output(const std::string& name) const {
     MNN::Tensor* dev = impl_->interp->getSessionOutput(
         impl_->session, name.c_str());
     if (!dev) return so;
-    MNN::Tensor* host_out =
-        MNN::Tensor::createHostTensorFromDevice(dev, false);
-    if (!host_out) return so;
-    if (!dev->copyToHostTensor(host_out)) { delete host_out; return so; }
-    // Cache the buffer; freed on the next output() call or destruction.
-    delete[] impl_->device_out_cache;
-    const size_t total = host_out->size() / sizeof(float);
-    impl_->device_out_cache = new float[total];
+    // PERF: reuse both the host readback tensor and the exposed cache
+    // buffer instead of createHostTensorFromDevice + new/delete per frame
+    // (2.7 MB alloc churn per call on the det prob map).
+    const size_t elem = dev->getType().bytes() > 0 ? dev->getType().bytes() : sizeof(float);
+    const size_t total = static_cast<size_t>(dev->size()) / elem;
+    if (i >= impl_->out_host_tensors.size()) return so;
+    MNN::Tensor* host_out = impl_->out_host_tensors[i];
+    if (host_out == nullptr || host_out->shape() != dev->shape() ||
+        static_cast<size_t>(host_out->size()) < static_cast<size_t>(dev->size())) {
+      delete host_out;
+      host_out = MNN::Tensor::createHostTensorFromDevice(dev, false);
+      impl_->out_host_tensors[i] = host_out;
+    }
+    if (host_out == nullptr) return so;
+    if (!dev->copyToHostTensor(host_out)) return so;
+    if (impl_->device_out_cache == nullptr ||
+        impl_->device_out_cache_cap < total) {
+      delete[] impl_->device_out_cache;
+      impl_->device_out_cache = new float[total];
+      impl_->device_out_cache_cap = total;
+    }
     std::memcpy(impl_->device_out_cache, host_out->host<float>(),
-                host_out->size());
+                total * sizeof(float));
     if (const char* dp = std::getenv("PPOCR_DUMP_OUTPUT")) {
       static int oseq = 0;
       char pth[1024];
@@ -353,7 +443,6 @@ SessionOutput MnnSession::output(const std::string& name) const {
       }
     }
     so.data = impl_->device_out_cache;
-    delete host_out;
     return so;
   }
   return so;
