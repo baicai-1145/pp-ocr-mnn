@@ -172,9 +172,16 @@ def norm_img_path(p: str) -> str:
     return p[idx:] if idx >= 0 else p
 
 
-def load_baseline(base_path: Path) -> List[dict]:
-    with open(base_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_baseline(base_path: Path) -> Optional[List[dict]]:
+    # A corrupt baseline (e.g. a truncated extraction) must degrade to a
+    # per-cell N/A instead of killing the whole 811-cell report. Return
+    # None and let score_full_cell treat it as n_invalid.
+    try:
+        with open(base_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        sys.stderr.write(f"[baseline] unreadable {base_path}: {e}\n")
+        return None
 
 
 def load_strip_gt(gt_path: Path) -> Dict[str, str]:
@@ -278,6 +285,9 @@ def score_full_cell(combo_dir: Path, lang: str, results_dir: Path
     """
     base = load_baseline(combo_dir / lang / "ocr_results.json")
     pred_path = results_dir / combo_dir.name / lang / "pred.json"
+    if base is None:
+        # Unreadable baseline: cell is N/A, never a report-wide crash.
+        return float("nan"), float("nan"), 0, -1, 0
     if not pred_path.exists():
         n_invalid = sum(1 for b in base if not _baseline_entry_is_valid(b)[0])
         return float("nan"), float("nan"), 0, n_invalid, 0
