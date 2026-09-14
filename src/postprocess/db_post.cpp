@@ -27,6 +27,7 @@
 #include <unordered_map>
 
 #include "ppocr/postprocess/geometry.h"
+#include "ppocr/postprocess/suzuki.h"
 
 // Clipper (header-only, vendored). See third_party/clipper/clipper.hpp.
 #include "clipper.hpp"
@@ -453,62 +454,41 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
   // for it in CONTRACT.md.
   (void)0;
 
-  // 2) 8-connected CCL via 2-pass union-find.
-  UnionFind uf;
-  uf.init(W * H);
-  std::vector<int> label(W * H, 0);
-  int next_label = 1;
-  for (int y = 0; y < H; ++y) {
-    for (int x = 0; x < W; ++x) {
-      if (!mask[y * W + x]) continue;
-      int my = next_label++;
-      std::vector<int> neighbors;
-      for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-          if (dx == 0 && dy == 0) continue;
-          int xx = x + dx, yy = y + dy;
-          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
-          if (label[yy * W + xx] > 0) neighbors.push_back(label[yy * W + xx]);
-        }
-      if (neighbors.empty()) label[y * W + x] = my;
-      else {
-        int min_lbl = *std::min_element(neighbors.begin(), neighbors.end());
-        label[y * W + x] = min_lbl;
-        for (int n : neighbors) uf.unite(min_lbl, n);
-      }
-    }
-  }
-  std::vector<int> comp(W * H, 0);
-  std::vector<int> comp_size;
-  comp_size.push_back(0);
-  for (int i = 0; i < W * H; ++i) {
-    if (label[i] == 0) continue;
-    int root = uf.find(label[i]);
-    auto it = std::find(comp_size.begin() + 1, comp_size.end(), root);
-    int idx;
-    if (it == comp_size.end()) {
-      comp_size.push_back(root);
-      idx = static_cast<int>(comp_size.size()) - 1;
-    } else {
-      idx = static_cast<int>(it - comp_size.begin());
-    }
-    comp[i] = idx;
-  }
-  int n_comp = static_cast<int>(comp_size.size()) - 1;
-
-  // 3) For each component, trace external boundary and process.
-  int max_cand = std::max(1, cfg.max_candidates);
-  int max_cand_n = std::min(n_comp, max_cand);
-
-  // Sort components by size desc, like cv::findContours ordering (approx).
-  std::vector<int> order(n_comp);
-  std::iota(order.begin(), order.end(), 1);
-  std::vector<int> comp_pixel_count(n_comp + 1, 0);
-  for (int i = 0; i < W * H; ++i)
-    if (comp[i] > 0) ++comp_pixel_count[comp[i]];
-  std::sort(order.begin(), order.end(), [&](int a, int b) {
-    return comp_pixel_count[a] > comp_pixel_count[b];
-  });
+  // 2) Contour extraction — two interchangeable extractors, selected by the
+  //    PPOCR_SUZUKI environment variable (default 0 = LEGACY).
+  //
+  //      PPOCR_SUZUKI unset / 0 -> legacy CCL + hole-flood + Moore trace.
+  //                               Bit-identical to main's det output.
+  //      PPOCR_SUZUKI=1         -> Suzuki-Abe single-pass border following:
+  //                               ~8.5-37x faster db_post AND strictly closer to
+  //                               cv2/Paddle (see src/postprocess/suzuki.cpp).
+  //
+  //    WHY SUZUKI IS OFF BY DEFAULT
+  //    ---------------------------
+  //    The 811-cell gate is a hard contract, and Suzuki changes det output on
+  //    some cells. On the 7-det x {zh,en,ja} A/B (210 images) 19/21 cells are
+  //    bit-identical, but PP-OCRv4_mobile_det/en moves 0.0121 PASS -> 0.0898 FAIL.
+  //
+  //    That failure is NOT tracer error. Suzuki is a strict superset of the
+  //    legacy output: over the 31 images that differ it recovers 46 det boxes
+  //    the legacy tracer silently dropped (Paddle-baseline box recall 90.2% ->
+  //    94.9%), and every recovered box that IS in the baseline matches it
+  //    bit-for-bit. The FAIL comes from ~11 additional small "phantom" blobs per
+  //    image that Paddle does not detect at all, because the MNN prob map and
+  //    Paddle's prob map differ at blob level. Those extra boxes get rec'd, shift
+  //    the joined text, and cost the CER.
+  //
+  //    Postprocess cannot filter them out safely: the phantoms' area/short-side
+  //    distributions overlap the baseline's real boxes (the baseline legitimately
+  //    contains 5/5/6/13 px boxes on the same image), so any floor that removes
+  //    the phantoms also removes true positives. The real fix is prob-map
+  //    fidelity -- either tighten the inference path toward Paddle's numerics, or
+  //    add a conversion-side calibration. Until then the legacy path stays the
+  //    default and Suzuki is opt-in for benchmarking.
+  static const bool use_suzuki = [] {
+    const char* v = std::getenv("PPOCR_SUZUKI");
+    return v && *v && *v != '0';
+  }();
 
   // Per-candidate funnel shared by external borders and synthesized hole
   // rings: minibox -> score -> unclip -> re-minibox -> sside -> map.
@@ -662,77 +642,159 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     return true;
   };
 
-  // ---- Global hole precompute ------------------------------------------
-  // One pass over the background: every 4-connected bg region gets flooded
-  // once; regions touching the image border or bordered by more than one
-  // component are not holes. Result: holes_of[c] = list of hole pixel sets
-  // fully enclosed by component c (RETR_LIST treats their borders as
-  // independent contour candidates).
-  std::unordered_map<int, std::vector<std::vector<std::pair<int,int>>>> holes_of;
-  {
-    std::vector<int> region_id(W * H, -1);
-    int cur_region = 0;
-    static const int DX[4] = {1,-1,0,0};
-    static const int DY[4] = {0,0,1,-1};
-    for (int yy = 0; yy < H; ++yy)
-      for (int xx = 0; xx < W; ++xx) {
-        size_t idx = static_cast<size_t>(yy) * W + xx;
-        if (comp[idx] != 0 || region_id[idx] >= 0) continue;
-        std::vector<std::pair<int,int>> stack{{xx,yy}};
-        std::vector<std::pair<int,int>> seen;
-        bool escapes = false;
-        int surround = -1;               // -1 = none seen yet; -2 = multiple
-        region_id[idx] = cur_region;
-        while (!stack.empty()) {
-          auto [qx,qy] = stack.back(); stack.pop_back();
-          seen.emplace_back(qx,qy);
-          for (int d = 0; d < 4; ++d) {
-            int ux = qx + DX[d], uy = qy + DY[d];
-            if ((unsigned)ux >= (unsigned)W || (unsigned)uy >= (unsigned)H) {
-              escapes = true;
-              continue;
-            }
-            size_t uidx = static_cast<size_t>(uy) * W + ux;
-            int c2 = comp[uidx];
-            if (c2 == 0) {
-              if (region_id[uidx] < 0) { region_id[uidx] = cur_region; stack.emplace_back(ux,uy); }
-              continue;
-            }
-            if (surround == -1) surround = c2;
-            else if (surround != c2) surround = -2;
-          }
-        }
-        ++cur_region;
-        if (!escapes && surround >= 1)
-          holes_of[surround].push_back(std::move(seen));
-      }
-  }
-
   int processed_cand = 0;
-  for (int ci = 0; ci < max_cand_n; ++ci) {
-    int lbl = order[ci];
-    if (comp_pixel_count[lbl] < 1) continue;
+  if (use_suzuki) {
+    // One Suzuki-Abe pass over the binary mask. Reproduces
+    // cv::findContours(RETR_LIST, CHAIN_APPROX_NONE) exactly -- value-, sign-
+    // and order-wise (verified against cv2 4.10 and 5.0 via
+    // tools/verify_suzuki.py: 40/40 masks byte-exact).
+    std::vector<std::vector<IntPoint>> contours;
+    suzuki_borders(mask.data(), W, H, &contours);
 
-    int sx = -1, sy = -1;
-    if (!find_first_boundary(comp, W, H, lbl, &sx, &sy)) continue;
-    std::vector<PointF> boundary = trace_boundary(comp, W, H, lbl, sx, sy);
-    if (boundary.size() >= 4 && process_contour(boundary)) ++processed_cand;
-
-    // ---- RETR_LIST parity: use precomputed hole regions -----------------
-    auto hit = holes_of.find(lbl);
-    if (hit == holes_of.end()) continue;
-    bool emitted_hole_box = false;
-    for (const auto& reg : hit->second) {
-      std::vector<uint8_t> hole(W * H, 0);
-      for (auto& s : reg) hole[static_cast<size_t>(s.second) * W + s.first] = 1;
-      std::vector<PointF> ring = synthesize_hole_ring(comp, hole, W, H, lbl);
-      if (ring.size() >= 4 && process_contour(ring)) {
-        ++processed_cand;
-        emitted_hole_box = true;
+    // Paddle's DBPostProcess iterates `contours[:max_candidates]` in cv2's
+    // emitted order, which is reverse discovery order (see suzuki.cpp) -- so
+    // we must NOT re-sort by size. max_candidates is 1000 and real prob maps
+    // yield 9-531 borders, so the cap is a backstop, not a filter.
+    const size_t max_cand = static_cast<size_t>(std::max(1, cfg.max_candidates));
+    const size_t n_use = std::min(contours.size(), max_cand);
+    for (size_t ci = 0; ci < n_use; ++ci) {
+      const auto& c = contours[ci];
+      if (c.size() < 4) continue;
+      std::vector<PointF> boundary;
+      boundary.reserve(c.size());
+      for (const auto& q : c) {
+        boundary.push_back({static_cast<float>(q.x), static_cast<float>(q.y)});
+      }
+      if (process_contour(boundary)) ++processed_cand;
+    }
+  } else {
+    // 2) 8-connected CCL via 2-pass union-find.
+    UnionFind uf;
+    uf.init(W * H);
+    std::vector<int> label(W * H, 0);
+    int next_label = 1;
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        if (!mask[y * W + x]) continue;
+        int my = next_label++;
+        std::vector<int> neighbors;
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+            if (label[yy * W + xx] > 0) neighbors.push_back(label[yy * W + xx]);
+          }
+        if (neighbors.empty()) label[y * W + x] = my;
+        else {
+          int min_lbl = *std::min_element(neighbors.begin(), neighbors.end());
+          label[y * W + x] = min_lbl;
+          for (int n : neighbors) uf.unite(min_lbl, n);
+        }
       }
     }
-    (void)emitted_hole_box;
-  }
+    std::vector<int> comp(W * H, 0);
+    std::vector<int> comp_size;
+    comp_size.push_back(0);
+    for (int i = 0; i < W * H; ++i) {
+      if (label[i] == 0) continue;
+      int root = uf.find(label[i]);
+      auto it = std::find(comp_size.begin() + 1, comp_size.end(), root);
+      int idx;
+      if (it == comp_size.end()) {
+        comp_size.push_back(root);
+        idx = static_cast<int>(comp_size.size()) - 1;
+      } else {
+        idx = static_cast<int>(it - comp_size.begin());
+      }
+      comp[i] = idx;
+    }
+    int n_comp = static_cast<int>(comp_size.size()) - 1;
+
+    // 3) For each component, trace external boundary and process.
+    int max_cand = std::max(1, cfg.max_candidates);
+    int max_cand_n = std::min(n_comp, max_cand);
+
+    // Sort components by size desc, like cv::findContours ordering (approx).
+    std::vector<int> order(n_comp);
+    std::iota(order.begin(), order.end(), 1);
+    std::vector<int> comp_pixel_count(n_comp + 1, 0);
+    for (int i = 0; i < W * H; ++i)
+      if (comp[i] > 0) ++comp_pixel_count[comp[i]];
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+      return comp_pixel_count[a] > comp_pixel_count[b];
+    });
+    // ---- Global hole precompute ------------------------------------------
+    // One pass over the background: every 4-connected bg region gets flooded
+    // once; regions touching the image border or bordered by more than one
+    // component are not holes. Result: holes_of[c] = list of hole pixel sets
+    // fully enclosed by component c (RETR_LIST treats their borders as
+    // independent contour candidates).
+    std::unordered_map<int, std::vector<std::vector<std::pair<int,int>>>> holes_of;
+    {
+      std::vector<int> region_id(W * H, -1);
+      int cur_region = 0;
+      static const int DX[4] = {1,-1,0,0};
+      static const int DY[4] = {0,0,1,-1};
+      for (int yy = 0; yy < H; ++yy)
+        for (int xx = 0; xx < W; ++xx) {
+          size_t idx = static_cast<size_t>(yy) * W + xx;
+          if (comp[idx] != 0 || region_id[idx] >= 0) continue;
+          std::vector<std::pair<int,int>> stack{{xx,yy}};
+          std::vector<std::pair<int,int>> seen;
+          bool escapes = false;
+          int surround = -1;               // -1 = none seen yet; -2 = multiple
+          region_id[idx] = cur_region;
+          while (!stack.empty()) {
+            auto [qx,qy] = stack.back(); stack.pop_back();
+            seen.emplace_back(qx,qy);
+            for (int d = 0; d < 4; ++d) {
+              int ux = qx + DX[d], uy = qy + DY[d];
+              if ((unsigned)ux >= (unsigned)W || (unsigned)uy >= (unsigned)H) {
+                escapes = true;
+                continue;
+              }
+              size_t uidx = static_cast<size_t>(uy) * W + ux;
+              int c2 = comp[uidx];
+              if (c2 == 0) {
+                if (region_id[uidx] < 0) { region_id[uidx] = cur_region; stack.emplace_back(ux,uy); }
+                continue;
+              }
+              if (surround == -1) surround = c2;
+              else if (surround != c2) surround = -2;
+            }
+          }
+          ++cur_region;
+          if (!escapes && surround >= 1)
+            holes_of[surround].push_back(std::move(seen));
+        }
+    }
+
+    for (int ci = 0; ci < max_cand_n; ++ci) {
+      int lbl = order[ci];
+      if (comp_pixel_count[lbl] < 1) continue;
+
+      int sx = -1, sy = -1;
+      if (!find_first_boundary(comp, W, H, lbl, &sx, &sy)) continue;
+      std::vector<PointF> boundary = trace_boundary(comp, W, H, lbl, sx, sy);
+      if (boundary.size() >= 4 && process_contour(boundary)) ++processed_cand;
+
+      // ---- RETR_LIST parity: use precomputed hole regions -----------------
+      auto hit = holes_of.find(lbl);
+      if (hit == holes_of.end()) continue;
+      bool emitted_hole_box = false;
+      for (const auto& reg : hit->second) {
+        std::vector<uint8_t> hole(W * H, 0);
+        for (auto& s : reg) hole[static_cast<size_t>(s.second) * W + s.first] = 1;
+        std::vector<PointF> ring = synthesize_hole_ring(comp, hole, W, H, lbl);
+        if (ring.size() >= 4 && process_contour(ring)) {
+          ++processed_cand;
+          emitted_hole_box = true;
+        }
+      }
+      (void)emitted_hole_box;
+    }  }
+  (void)processed_cand;
   return out;
 }
 

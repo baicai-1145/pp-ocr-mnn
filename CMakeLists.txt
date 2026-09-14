@@ -166,6 +166,7 @@ add_library(ppocr_core STATIC
   src/ppocr.cpp
   src/downloader.cpp
   src/postprocess/db_post.cpp
+  src/postprocess/suzuki.cpp
   src/postprocess/geometry.cpp
   src/postprocess/ctc_decode.cpp
   third_party/clipper/clipper.cpp
@@ -328,6 +329,28 @@ add_test(NAME test_preprocess COMMAND test_preprocess)
 # the working dir to the build dir so it doesn't pollute the source tree.
 set_tests_properties(test_preprocess PROPERTIES
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Suzuki-Abe border follower: byte-parity with cv2.findContours(RETR_LIST,
+# CHAIN_APPROX_NONE). The built-in cases here are dependency-free; the full
+# 39-mask cv2 diff lives in tools/verify_suzuki.py (needs opencv-python).
+add_executable(test_suzuki tests/test_suzuki.cpp)
+target_link_libraries(test_suzuki PRIVATE ppocr_core)
+add_test(NAME test_suzuki COMMAND test_suzuki)
+
+# db_postprocess extractor switch (PPOCR_SUZUKI): default = legacy path,
+# =1 = Suzuki-Abe. Pins that both paths emit well-formed boxes, that =0 selects
+# legacy, and that on clean synthetic masks the two extractors agree exactly
+# (i.e. the real-corpus divergence is prob-map driven, not tracer logic).
+add_executable(test_db_post_switch tests/test_db_post_switch.cpp)
+target_link_libraries(test_db_post_switch PRIVATE ppocr_core)
+add_test(NAME test_db_post_switch COMMAND test_db_post_switch)
+
+# SE-pool rewrite variant policy (task-7, PPOCR_SE_REWRITE): which det models
+# may load the `<name>.red.mnn` Metal variant. Pure header, no MNN/models.
+add_executable(test_se_rewrite tests/test_se_rewrite.cpp)
+target_include_directories(test_se_rewrite PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_test(NAME test_se_rewrite COMMAND test_se_rewrite)
 endif()
 
 # Auto-downloader test driver (TOOLS-5 / M3). It links against

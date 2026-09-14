@@ -35,7 +35,7 @@ struct Args {
   std::string det_config;        // path to det .mnn or config
   std::string rec_config;
   std::string cls_config;
-  std::string model_dir = "./models";
+  std::string model_dir;             // empty -> engine resolves from PPORC_MNN_MODELS or ./models
   std::string registry_path;     // optional
   std::string backend = "auto";
   std::string boxes_json;        // M2-ISO: skip det, use boxes from this file
@@ -238,7 +238,11 @@ int run_batch(const Args& a) {
 
   auto make_engine = [&]() -> ppocr_engine* {
     ppocr_config cfg{};
-    cfg.model_dir = a.model_dir.c_str();
+    // Empty model_dir means "not specified": pass nullptr so the engine
+    // resolves PPORC_MNN_MODELS (its documented env override). A hard
+    // "./models" default here silently defeated the env var for every
+    // run_reference.py invocation from a cwd without a local models/.
+    cfg.model_dir = a.model_dir.empty() ? nullptr : a.model_dir.c_str();
     cfg.det_name  = det_name.empty() ? nullptr : det_name.c_str();
     cfg.rec_name  = rec_name.empty() ? nullptr : rec_name.c_str();
     cfg.cls_name  = cls_name.empty() ? nullptr : cls_name.c_str();
@@ -374,7 +378,7 @@ int main(int argc, char** argv) {
                                    : config_basename(a.cls_config);
 
   ppocr_config cfg{};
-  cfg.model_dir = a.model_dir.c_str();
+  cfg.model_dir = a.model_dir.empty() ? nullptr : a.model_dir.c_str();
   cfg.det_name  = det_name.empty() ? nullptr : det_name.c_str();
   cfg.rec_name  = rec_name.empty() ? nullptr : rec_name.c_str();
   cfg.cls_name  = cls_name.empty() ? nullptr : cls_name.c_str();
