@@ -10,6 +10,8 @@ models/_onnx/
 models
 # downloaded assets
 _downloads/
+# perf-post: dataset symlink to the shared eval corpus (local dev only)
+_downloads
 # local test outputs
 tests/data/
 results/
