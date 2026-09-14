@@ -160,6 +160,19 @@ def synthetic_masks():
             m[max(0, cy - ry):min(H, cy + ry + 1),
               max(0, cx - rx):min(W, cx + rx + 1)] ^= 1
         out["rand%d" % k] = m
+    # max_candidates stress: 3700 borders (1850 boxes x2 for their holes) on a
+    # 480x640 map, i.e. well past the configured max_candidates = 1000. Confirms
+    # the tracer's emission order and content stay exact when the cap WOULD
+    # filter, so the cap cannot silently change which boxes survive.
+    grid = np.zeros((480, 640), np.uint8)
+    n_borders = 0
+    for gy in range(20, 480 - 20, 12):
+        for gx in range(20, 640 - 20, 12):
+            grid[gy:gy + 8, gx:gx + 8] = 1
+            grid[gy + 3:gy + 5, gx + 3:gx + 5] = 0
+            n_borders += 2
+    assert n_borders == 3700, n_borders
+    out["grid_3700"] = grid
     # larger map with many small boxes (perf + ordering stress)
     mb = np.zeros((480, 640), np.uint8)
     rng = np.random.default_rng(11)
