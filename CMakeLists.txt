@@ -338,8 +338,9 @@ target_link_libraries(test_suzuki PRIVATE ppocr_core)
 add_test(NAME test_suzuki COMMAND test_suzuki)
 
 # db_postprocess extractor switch (PPOCR_SUZUKI): default = legacy path,
-# =1 = Suzuki-Abe. Pins that both paths produce well-formed boxes and that the
-# switch is actually honoured.
+# =1 = Suzuki-Abe. Pins that both paths emit well-formed boxes, that =0 selects
+# legacy, and that on clean synthetic masks the two extractors agree exactly
+# (i.e. the real-corpus divergence is prob-map driven, not tracer logic).
 add_executable(test_db_post_switch tests/test_db_post_switch.cpp)
 target_link_libraries(test_db_post_switch PRIVATE ppocr_core)
 add_test(NAME test_db_post_switch COMMAND test_db_post_switch)
