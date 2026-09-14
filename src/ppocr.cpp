@@ -188,6 +188,13 @@ static ppocr_status resolve_config_paths(Engine& e, const ppocr_config* cfg,
     auto slash = e.model_dir.find_last_of("/\\");
     if (slash != std::string::npos) {
       cfg_dir_fallback = e.model_dir.substr(0, slash) + "/configs";
+    } else {
+      // Relative dir without a slash (e.g. "models"): the sibling
+      // layout is "./configs". Without this the rec dict silently
+      // stays empty and every text comes out "" (found on macOS:
+      // --model-dir models produced empty texts while an absolute
+      // path matched the baselines bit-for-bit).
+      cfg_dir_fallback = "./configs";
     }
   }
   auto find_cfg = [&](const std::string& name) -> std::string {
@@ -319,6 +326,12 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
     auto slash = model_dir.find_last_of("/\\");
     if (slash != std::string::npos) {
       candidates.push_back(model_dir.substr(0, slash) + "/configs/registry.json");
+    } else {
+      // Relative dir without a slash: same sibling-layout fallback as
+      // resolve_config_paths ("./configs/registry.json"). Without this
+      // the registry fails to load and ensure_model hard-fails with
+      // "registry has no entry" for every model.
+      candidates.push_back("./configs/registry.json");
     }
     for (const auto& c : candidates) {
       std::ifstream f(c, std::ios::binary);
