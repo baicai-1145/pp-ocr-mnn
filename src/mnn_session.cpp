@@ -412,15 +412,20 @@ SessionOutput MnnSession::output(const std::string& name) const {
   if (!impl_->interp) return so;
   int idx = impl_->output_index(name);
   if (idx < 0) return so;
-  so.shape = impl_->output_dims[idx];
+  MNN::Tensor* dev = impl_->output_tensors[idx];
+  if (!dev) return so;
+  // Read the shape straight off the cached tensor. This is a cheap
+  // vector<int> copy with NO interpreter lock, and it keeps dynamic-shape
+  // models correct even though run() no longer re-queries outputs: MNN can
+  // update an output's shape at run time without a resize_input.
+  so.shape = dev->shape();
+  impl_->output_dims[idx] = so.shape;
   // Always snapshot through copyToHostTensor. NEVER read the session
   // output tensor's host pointer directly: for the Arm82 (CPU fp16,
   // precision=Low) backend the session tensors carry fp16 data, and
   // copyToHostTensor routes through onCopyBuffer, which dequantizes
   // fp16->fp32 (Arm82->CPU). A direct read would reinterpret fp16
   // bytes as fp32 (e.g. uniform 0x7e007e00 = fp16 NaN pattern).
-  MNN::Tensor* dev = impl_->output_tensors[idx];
-  if (!dev) return so;
   // PERF: reuse the host readback tensor + the owned float buffer. Both
   // only grow when the output shape grows.
   if (!impl_->host_out_valid || impl_->host_out_dims != dev->shape()) {
