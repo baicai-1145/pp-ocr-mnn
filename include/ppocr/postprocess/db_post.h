@@ -20,6 +20,25 @@ struct DetBox {
   float score = 0; // mean probability of the box interior
 };
 
+// Two interchangeable contour extractors, selected by the PPOCR_SUZUKI
+// environment variable (read per call; default 0 = LEGACY):
+//
+//   PPOCR_SUZUKI unset / 0  legacy CCL + hole-flood + Moore trace.
+//                           Bit-identical to main's det output. DEFAULT.
+//   PPOCR_SUZUKI=1          Suzuki-Abe single-pass border following
+//                           (src/postprocess/suzuki.cpp). ~8.5-37x faster
+//                           db_post and strictly closer to
+//                           cv::findContours(RETR_LIST, CHAIN_APPROX_NONE).
+//
+// Suzuki is opt-in because it changes det output on some cells: it recovers
+// boxes the legacy tracer drops (Paddle-baseline box recall 90.2% -> 94.9%) but
+// also surfaces small "phantom" blobs Paddle does not detect, since the MNN and
+// Paddle prob maps differ at blob level. Those extra boxes cost CER on
+// PP-OCRv4_mobile_det/en (0.0121 PASS -> 0.0898 FAIL) while 19/21 cells stay
+// bit-identical, and no postprocess-side size/area filter can separate the
+// phantoms from real small boxes. Real fix: prob-map fidelity on the
+// inference/conversion side. See tests/test_db_post_switch.cpp and
+// tools/verify_suzuki.py.
 std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
                                    int src_w, int src_h,
                                    float ratio_w, float ratio_h,

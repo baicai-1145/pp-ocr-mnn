@@ -336,6 +336,13 @@ set_tests_properties(test_preprocess PROPERTIES
 add_executable(test_suzuki tests/test_suzuki.cpp)
 target_link_libraries(test_suzuki PRIVATE ppocr_core)
 add_test(NAME test_suzuki COMMAND test_suzuki)
+
+# db_postprocess extractor switch (PPOCR_SUZUKI): default = legacy path,
+# =1 = Suzuki-Abe. Pins that both paths produce well-formed boxes and that the
+# switch is actually honoured.
+add_executable(test_db_post_switch tests/test_db_post_switch.cpp)
+target_link_libraries(test_db_post_switch PRIVATE ppocr_core)
+add_test(NAME test_db_post_switch COMMAND test_db_post_switch)
 endif()
 
 # Auto-downloader test driver (TOOLS-5 / M3). It links against
