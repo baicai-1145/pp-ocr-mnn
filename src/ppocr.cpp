@@ -17,6 +17,7 @@
 #include "ppocr/postprocess/db_post.h"
 #include "ppocr/postprocess/geometry.h"
 #include "ppocr/preprocess.h"
+#include "ppocr/se_rewrite.h"
 
 #include <atomic>
 #include <chrono>
@@ -83,7 +84,7 @@ struct AsyncJob {
 struct Engine {
   // model paths and parsed configs.
   std::string model_dir;
-  std::string det_path, rec_path, cls_path;
+  std::string det_path, det_path_orig, rec_path, cls_path;
   ModelConfig det_cfg, rec_cfg, cls_cfg;
   // Seal mode: det model is one of PP-OCRvN_*_seal_det. The pipeline
   // then skips the reading-order sort (ring text is cyclic), uses rec
@@ -157,6 +158,43 @@ static bool file_exists(const std::string& p) {
   return fs::is_regular_file(p, ec);
 }
 
+// ---- Metal-only SE-pool rewrite dispatch (task-7) ---------------------
+//
+// The policy (which dets have a useful rewritten variant, and why the others
+// are excluded) lives in include/ppocr/se_rewrite.h so it can be unit tested
+// without model files. Summary: rewrite_se_pool.py swaps SE-block global
+// average pools for an equivalent Reduction, which is numerically inert
+// (5-language full-res MLC delta 0.0e+00 on PP-OCRv5_mobile) but only wins on
+// Metal; it is 2-6% slower on CPU and 3.1x slower on PP-OCRv4_server_det.
+//
+// `<name>.red.mnn` is a *deployment variant*, never a replacement: if the
+// file is missing, or the backend is not Metal, the original model loads
+// exactly as before (silent fallback - no user-visible change). Distribution
+// of the variant files is a separate (M3) registry step; this dispatch is a
+// pure local-file lookup.
+
+// Choose the det .mnn to load. Returns `det_path` unchanged unless the
+// backend is Metal, the model is on the rewrite allowlist, and the variant
+// file is actually present. PPOCR_SE_REWRITE=0 forces the original (used for
+// A/B measurement); any other non-empty value additionally logs the choice.
+static std::string resolve_det_model_path(const std::string& det_path,
+                                          const std::string& det_name,
+                                          const std::string& model_dir,
+                                          Backend backend) {
+  if (backend != Backend::Metal) return det_path;
+  if (!det_has_se_rewrite_variant(det_name)) return det_path;
+  const char* env = std::getenv("PPOCR_SE_REWRITE");
+  if (env && std::string(env) == "0") return det_path;
+  const std::string red =
+      model_dir + "/" + se_rewrite_variant_name(det_name);
+  if (!file_exists(red)) return det_path;
+  if (env) {
+    std::fprintf(stderr, "det: metal SE-pool rewrite variant selected: %s\n",
+                 red.c_str());
+  }
+  return red;
+}
+
 // SHA-256 of a file. Implemented inline to keep the public C ABI
 // dependency-free. Used by registry verification once ws/tools lands
 // the runtime downloader; for M1 the verification path is M3 scope.
@@ -206,6 +244,11 @@ static ppocr_status resolve_config_paths(Engine& e, const ppocr_config* cfg,
   e.det_path = e.model_dir + "/" + det_name + ".mnn";
   e.rec_path = e.model_dir + "/" + rec_name + ".mnn";
   e.cls_path = e.model_dir + "/" + cls_name + ".mnn";
+
+  // Keep an untouched copy of the det path: the GPU->CPU fallback session
+  // below must always use the original model (the SE-rewrite variant is a
+  // Metal-only choice, and it is 2-6% slower on CPU).
+  e.det_path_orig = e.det_path;
 
   // Try to load the model configs if available. If they aren't on disk
   // (e.g. fast CI runs without a fresh registry) we fall back to safe
@@ -369,12 +412,35 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   sc.backend = pickBackend(static_cast<ppocr_backend>(cfg->backend));
   sc.num_threads = cfg->num_threads;
 
+  // Metal-only SE-pool rewrite variant (task-7). This is a *model choice*,
+  // so it lives here in the engine layer; MnnSession stays backend-generic
+  // and never inspects file names.
+  det_path = resolve_det_model_path(det_path, det_name, model_dir, sc.backend);
+
   det = std::make_unique<MnnSession>();
   try {
     det->load(det_path, sc);
   } catch (const std::exception& ex) {
-    if (err && elen) std::snprintf(err, elen, "det load: %s", ex.what());
-    return PPOCR_ERR_MODEL;
+    // The SE-rewrite variant is a pure optimization, so a bad copy of it
+    // (truncated download, partial write, stale file) must degrade to the
+    // original model rather than take the whole deployment down. The
+    // original is always present - resolve_config_paths already checked it.
+    if (det_path != det_path_orig && file_exists(det_path_orig)) {
+      std::fprintf(stderr,
+                   "det: SE-pool rewrite variant failed to load (%s); "
+                   "falling back to original %s\n",
+                   ex.what(), det_path_orig.c_str());
+      det_path = det_path_orig;
+      try {
+        det->load(det_path, sc);
+      } catch (const std::exception& ex2) {
+        if (err && elen) std::snprintf(err, elen, "det load: %s", ex2.what());
+        return PPOCR_ERR_MODEL;
+      }
+    } else {
+      if (err && elen) std::snprintf(err, elen, "det load: %s", ex.what());
+      return PPOCR_ERR_MODEL;
+    }
   }
   if (!rec_name.empty() && !rec_path.empty()) {
     rec = std::make_unique<MnnSession>();
@@ -421,7 +487,7 @@ static void run_det_sync(Engine& e, const Image& bgr,
   auto t_run_end = std::chrono::steady_clock::now();
   SessionOutput det_fb_output;
   bool use_fb_output = false;
-  if (ec != 0 && e.det_path.length() > 0) {
+  if (ec != 0 && e.det_path_orig.length() > 0) {
     // GPU det failed (typically a CUDA workspace alloc on huge inputs).
     // Fall back to a CPU det session for this image.
     if (!e.det_cpu_fallback && !e.det_cpu_fallback_tried) {
@@ -434,7 +500,7 @@ static void run_det_sync(Engine& e, const Image& bgr,
                                  : static_cast<int>(
                                        std::min(8u, std::thread::hardware_concurrency()));
         auto fb = std::make_unique<MnnSession>();
-        fb->load(e.det_path, cpu_sc);
+        fb->load(e.det_path_orig, cpu_sc);
         e.det_cpu_fallback = std::move(fb);
       } catch (const std::exception&) {
         e.det_cpu_fallback.reset();
