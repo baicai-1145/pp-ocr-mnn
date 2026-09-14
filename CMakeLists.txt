@@ -166,6 +166,7 @@ add_library(ppocr_core STATIC
   src/ppocr.cpp
   src/downloader.cpp
   src/postprocess/db_post.cpp
+  src/postprocess/suzuki.cpp
   src/postprocess/geometry.cpp
   src/postprocess/ctc_decode.cpp
   third_party/clipper/clipper.cpp

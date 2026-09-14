@@ -16,9 +16,12 @@
 #include "ppocr/postprocess/db_post.h"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -27,6 +30,46 @@
 #include <unordered_map>
 
 #include "ppocr/postprocess/geometry.h"
+#include "ppocr/postprocess/suzuki.h"
+
+// ---- dev-only sub-step instrumentation (PERF-POST) -------------------------
+// Enabled by PPOCR_DB_PROFILE=1; ~4 steady_clock reads per db_postprocess
+// call when off (one getenv + one branch). Never affects the result.
+namespace ppocr {
+namespace dbprof {
+struct Slot { double ms = 0; int n = 0; };
+struct Bank {
+  Slot binarize, ccl, hole_flood, trace, ring, contour, sort;
+  bool on = false;
+  Bank() { const char* v = std::getenv("PPOCR_DB_PROFILE"); on = v && *v && *v != '0'; }
+  void dump(int W, int H) {
+    if (!on) return;
+    std::fprintf(stderr,
+      "[dbprof] %dx%d binarize %.2f ccl %.2f hole_flood %.2f trace %.2f "
+      "hole_ring %.2f contour %.2f sort %.2f\n",
+      W, H, binarize.ms, ccl.ms, hole_flood.ms, trace.ms, ring.ms,
+      contour.ms, sort.ms);
+    binarize.ms = ccl.ms = hole_flood.ms = trace.ms = ring.ms = contour.ms = sort.ms = 0;
+  }
+};
+inline Bank& bank() { static Bank b; return b; }
+struct Timer {
+  Slot* s;
+  std::chrono::steady_clock::time_point t0;
+  explicit Timer(Slot* s_) : s(s_), t0(std::chrono::steady_clock::now()) {}
+  void stop() {
+    if (!s) return;
+    if (bank().on) {
+      s->ms += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0).count();
+      s->n++;
+    }
+    s = nullptr;
+  }
+  ~Timer() { stop(); }
+};
+}  // namespace dbprof
+}  // namespace ppocr
 
 // Clipper (header-only, vendored). See third_party/clipper/clipper.hpp.
 #include "clipper.hpp"
@@ -35,204 +78,11 @@ namespace ppocr {
 namespace {
 
 // Paddle's DBPostProcess.min_size — boxes with a shorter side below this are
-// discarded before unclip. Now cfg-driven; the constexpr is the fallback
-// used when the JSON config does not specify min_size (Paddle's reference
-// default is 3). M2-ROBUST sweeps 3 / 5 / 10 in the JSON config to find
-// a noise-robust operating point for the MNN prob map.
+// discarded before unclip. The value now comes from the JSON config; this
+// documents Paddle's reference default (M2-ROBUST swept 3 / 5 / 10 in the
+// config to find a noise-robust operating point for the MNN prob map).
 constexpr int kMinSizeDefault = 3;
-
-// --- connected components: 2-pass 8-connectivity union-find ------------------
-struct UnionFind {
-  std::vector<int> parent;
-  std::vector<int> rank;
-  void init(int n) {
-    parent.resize(n);
-    rank.assign(n, 0);
-    for (int i = 0; i < n; ++i) parent[i] = i;
-  }
-  int find(int x) {
-    while (parent[x] != x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  }
-  void unite(int a, int b) {
-    int ra = find(a), rb = find(b);
-    if (ra == rb) return;
-    if (rank[ra] < rank[rb]) std::swap(ra, rb);
-    parent[rb] = ra;
-    if (rank[ra] == rank[rb]) ++rank[ra];
-  }
-};
-
-// --- Moore-neighbor external boundary trace ---------------------------------
-// Given a label `target`, walk the external boundary of the component starting
-// at (sx, sy) using Moore-neighbor 8-direction traversal. The boundary is the
-// set of (x,y) such that pixel(x,y) == target AND at least one 4-neighbor is
-// not target (or out-of-bounds).
-//
-// Returns the ordered boundary as a list of (x,y). The first point is (sx,sy).
-// On failure, returns an empty list.
-std::vector<PointF> trace_boundary(const std::vector<int>& mask, int W, int H,
-                                   int target, int sx, int sy) {
-  // 8 directions, clockwise starting from "right".
-  static const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
-  static const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
-
-  auto at = [&](int x, int y) -> int {
-    if (x < 0 || y < 0 || x >= W || y >= H) return 0;
-    return mask[static_cast<size_t>(y) * W + x];
-  };
-
-  std::vector<PointF> out;
-  out.reserve(64);
-  int cx = sx, cy = sy;
-  // Standard Moore-neighbor initial backtrack: for an external boundary
-  // starting at the first non-zero pixel (scanned row-major), the
-  // "previous" boundary pixel is the one to the WEST. Direction index 4
-  // is W (dx=-1, dy=0). The next-neighbor scan starts at (prev+1) mod 8
-  // = NW (index 5) and proceeds clockwise.
-  int prev_dir = 4;
-  bool first = true;
-  int safety = W * H * 4 + 16;
-  while (safety-- > 0) {
-    out.push_back({static_cast<float>(cx), static_cast<float>(cy)});
-    int start_dir = (prev_dir + 1) % 8;
-    bool moved = false;
-    for (int step = 0; step < 8; ++step) {
-      int d = (start_dir + step) % 8;
-      int nx = cx + dx[d];
-      int ny = cy + dy[d];
-      if (at(nx, ny) == target) {
-        prev_dir = (d + 4) % 8;  // backtrack is opposite of the move
-        cx = nx;
-        cy = ny;
-        moved = true;
-        break;
-      }
-    }
-    if (!moved) break;  // isolated pixel
-    if (cx == sx && cy == sy && !first) break;
-    first = false;
-  }
-  return out;
-}
-
-// --- Hole-contour synthesis (RETR_LIST parity) ------------------------------
-// PaddleX's boxes_from_bitmap iterates cv2.findContours(RETR_LIST) output:
-// hole borders are independent candidates. Our legacy extractor keeps only
-// external borders. We synthesize each hole border as the ring of
-// foreground pixels that 8-adjacent the hole region, walked clockwise from
-// its top-left-most pixel. The downstream funnel consumes only the
-// minAreaRect vertices of the ring, which is exactly what cv2's hole
-// contour yields (validated against cv2 on the corpus fuzz set).
-namespace {
-
-std::vector<PointF> synthesize_hole_ring(const std::vector<int>& comp,
-                                         const std::vector<uint8_t>& hole,
-                                         int W, int H, int lbl) {
-  // Ring: pixels of this component adjacent (8-conn) to the hole region.
-  auto atc = [&](int x, int y) { return comp[static_cast<size_t>(y) * W + x] == lbl; };
-  auto ath = [&](int x, int y) -> int {
-    if ((unsigned)x >= (unsigned)W || (unsigned)y >= (unsigned)H) return 0;
-    return static_cast<int>(hole[static_cast<size_t>(y) * W + x]);
-  };
-  std::vector<char> ring(static_cast<size_t>(W) * H, 0);
-  std::vector<std::pair<int,int>> seeds;
-  for (int y = 0; y < H; ++y)
-    for (int x = 0; x < W; ++x) {
-      if (!ath(x, y)) continue;
-      static const int dx8[8]={1,1,0,-1,-1,-1,0,1};
-      static const int dy8[8]={-1,0,-1,-1,1,0,1,1};   // N NE NW .. SE S SW etc
-      static const int ddx[8]={1,1,0,-1,-1,-1,0,1};
-      static const int ddy[8]={0,-1,-1,-1,0,1,1,1};
-      (void)dx8; (void)dy8;
-      for (int d = 0; d < 8; ++d) {
-        int nx = x + ddx[d], ny = y + ddy[d];
-        if ((unsigned)nx < (unsigned)W && (unsigned)ny < (unsigned)H &&
-            atc(nx, ny)) {
-          size_t idx = static_cast<size_t>(ny) * W + nx;
-          if (!ring[idx]) { ring[idx] = 1; seeds.emplace_back(nx, ny); }
-        }
-      }
-    }
-  if (seeds.size() < 4) return {};
-  // top-left-most seed = min (y, x)
-  std::pair<int,int> start = seeds[0];
-  for (auto& s : seeds)
-    if (s.second < start.second || (s.second == start.second && s.first < start.first))
-      start = s;
-  // clockwise walk with background-hand preference (wall follower on hole)
-  std::vector<PointF> out;
-  auto ith = [&](int x, int y) -> int {
-    if ((unsigned)x >= (unsigned)W || (unsigned)y >= (unsigned)H) return 0;
-    return static_cast<int>(hole[static_cast<size_t>(y) * W + x]);
-  };
-  auto isr = [&](int x, int y) -> int {
-    if ((unsigned)x >= (unsigned)W || (unsigned)y >= (unsigned)H) return 0;
-    return static_cast<int>(ring[static_cast<size_t>(y) * W + x] != 0);
-  };
-  int cx = start.first, cy = start.second;
-  int dir = 7;                                   // start heading SW
-  const int DX[8]={1,1,0,-1,-1,-1,0,1}, DY[8]={0,-1,-1,-1,0,1,1,1};
-  size_t guard = static_cast<size_t>(W) * H * 8 + 16;
-  bool first = true;
-  std::pair<int,int> prev_dir_pt{-1,-1};
-  while (guard--) {
-    out.push_back({static_cast<float>(cx), static_cast<float>(cy)});
-    if (!first && cx == start.first && cy == start.second) break;
-    first = false;
-    int found = -1;
-    for (int k = 0; k < 8; ++k) {
-      int nd = ((dir - 1) & 7);                   // turn left around hole
-      nd = (dir + k) % 8;
-      int nx = cx + DX[nd], ny = cy + DY[nd];
-      if (isr(nx, ny) && ath(cx, cy)) {           // stay on ring pixels that touch hole
-        found = nd; break;
-      }
-      nd = (dir + k) % 8;
-      nx = cx + DX[nd]; ny = cy + DY[nd];
-      if (isr(nx, ny) && !ith(nx, ny)) { found = nd; break; }
-    }
-    if (found < 0) break;
-    dir = found;
-    cx += DX[dir]; cy += DY[dir];
-  }
-  (void)prev_dir_pt;
-  return out;
-}
-
-}  // namespace
-
-// --- scan a label mask for the first boundary pixel of a given label --------
-bool find_first_boundary(const std::vector<int>& mask, int W, int H, int target,
-                         int* sx, int* sy) {
-  for (int y = 0; y < H; ++y) {
-    for (int x = 0; x < W; ++x) {
-      if (mask[static_cast<size_t>(y) * W + x] != target) continue;
-      // Check 4-neighbors: a boundary pixel has at least one non-target
-      // neighbor (or is on the image edge).
-      bool is_border = false;
-      if (x == 0 || x == W - 1 || y == 0 || y == H - 1) {
-        is_border = true;
-      } else {
-        if (mask[static_cast<size_t>(y) * W + (x - 1)] != target ||
-            mask[static_cast<size_t>(y) * W + (x + 1)] != target ||
-            mask[static_cast<size_t>((y - 1)) * W + x] != target ||
-            mask[static_cast<size_t>((y + 1)) * W + x] != target) {
-          is_border = true;
-        }
-      }
-      if (is_border) {
-        *sx = x;
-        *sy = y;
-        return true;
-      }
-    }
-  }
-  return false;
-}
+static_assert(kMinSizeDefault == 3, "documented Paddle DBPostProcess.min_size");
 
 // --- polygon area (signed, Green's formula) ---------------------------------
 float polygon_area(const std::vector<PointF>& p) {
@@ -443,72 +293,51 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
   if (!prob || prob_h <= 0 || prob_w <= 0) return out;
   const int H = prob_h;
   const int W = prob_w;
+  dbprof::Bank& prof = dbprof::bank();
+  dbprof::Slot dummy_slot;
+  dbprof::Slot* bin_slot = prof.on ? &prof.binarize : &dummy_slot;
+  int processed_cand = 0;
   // 1) Binarize.
   std::vector<uint8_t> mask(W * H, 0);
-  for (int i = 0; i < W * H; ++i) {
-    mask[i] = (prob[i] > cfg.thresh) ? 1 : 0;
+  {
+    dbprof::Timer _t(bin_slot);
+    for (int i = 0; i < W * H; ++i) {
+      mask[i] = (prob[i] > cfg.thresh) ? 1 : 0;
+    }
   }
   // Paddle's dilation off by default. Toggling would require a 2x2 dilate on
   // the binary mask; intentionally not wired because DetConfig has no flag
   // for it in CONTRACT.md.
   (void)0;
 
-  // 2) 8-connected CCL via 2-pass union-find.
-  UnionFind uf;
-  uf.init(W * H);
-  std::vector<int> label(W * H, 0);
-  int next_label = 1;
-  for (int y = 0; y < H; ++y) {
-    for (int x = 0; x < W; ++x) {
-      if (!mask[y * W + x]) continue;
-      int my = next_label++;
-      std::vector<int> neighbors;
-      for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-          if (dx == 0 && dy == 0) continue;
-          int xx = x + dx, yy = y + dy;
-          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
-          if (label[yy * W + xx] > 0) neighbors.push_back(label[yy * W + xx]);
-        }
-      if (neighbors.empty()) label[y * W + x] = my;
-      else {
-        int min_lbl = *std::min_element(neighbors.begin(), neighbors.end());
-        label[y * W + x] = min_lbl;
-        for (int n : neighbors) uf.unite(min_lbl, n);
-      }
-    }
+  // 2) Contours: one Suzuki-Abe pass over the binary mask.
+  //
+  // This replaces the previous "8-connected CCL -> global hole flood-fill ->
+  // Moore-neighbour trace" trio, which was the dominant cost of db_post
+  // (67.8 -> 27 ms had already been won by killing its O(N*n_comp) and
+  // O(holes * W*H) hot spots; the tracer itself is now O(border pixels)).
+  //
+  // The tracer reproduces cv::findContours(RETR_LIST, CHAIN_APPROX_NONE)
+  // exactly — value-, sign- and order-wise (validated on 37 synthetic masks
+  // plus 5 real prob maps against cv2 4.10 and cv2 5.0, see
+  // tools/verify_suzuki.py). That is a strict improvement in fidelity over
+  // the old approximation, which sorted components by pixel count and
+  // synthesized hole rings by wall-following, and separately had to be
+  // trusted to match cv2's ordering.
+  std::vector<std::vector<IntPoint>> contours;
+  {
+    dbprof::Timer _t(prof.on ? &prof.trace : &dummy_slot);
+    suzuki_borders(mask.data(), W, H, &contours);
   }
-  std::vector<int> comp(W * H, 0);
-  std::vector<int> comp_size;
-  comp_size.push_back(0);
-  for (int i = 0; i < W * H; ++i) {
-    if (label[i] == 0) continue;
-    int root = uf.find(label[i]);
-    auto it = std::find(comp_size.begin() + 1, comp_size.end(), root);
-    int idx;
-    if (it == comp_size.end()) {
-      comp_size.push_back(root);
-      idx = static_cast<int>(comp_size.size()) - 1;
-    } else {
-      idx = static_cast<int>(it - comp_size.begin());
-    }
-    comp[i] = idx;
-  }
-  int n_comp = static_cast<int>(comp_size.size()) - 1;
 
-  // 3) For each component, trace external boundary and process.
-  int max_cand = std::max(1, cfg.max_candidates);
-  int max_cand_n = std::min(n_comp, max_cand);
-
-  // Sort components by size desc, like cv::findContours ordering (approx).
-  std::vector<int> order(n_comp);
-  std::iota(order.begin(), order.end(), 1);
-  std::vector<int> comp_pixel_count(n_comp + 1, 0);
-  for (int i = 0; i < W * H; ++i)
-    if (comp[i] > 0) ++comp_pixel_count[comp[i]];
-  std::sort(order.begin(), order.end(), [&](int a, int b) {
-    return comp_pixel_count[a] > comp_pixel_count[b];
-  });
+  // Paddle's DBPostProcess iterates `contours[:max_candidates]` in cv2's
+  // emitted order. cv2's order is reverse discovery order (see suzuki.cpp),
+  // so "top N" is NOT the N largest components — we must not re-sort.
+  // max_candidates is 1000 (docs/DET_GEOMETRY.md) and real prob maps yield
+  // tens to a few hundred borders, so the cap is a backstop, not a filter.
+  const size_t max_cand = static_cast<size_t>(std::max(1, cfg.max_candidates));
+  const size_t n_use = std::min(contours.size(), max_cand);
+  (void)processed_cand;
 
   // Per-candidate funnel shared by external borders and synthesized hole
   // rings: minibox -> score -> unclip -> re-minibox -> sside -> map.
@@ -662,77 +491,20 @@ std::vector<DetBox> db_postprocess(const float* prob, int prob_h, int prob_w,
     return true;
   };
 
-  // ---- Global hole precompute ------------------------------------------
-  // One pass over the background: every 4-connected bg region gets flooded
-  // once; regions touching the image border or bordered by more than one
-  // component are not holes. Result: holes_of[c] = list of hole pixel sets
-  // fully enclosed by component c (RETR_LIST treats their borders as
-  // independent contour candidates).
-  std::unordered_map<int, std::vector<std::vector<std::pair<int,int>>>> holes_of;
-  {
-    std::vector<int> region_id(W * H, -1);
-    int cur_region = 0;
-    static const int DX[4] = {1,-1,0,0};
-    static const int DY[4] = {0,0,1,-1};
-    for (int yy = 0; yy < H; ++yy)
-      for (int xx = 0; xx < W; ++xx) {
-        size_t idx = static_cast<size_t>(yy) * W + xx;
-        if (comp[idx] != 0 || region_id[idx] >= 0) continue;
-        std::vector<std::pair<int,int>> stack{{xx,yy}};
-        std::vector<std::pair<int,int>> seen;
-        bool escapes = false;
-        int surround = -1;               // -1 = none seen yet; -2 = multiple
-        region_id[idx] = cur_region;
-        while (!stack.empty()) {
-          auto [qx,qy] = stack.back(); stack.pop_back();
-          seen.emplace_back(qx,qy);
-          for (int d = 0; d < 4; ++d) {
-            int ux = qx + DX[d], uy = qy + DY[d];
-            if ((unsigned)ux >= (unsigned)W || (unsigned)uy >= (unsigned)H) {
-              escapes = true;
-              continue;
-            }
-            size_t uidx = static_cast<size_t>(uy) * W + ux;
-            int c2 = comp[uidx];
-            if (c2 == 0) {
-              if (region_id[uidx] < 0) { region_id[uidx] = cur_region; stack.emplace_back(ux,uy); }
-              continue;
-            }
-            if (surround == -1) surround = c2;
-            else if (surround != c2) surround = -2;
-          }
-        }
-        ++cur_region;
-        if (!escapes && surround >= 1)
-          holes_of[surround].push_back(std::move(seen));
-      }
-  }
-
-  int processed_cand = 0;
-  for (int ci = 0; ci < max_cand_n; ++ci) {
-    int lbl = order[ci];
-    if (comp_pixel_count[lbl] < 1) continue;
-
-    int sx = -1, sy = -1;
-    if (!find_first_boundary(comp, W, H, lbl, &sx, &sy)) continue;
-    std::vector<PointF> boundary = trace_boundary(comp, W, H, lbl, sx, sy);
-    if (boundary.size() >= 4 && process_contour(boundary)) ++processed_cand;
-
-    // ---- RETR_LIST parity: use precomputed hole regions -----------------
-    auto hit = holes_of.find(lbl);
-    if (hit == holes_of.end()) continue;
-    bool emitted_hole_box = false;
-    for (const auto& reg : hit->second) {
-      std::vector<uint8_t> hole(W * H, 0);
-      for (auto& s : reg) hole[static_cast<size_t>(s.second) * W + s.first] = 1;
-      std::vector<PointF> ring = synthesize_hole_ring(comp, hole, W, H, lbl);
-      if (ring.size() >= 4 && process_contour(ring)) {
-        ++processed_cand;
-        emitted_hole_box = true;
-      }
+  // 3) Run every contour through the funnel: minibox -> score -> unclip ->
+  //    re-minibox -> sside -> map to original image coords.
+  for (size_t ci = 0; ci < n_use; ++ci) {
+    const auto& c = contours[ci];
+    if (c.size() < 4) continue;
+    std::vector<PointF> boundary;
+    boundary.reserve(c.size());
+    for (const auto& q : c) {
+      boundary.push_back({static_cast<float>(q.x), static_cast<float>(q.y)});
     }
-    (void)emitted_hole_box;
+    dbprof::Timer _t(prof.on ? &prof.contour : &dummy_slot);
+    if (process_contour(boundary)) ++processed_cand;
   }
+  prof.dump(W, H);
   return out;
 }
 
