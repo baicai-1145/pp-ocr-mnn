@@ -281,6 +281,17 @@ Two MNN Metal issues were diagnosed and are mitigated in the engine
 Final config = **fp32 (Precision_High) + winograd off**. The engine forces
 `Precision_High` on all GPU backends; Metal joins CUDA/OpenCL/Vulkan there.
 
+Diagnostic knobs (never for production, both fail the gate on this build):
+`PPOCR_METAL_PREC=normal` (fp16 storage) is ~35 % faster on the det stage
+(tiny det @1280×960: 37.9 ms vs 57.9 ms total, min of 10 interleaved rounds)
+but scores MLC zh 0.099 / en 0.160 / ru 0.600 / ja 0.596 / ar 0.448 on
+v6-tiny and ru 0.139 / ar 0.267 on v4-mobile; `PPOCR_MNN_WINOGRAD=3`
+(MNN's own default) measured 63.3 ms vs 57.6 ms at level 0 **and** +20 MB
+RSS, i.e. slower and heavier here (det is dominated by global-pooling and
+NC4HW4 raster traffic, not convolution). `PPOCR_MNN_COMMIT_OPS` and
+`PPOCR_NO_RESIZE_CACHE` are A/B knobs for the Metal command-buffer commit
+granularity and the redundant-resize skip respectively.
+
 | cell (800 imgs) | Metal fp32+w0 MLC | CPU MLC | status |
 |---|---|---|---|
 | PP-OCRv4_mobile_det__PP-OCRv4_mobile_rec | 0.0388 | 0.0388 | PASS |
