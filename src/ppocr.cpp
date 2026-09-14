@@ -183,13 +183,16 @@ static ppocr_status resolve_config_paths(Engine& e, const ppocr_config* cfg,
   // are sibling directories). M1 hard-fails the parse if neither
   // exists; M2+ can pin a single layout once the registry is wired.
   const std::string cfg_dir_primary = e.model_dir + "/configs";
-  std::string cfg_dir_fallback;
-  {
-    auto slash = e.model_dir.find_last_of("/\\");
-    if (slash != std::string::npos) {
-      cfg_dir_fallback = e.model_dir.substr(0, slash) + "/configs";
-    }
-  }
+  // PERF-M4/PERF-BUG: always derive the sibling `<model_dir>/../configs`
+  // layout. The previous code only did this when model_dir contained a
+  // slash, so the documented `--model-dir models` form (no slash) produced
+  // an EMPTY fallback: <sibling>/configs/<name>.json was never found, the
+  // rec dict silently failed to load, and every rec text came out "" while
+  // the det boxes stayed correct. Path arithmetic makes it unconditional:
+  //   "models"      -> "models/../configs"  == "./configs"
+  //   "./models"    -> "./models/../configs" == "./configs"
+  //   "/a/b/models" -> "/a/b/models/../configs" == "/a/b/configs"
+  const std::string cfg_dir_fallback = e.model_dir + "/../configs";
   auto find_cfg = [&](const std::string& name) -> std::string {
     if (name.empty()) return {};
     std::string p1 = cfg_dir_primary + "/" + name + ".json";

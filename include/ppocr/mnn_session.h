@@ -100,6 +100,10 @@ class MnnSession {
   const char* backend_name() const;
 
  private:
+  // PERF-M4: re-resolve cached MNN::Tensor* pointers (and their host
+  // addresses) after a resize, which may have reallocated buffers.
+  void refresh_tensors_locked();
+
   MnnSessionImpl* impl_ = nullptr;
 };
 
