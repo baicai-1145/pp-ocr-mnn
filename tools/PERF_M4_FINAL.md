@@ -61,6 +61,16 @@
 - 但 FLOP 峰值对这种负载失灵：34.5ms 中 conv 类仅 ~17.5ms，其余为 Raster/Binary/Unary 等纯访存算子（激活流量估算 2-4GB → 带宽地板 17-33ms @120GB/s）。按带宽口径利用率约 30-60%，距硬件极限 1.5-2×。
 - 该图在 Metal 的现实地板 ≈ 20-25ms。击穿需：fp16（精度 gate 否决）、算子融合（MNN 上游）、降输入分辨率（基线契约变更）。
 
+## 5.6 CoreML 实验记录（事后补录，全部实测 M4 / MNN 3.6.1 / macOS 26 SDK）
+
+- **可行性**：重编 libMNN（`-DMNN_COREML=ON`，build_coreml/）后 `--backend coreml` 可用。det 固定尺寸路径完全可用，热态 **10.6ms**（vs Metal ~35ms GPU、CPU 99ms）。
+- **rec 不可用**（结构性）：rec 模型动态宽度 [1,3,48,-1] vs CoreML `EXACT_ARRAY_MAPPING` 固定形状 → "Failed to Invok the Model"。已实现混合调度：det=CoreML、rec=Metal（load 失败回落 CPU），`PPOCR_COREML_MIXED=0` 可诊断。
+- **硬伤 1：每新形状 ~0.5-0.8s 编译费**。CoreML 后端每次 resize 都磁盘写 mlmodel + compileModelAtURL。变尺寸 eval 集 0.84s/张，比 Metal 慢一个量级。仅固定尺寸流（视频）能吃到 10.6ms。
+- **硬伤 2：数值退化**。ru MLC 0.0591→0.1596（新回归，ru/04 整图 miss），ja 0.028→0.046（翻倍但<0.05），zh/en 干净。根因指向 ANE fp16（prob-map checksum 10.0 vs CPU 52.6，二值化只吸收了部分）。
+- **硬伤 3**：`MLComputeUnitsAll` 硬编码于 MNN，无法强制避开 ANE（submodule 禁改）。
+- **定位**：opt-in 快速路径，默认 AUTO→Metal 不变。e2e 最快 27ms（37 FPS，det CoreML + rec Metal + Suzuki）。
+- **附带修复**：CommandLineTools 27.0 SDK 的 tbd 文件损坏（unknown architecture），build/ 需 `-DCMAKE_OSX_SYSROOT=.../MacOSX26.sdk` 重配才能链接。
+
 ## 6. 未竟事项 / 后续任务
 
 1. SE-rewrite 合并落地（backend 分派 + 811-cell Linux 复验）— 最大单项 Metal 收益。
