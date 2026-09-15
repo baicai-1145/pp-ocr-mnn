@@ -55,6 +55,12 @@
 - Metal 计时：runSession 只提交；真实 GPU 时间在 readback（waitUntilCompleted）。400px 小输入噪声 17%（同计算重打包都能测出），只有 full-res（≥1053px）信噪比可用。
 - 单语言 gate 不足以判数值路径改动（zh bit-exact 而 ru 崩）→ 最少 zh/en/ja/ar/ru。
 
+## 5.5 更正与澄清：Metal "GPU 利用率" 的正确量纲
+
+- 最终总结中"1%→7% FLOP 峰值利用率"的 7% 是算术错误；正确值为 ~1-1.5%。
+- 但 FLOP 峰值对这种负载失灵：34.5ms 中 conv 类仅 ~17.5ms，其余为 Raster/Binary/Unary 等纯访存算子（激活流量估算 2-4GB → 带宽地板 17-33ms @120GB/s）。按带宽口径利用率约 30-60%，距硬件极限 1.5-2×。
+- 该图在 Metal 的现实地板 ≈ 20-25ms。击穿需：fp16（精度 gate 否决）、算子融合（MNN 上游）、降输入分辨率（基线契约变更）。
+
 ## 6. 未竟事项 / 后续任务
 
 1. SE-rewrite 合并落地（backend 分派 + 811-cell Linux 复验）— 最大单项 Metal 收益。
