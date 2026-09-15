@@ -412,6 +412,25 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   sc.backend = pickBackend(static_cast<ppocr_backend>(cfg->backend));
   sc.num_threads = cfg->num_threads;
 
+  // CoreML mixed dispatch: the PP-OCR rec models are dynamic-width
+  // ([1,3,48,-1]) and MNN's CoreML backend serializes fixed shapes
+  // (EXACT_ARRAY_MAPPING), so rec fails to invoke ("Failed to Invok the
+  // Model", verified on MNN 3.6.1 / macOS 26 SDK). The det models are
+  // per-image resized to concrete shapes and run fine on CoreML (~2x
+  // faster than Metal det on M4). So for the CoreML backend: det stays on
+  // CoreML; rec + cls prefer Metal (dynamic-shape tolerant, already
+  // gate-validated) and fall back to CPU at runtime if Metal is absent
+  // (capability probing, no platform ifdefs — see AGENTS.md rule 6).
+  // PPOCR_COREML_MIXED=0 forces everything onto CoreML (diagnostic only;
+  // rec will produce empty texts).
+  Backend rec_backend = sc.backend;
+  {
+    const char* mix = std::getenv("PPOCR_COREML_MIXED");
+    if ((!mix || mix[0] != '0') && sc.backend == Backend::CoreML) {
+      rec_backend = Backend::Metal;
+    }
+  }
+
   // Metal-only SE-pool rewrite variant (task-7). This is a *model choice*,
   // so it lives here in the engine layer; MnnSession stays backend-generic
   // and never inspects file names.
@@ -444,20 +463,39 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   }
   if (!rec_name.empty() && !rec_path.empty()) {
     rec = std::make_unique<MnnSession>();
+    SessionConfig rec_sc = sc;
+    rec_sc.backend = rec_backend;  // see CoreML mixed dispatch above
     try {
-      rec->load(rec_path, sc);
-    } catch (const std::exception& ex) {
-      if (err && elen) std::snprintf(err, elen, "rec load: %s", ex.what());
-      return PPOCR_ERR_MODEL;
+      rec->load(rec_path, rec_sc);
+    } catch (const std::exception&) {
+      // The mixed-dispatch rec backend is a preference, not a contract:
+      // if it is unavailable on this machine (e.g. Metal-less Linux with
+      // a CoreML-capable build), retry once on CPU before failing.
+      if (rec_sc.backend == Backend::Cpu) throw;
+      rec_sc.backend = Backend::Cpu;
+      try {
+        rec->load(rec_path, rec_sc);
+      } catch (const std::exception& ex) {
+        if (err && elen) std::snprintf(err, elen, "rec load: %s", ex.what());
+        return PPOCR_ERR_MODEL;
+      }
     }
   }
   if (!cls_name.empty() && !cls_path.empty()) {
     cls = std::make_unique<MnnSession>();
+    SessionConfig cls_sc = sc;
+    cls_sc.backend = rec_backend;  // cls crops share rec's dynamic-shape risk
     try {
-      cls->load(cls_path, sc);
-    } catch (const std::exception& ex) {
-      if (err && elen) std::snprintf(err, elen, "cls load: %s", ex.what());
-      return PPOCR_ERR_MODEL;
+      cls->load(cls_path, cls_sc);
+    } catch (const std::exception&) {
+      if (cls_sc.backend == Backend::Cpu) throw;
+      cls_sc.backend = Backend::Cpu;
+      try {
+        cls->load(cls_path, cls_sc);
+      } catch (const std::exception& ex) {
+        if (err && elen) std::snprintf(err, elen, "cls load: %s", ex.what());
+        return PPOCR_ERR_MODEL;
+      }
     }
   }
   return PPOCR_OK;

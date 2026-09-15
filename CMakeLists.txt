@@ -219,6 +219,29 @@ endif()
 set(_PPOCR_MNN_FRAMEWORKS)
 if(APPLE)
   set(_PPOCR_MNN_FRAMEWORKS "-framework Metal" "-framework Foundation")
+  # CoreML-enabled libMNN.a (MNN_COREML=ON) additionally links CoreML and
+  # CoreVideo (CoreMLExecutor.mm). Probe the built lib for CoreMLExecutor
+  # object references and add the frameworks only then, so a plain Metal
+  # build keeps its current link line on Linux CI cross-builds.
+  if(MNN_LIBRARY AND EXISTS "${MNN_LIBRARY}")
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E env true
+      OUTPUT_QUIET ERROR_QUIET)
+    file(MD5 "${MNN_LIBRARY}" _mnn_lib_hash)
+    # cheap textual probe: nm is available on macOS toolchains
+    find_program(NM_TOOL nm)
+    if(NM_TOOL)
+      execute_process(
+        COMMAND ${NM_TOOL} "${MNN_LIBRARY}"
+        OUTPUT_VARIABLE _mnn_nm_out
+        ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+      if(_mnn_nm_out MATCHES "CoreMLExecutor")
+        list(APPEND _PPOCR_MNN_FRAMEWORKS
+             "-framework CoreML" "-framework CoreVideo")
+        message(STATUS "CoreML backend detected in libMNN.a: adding CoreML/CoreVideo frameworks")
+      endif()
+    endif()
+  endif()
 endif()
 if(_ppocr_using_prebuilt_mnn)
   # libMNN.a needs zlib (for weight compression). MNN itself declares
