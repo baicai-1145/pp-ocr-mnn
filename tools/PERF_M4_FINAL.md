@@ -71,6 +71,26 @@
 - **定位**：opt-in 快速路径，默认 AUTO→Metal 不变。e2e 最快 27ms（37 FPS，det CoreML + rec Metal + Suzuki）。
 - **附带修复**：CommandLineTools 27.0 SDK 的 tbd 文件损坏（unknown architecture），build/ 需 `-DCMAKE_OSX_SYSROOT=.../MacOSX26.sdk` 重配才能链接。
 
+## 5.7 MNN CoreML 后端 bug 修复（coreml-rec-fix 分支，f726c8b）
+
+应"实现 CoreML 推理 rec"的要求，直接改了 MNN submodule（分支 coreml-rec-fix，可提上游 PR）：
+
+**修复的两个真 bug**（CoreMLRaster.cpp）：
+1. **buildPermute 非法转置轴**：原实现按"输出形状值匹配输入维"猜 axes，rank-3/重复维度时产出 `[0,2,1,0]`（轴 0 重复、轴 3 缺失）——CoreML 编译通过但所有预测报 error -1。改为从 raster Region 的 src/dst strides 严格推导（输入轴的 C-order stride == region slot stride），按输入 rank 输出。
+2. **rank-3 reshapeStatic 广播爆炸**：`[1,160,40]` 原样发射后，SE 的 scale 把 `[160]`-gamma 广播成 `(160,160,40)`（实测前缀探针）。规范化 rank<4 目标到 `[N,C,H,W]`。
+
+**成果**：
+- rec 模型从"Failed to Invok"→ **B=1 全宽度跑通**（W=48/96/320/640 checksum ≈CPU×1.000）；det 无回归（6/3/32 框与 CPU 逐 box 一致）
+- 常输入 checksum 匹配 ≠ 真数据正确：**真实图像 rec 输出仍是乱码**——转换器把 matmul 降级成 conv 时留下 rank-3/rank-4 接缝（SE 块内 `multiplyBroadcastable` 双输入 rank 不一致），CoreML 的 rank-4 NCHW 世界消化不了；且 batch 维（[B,160,40]）会被规范化成 C=B。这两个是**转换器侧问题**，非后端可修
+- 结论：rec 上 CoreML 需要转换器清理（保持 BatchMatMul 或一致 rank-4），已记录为上游方向
+
+**引擎侧交付**（ws/coreml-mnn-fix @ 3345a8e）：
+- `PPOCR_COREML_REC=cpu`：det CoreML + rec CPU 组合（应对重编 libMNN 的 Metal shader 在新 SDK 下编不过的情况）
+- 实测（zh/03 热态）：det=CoreML + rec=CPU e2e **47ms**，+Suzuki **35ms**
+- 5 语言 gate：zh 0.0288 / en 0.0023 / ja 0.0407 / ar 0.1740 / ru 0.1596——**ru 仍回归**（det 侧 ANE fp16 数值，与后端修复无关，ru/04 整图 miss 特征不变）
+
+**副产品**：重编 libMNN（MNN_COREML=ON）在 Xcode 27 SDK 下 Metal shader 编译失败（`thread short4` address-space 错误）——上游兼容性问题的又一证据。
+
 ## 6. 未竟事项 / 后续任务
 
 1. SE-rewrite 合并落地（backend 分派 + 811-cell Linux 复验）— 最大单项 Metal 收益。
