@@ -412,22 +412,27 @@ ppocr_status Engine::load_submodels(const ppocr_config* cfg, char* err,
   sc.backend = pickBackend(static_cast<ppocr_backend>(cfg->backend));
   sc.num_threads = cfg->num_threads;
 
-  // CoreML mixed dispatch: the PP-OCR rec models are dynamic-width
-  // ([1,3,48,-1]) and MNN's CoreML backend serializes fixed shapes
-  // (EXACT_ARRAY_MAPPING), so rec fails to invoke ("Failed to Invok the
-  // Model", verified on MNN 3.6.1 / macOS 26 SDK). The det models are
-  // per-image resized to concrete shapes and run fine on CoreML (~2x
-  // faster than Metal det on M4). So for the CoreML backend: det stays on
-  // CoreML; rec + cls prefer Metal (dynamic-shape tolerant, already
-  // gate-validated) and fall back to CPU at runtime if Metal is absent
-  // (capability probing, no platform ifdefs — see AGENTS.md rule 6).
-  // PPOCR_COREML_MIXED=0 forces everything onto CoreML (diagnostic only;
-  // rec will produce empty texts).
+  // CoreML mixed dispatch (measured, see PERF_M4_FINAL §5.6/§5.7): det runs
+  // correctly on MNN's CoreML backend (~3x the Metal det GPU time on M4)
+  // after two CoreMLRaster fixes on our coreml-rec-fix MNN branch (invalid
+  // transpose axes; rank-3 reshapeStatic breaking per-channel broadcast).
+  // rec still diverges on real data (garbage CTC probs) even though
+  // constant-input checksums match: the converter's matmul→conv lowering
+  // leaves rank-3/rank-4 seams through the SE blocks that don't map onto
+  // CoreML's rank-4 NCHW world without a converter-side graph cleanup.
+  // So rec + cls stay on Metal by default; PPOCR_COREML_MIXED=0 forces
+  // them onto CoreML too (experimental, known-wrong for rec).
   Backend rec_backend = sc.backend;
   {
     const char* mix = std::getenv("PPOCR_COREML_MIXED");
     if ((!mix || mix[0] != '0') && sc.backend == Backend::CoreML) {
       rec_backend = Backend::Metal;
+      // PPOCR_COREML_REC=cpu: run rec on CPU instead of Metal (for
+      // libMNN builds whose Metal shaders don't load under newer SDKs).
+      const char* rc = std::getenv("PPOCR_COREML_REC");
+      if (rc && rc[0] == 'c') {
+        rec_backend = Backend::Cpu;
+      }
     }
   }
 
